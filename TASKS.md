@@ -1153,7 +1153,7 @@ optional there and can be made mandatory by the authority.
       *Done when:* a SITL aircraft seen on both sources is one track, and
       disabling either source leaves it visible through the other.
 
-- [ ] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
+- [x] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
       from console users, with a registration number, contact and status;
       remote pilots with competency records; UAS with serial, class label
       (C0-C6), MTOM and the operator that owns them. Import from a

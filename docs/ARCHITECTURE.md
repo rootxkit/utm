@@ -203,9 +203,19 @@ bases(id, name, geom POINT, capacity, charging_slots)
 
 drones(id, serial, model, sysid, status, max_payload_g, max_range_m,
        battery_capacity_wh, cruise_speed_ms, avg_power_w,
-       home_base_id, current_pilot_id, firmware_version)
+       home_base_id, current_pilot_id, firmware_version,
+       uas_operator_id, class_label, mtom_g,
+       registration_status)   -- U-01: a UAS is a drone with an operator
 
-pilots(id, name, license_ref, status, max_concurrent_drones)
+pilots(id, name, license_ref, status, max_concurrent_drones,
+       uas_operator_id, registration_status)   -- U-01: remote pilots
+
+uas_operators(id, registration_number, legal_name, operator_type,
+              contact_email, contact_phone, postal_address, status,
+              valid_until, source)   -- U-01, 2019/947 Art. 14
+
+pilot_competencies(pilot_id, competency, certificate_ref,
+                   valid_until)   -- A1_A3 | A2 | STS_01 | STS_02
 
 drone_state(drone_id, ts, geom POINT, alt_amsl_m, alt_above_home_m,
             heading_deg, vx_ms, vy_ms, vz_ms, batt_pct, batt_voltage, mode,
@@ -221,8 +231,14 @@ events(id, ts, actor_type, actor_id, entity_type, entity_id,
 ```
 
 Planned: `incidents` (M-02) — a violation with its time, aircraft and serial,
-operator, track excerpt and status (new, reviewed, closed); third-party
-operators and their drones in the registry (M-03).
+operator, track excerpt and status (new, reviewed, closed).
+
+Third-party operators and their aircraft are in the registry since U-01
+(`infra/migrations/relational/versions/0005_uas_registry.py` says why UAS
+and remote pilots extend `drones` and `pilots` rather than duplicate them).
+A UAS is projected into `known_drones` like a fleet drone, so its serial is
+matched by Remote ID; what a match against a suspended or unknown operator
+means for a track is U-02.
 
 Indexes that matter: GiST on every geometry column and
 `drone_state(drone_id, ts DESC)`.
