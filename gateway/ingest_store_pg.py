@@ -108,6 +108,10 @@ _segments = sa.table(
     sa.column("record_count", sa.Integer),
     sa.column("compressed_bytes", sa.BigInteger),
     sa.column("uncompressed_bytes", sa.BigInteger),
+    sa.column("stored_at", sa.DateTime(timezone=True)),
+    # Set by retention when the file is gone (gateway/retention.py).
+    sa.column("deleted_at", sa.DateTime(timezone=True)),
+    sa.column("deleted_reason", sa.Text),
 )
 
 _events = sa.table(
@@ -331,9 +335,13 @@ class TimescaleIngestStore:
            left the next resend raising on `archive_segments_unique` on every
            attempt, for ever, appending the same bytes to the segment each
            time. The rows are there, so only the watermark is missing.
-        2. The index insert is `ON CONFLICT DO NOTHING` on that constraint, so
-           a row that exists anyway - a resend re-batched across an hour
-           boundary, say - is not an error.
+        2. The index insert is `ON CONFLICT DO UPDATE` on that constraint,
+           so a row that exists anyway is not an error. The update matters
+           for a row retention has marked deleted: the constraint still
+           matches it, and `DO NOTHING` would leave the resent bytes on disk
+           with no live row - unreadable by index and invisible to the next
+           sweep. The row is resurrected instead, describing the new bytes,
+           with a fresh `stored_at` so retention ages it from now.
         3. The index rows and the watermark commit together. A crash can now
            only leave an unindexed frame at the end of a segment, which the
            next resend appends once more; `read_segment` reads across that
@@ -387,9 +395,30 @@ class TimescaleIngestStore:
         try:
             async with self.engine.begin() as connection:
                 if writes:
+                    insert = pg_insert(_segments)
+                    excluded = insert.excluded
                     await connection.execute(
-                        pg_insert(_segments).on_conflict_do_nothing(
-                            constraint="archive_segments_unique"
+                        insert.on_conflict_do_update(
+                            constraint="archive_segments_unique",
+                            set_={
+                                "hour_start": excluded.hour_start,
+                                "first_recv_utc_ns": excluded.first_recv_utc_ns,
+                                "last_recv_utc_ns": excluded.last_recv_utc_ns,
+                                "record_count": excluded.record_count,
+                                "compressed_bytes": excluded.compressed_bytes,
+                                "uncompressed_bytes": excluded.uncompressed_bytes,
+                                # A live row keeps its age; a deleted one is
+                                # new bytes and ages from now.
+                                "stored_at": sa.case(
+                                    (
+                                        _segments.c.deleted_at.is_not(None),
+                                        sa.func.now(),
+                                    ),
+                                    else_=_segments.c.stored_at,
+                                ),
+                                "deleted_at": None,
+                                "deleted_reason": None,
+                            },
                         ),
                         [
                             {
@@ -418,7 +447,12 @@ class TimescaleIngestStore:
     async def _indexed_ranges(
         self, station_id: str, epoch: str, first_seq: int, last_seq: int
     ) -> set[tuple[str, int, int]]:
-        """Index rows already covering part of `[first_seq, last_seq]`."""
+        """Live index rows already covering part of `[first_seq, last_seq]`.
+
+        Live only. A row retention has marked deleted describes bytes that are
+        no longer on disk; counting it as "already indexed" would skip the
+        append, acknowledge the resend, and leave nothing to read.
+        """
         try:
             async with self.engine.connect() as connection:
                 rows = (
@@ -432,6 +466,7 @@ class TimescaleIngestStore:
                             _segments.c.epoch == epoch,
                             _segments.c.first_seq >= first_seq,
                             _segments.c.last_seq <= last_seq,
+                            _segments.c.deleted_at.is_(None),
                         )
                     )
                 ).all()

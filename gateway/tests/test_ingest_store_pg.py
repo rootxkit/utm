@@ -623,3 +623,50 @@ async def test_concurrent_stores_for_one_station_do_not_interleave_the_segment(
             {"s": station, "e": EPOCH},
         )
     assert total == 60
+
+
+# --- a range retention removed is archived again on resend (S-05) ----------
+
+
+async def test_a_range_deleted_by_retention_is_archived_again_on_resend(
+    store: TimescaleIngestStore, engine: AsyncEngine, station: str
+) -> None:
+    """The precheck must see live rows only. A row marked deleted describes
+    bytes that are gone; treating it as already indexed would skip the
+    append, acknowledge the resend, and leave nothing on disk to read."""
+    await store.store_records(station, EPOCH, records(0, 50))
+    path = _only_segment_path(store, station)
+    # What a retention pass leaves: the row marked, the file gone.
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "UPDATE archive_segments SET deleted_at = now(), "
+                "deleted_reason = 'age' WHERE station_id = :s"
+            ),
+            {"s": station},
+        )
+    (store.archive.root / path).unlink()
+    await _rewind_watermark(engine, station, EMPTY_WATERMARK)
+
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
+
+    assert watermark == 49
+    stored = store.archive.read_segment(path)
+    assert [record.seq for record in stored] == list(range(50))
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                sa.text(
+                    "SELECT deleted_at, deleted_reason, stored_at > now() - "
+                    "interval '1 minute' AS fresh FROM archive_segments "
+                    "WHERE station_id = :s"
+                ),
+                {"s": station},
+            )
+        ).all()
+    # One row, live again, describing the new bytes and aged from now. The
+    # unique constraint still matches the deleted row, so this is the
+    # ON CONFLICT DO UPDATE resurrecting it rather than a second row.
+    assert [(row.deleted_at, row.deleted_reason, row.fresh) for row in rows] == [
+        (None, None, True)
+    ]
