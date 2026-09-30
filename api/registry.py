@@ -613,6 +613,12 @@ class FleetRegistry:
                 "drone retired but its telemetry projection was not updated",
                 extra={"drone_id": str(drone_id), "error": repr(error)},
             )
+            # TODO(S-16): nothing repairs this unless someone retires the drone
+            # again. A periodic sweep should find drones whose `retired_at` is
+            # set here but whose `known_drones.retired_at` is NULL, or that
+            # still have open `source_bindings`, and re-apply
+            # `_project_retirement` at the recorded `retired_at` (idempotent),
+            # auditing `bindings_closed` for each one it repairs.
             raise ProjectionIncompleteError(
                 f"drone {drone_id} is retired, but its telemetry bindings could "
                 "not be closed; retire it again to finish"
