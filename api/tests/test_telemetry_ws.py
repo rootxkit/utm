@@ -26,6 +26,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from api.telemetry_ws import ConsoleHub, create_app
+from common.bus import round_trip
 from gateway.drone_state import DroneStateRow
 from gateway.publisher import TelemetryPublisher
 from gateway.station_state import LinkState
@@ -184,12 +185,9 @@ async def test_a_published_row_reaches_a_browser(bus: Any) -> None:
         try:
             row = a_row()
             await TelemetryPublisher(bus=bus).publish_row(row)
-            # `publish` buffers; the flush is what puts the bytes on the wire.
-            # `create_app` documents the same hazard on the subscribe side, and
-            # it is symmetric: without this the test relies on the client's
-            # background flusher being prompt, which is not a guarantee and is
-            # exactly the kind of assumption that holds locally and flaps in CI.
-            await bus.flush()
+            # `publish` buffers. A round trip, not `flush()`, is what confirms
+            # the server has it (common/bus.py).
+            await round_trip(bus)
             message = await drain_until(received, "telemetry")
         finally:
             collector.cancel()
@@ -220,7 +218,7 @@ async def test_station_state_reaches_a_browser_with_the_distinction(
             await TelemetryPublisher(bus=bus).publish_station(
                 "tbilisi-base-1", LinkState.UNREACHABLE, last_datagram_age_ms=40
             )
-            await bus.flush()
+            await round_trip(bus)
             message = await drain_until(received, "station")
         finally:
             collector.cancel()

@@ -54,6 +54,7 @@ from nats.aio.msg import Msg
 from api.assets import STATIC, mount_map_assets
 from api.auth import FEED_COOKIE, verify_feed_ticket, wall_clock_s
 from common import get_logger
+from common.bus import round_trip
 
 _log = get_logger(__name__)
 
@@ -219,8 +220,9 @@ def create_app(
                 await client.subscribe(subject, cb=on_message)
             # `subscribe` returns before the server has registered the
             # interest, so without this a console attaching just before a
-            # publish silently misses it. Flushing waits for the round trip.
-            await client.flush()
+            # publish silently misses it. Not `flush()`: its PONG can come
+            # back before the SUBs have been sent (common/bus.py).
+            await round_trip(client)
 
         app.state.hub = hub
         app.state.nats = client

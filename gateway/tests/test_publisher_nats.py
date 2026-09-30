@@ -21,6 +21,7 @@ from typing import Any, cast
 import nats
 import pytest
 
+from common.bus import round_trip
 from gateway.pipeline import IngestPipeline
 from gateway.publisher import TelemetryPublisher
 from gateway.tests.test_pipeline import (
@@ -73,7 +74,7 @@ async def test_a_subscriber_receives_every_position_update(
         received.append(json.loads(message.data))
 
     await subscriber_client.subscribe(f"telemetry.{DRONE}", cb=collect)
-    await subscriber_client.flush()
+    await round_trip(subscriber_client)
 
     pipeline = IngestPipeline(
         station_id="nats-p1-06",
@@ -92,7 +93,7 @@ async def test_a_subscriber_receives_every_position_update(
             seq += 1
         rows = await pipeline.process(EPOCH, batch)
         sent += len(rows)
-    await publisher_client.flush()
+    await round_trip(publisher_client)
 
     expected = BATCHES * POSITIONS_PER_BATCH
     assert sent == expected, "the pipeline did not produce one row per position"
@@ -121,7 +122,7 @@ async def test_a_message_that_is_not_a_position_publishes_nothing(
         received.append(message.data)
 
     await subscriber_client.subscribe(f"telemetry.{DRONE}", cb=collect)
-    await subscriber_client.flush()
+    await round_trip(subscriber_client)
     pipeline = IngestPipeline(
         station_id="nats-p1-06-absent",
         resolver=cast(Any, FakeResolver()),
@@ -130,7 +131,7 @@ async def test_a_message_that_is_not_a_position_publishes_nothing(
     )
 
     await pipeline.process(EPOCH, [record(0, heartbeat()), record(1, heartbeat())])
-    await publisher_client.flush()
+    await round_trip(publisher_client)
     await asyncio.sleep(0.3)
 
     assert received == []
