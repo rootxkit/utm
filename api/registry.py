@@ -22,6 +22,10 @@ the relational commit fails after the projection succeeded, the telemetry
 database knows a drone this one does not: harmless, because the projection is
 never an authority, and registering again rewrites it.
 
+Retiring is the other way round, because closing a binding is not harmless
+to leave behind: the projection follows the relational commit, and a failure
+there is repaired by retiring again (`FleetRegistry.retire_drone`).
+
 ## Status is derived, never stored
 
 P2-05 requires drone status to come from telemetry freshness, not from a
@@ -88,6 +92,14 @@ class NotFoundError(RegistryError):
 class ConflictError(RegistryError):
     def __init__(self, message: str, *, code: str = "conflict") -> None:
         super().__init__("conflict", message, code=code)
+
+
+class ProjectionIncompleteError(RegistryError):
+    """The relational change committed; the telemetry projection did not
+    follow. Repeating the request finishes it."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("projection_incomplete", message)
 
 
 # What a refusal by a database constraint is called, by SQLSTATE. The
@@ -516,6 +528,17 @@ class FleetRegistry:
 
         The projection is marked retired and every open binding is closed, so
         its SYSID stops being attributed to it from now on.
+
+        Unlike registering, the telemetry writes come *after* the relational
+        commit. Closing a binding cannot be undone by a rollback here, so
+        doing it inside the transaction meant a failed audit insert or commit
+        left the drone active in this database and unattributable in that
+        one, with nothing to repair it. In this order the only partial state
+        is the recoverable one: retired here, bindings still open there. The
+        caller is told (`ProjectionIncompleteError`), and retiring the drone
+        again repairs it: an already-retired drone has its projection
+        re-applied, idempotently and at its recorded `retired_at`, before
+        the request is refused as a conflict.
         """
         at = self._now()
         async with self.engine.begin() as connection:
@@ -529,30 +552,65 @@ class FleetRegistry:
                     {"id": str(drone_id), "at": at},
                 )
             ).one_or_none()
+            existing = None
             if updated is None:
-                exists = (
+                existing = (
                     await connection.execute(
-                        sa.text("SELECT 1 FROM drones WHERE id = :id"),
+                        sa.text("SELECT label, retired_at FROM drones WHERE id = :id"),
                         {"id": str(drone_id)},
                     )
                 ).one_or_none()
-                if exists is None:
+                if existing is None:
                     raise NotFoundError(f"no drone {drone_id}")
-                raise ConflictError(f"drone {drone_id} is already retired")
-            drone = _row(updated)
-            closed = await self.projection.close_bindings_for_drone(drone_id, at=at)
-            await self.projection.register_drone(
-                drone_id, drone["label"], retired_at=at
+            else:
+                await self._audit(
+                    connection, "drone", drone_id, "retired", {}, actor=actor
+                )
+
+        if existing is not None:
+            # Retired before. Finish a projection an earlier attempt may have
+            # left incomplete, then refuse as before.
+            await self._project_retirement(
+                drone_id, existing.label, existing.retired_at, actor=actor
             )
-            await self._audit(
-                connection,
-                "drone",
-                drone_id,
-                "retired",
-                {"bindings_closed": closed},
-                actor=actor,
+            raise ConflictError(
+                f"drone {drone_id} is already retired", code="already_retired"
             )
+        assert updated is not None
+        drone = _row(updated)
+        await self._project_retirement(drone_id, drone["label"], at, actor=actor)
         return await self._with_status(drone)
+
+    async def _project_retirement(
+        self, drone_id: UUID, label: str, at: datetime, *, actor: Actor
+    ) -> int:
+        """Close the drone's bindings and mark its projection retired, after
+        the relational retirement committed. Idempotent: a binding already
+        closed is not closed again. Audited as `bindings_closed` when it
+        closed any."""
+        try:
+            closed = await self.projection.close_bindings_for_drone(drone_id, at=at)
+            await self.projection.register_drone(drone_id, label, retired_at=at)
+        except Exception as error:
+            _log.error(
+                "drone retired but its telemetry projection was not updated",
+                extra={"drone_id": str(drone_id), "error": repr(error)},
+            )
+            raise ProjectionIncompleteError(
+                f"drone {drone_id} is retired, but its telemetry bindings could "
+                "not be closed; retire it again to finish"
+            ) from error
+        if closed:
+            async with self.engine.begin() as connection:
+                await self._audit(
+                    connection,
+                    "drone",
+                    drone_id,
+                    "bindings_closed",
+                    {"bindings_closed": closed, "at": at},
+                    actor=actor,
+                )
+        return closed
 
     async def _with_status(self, drone: dict[str, Any]) -> dict[str, Any]:
         try:

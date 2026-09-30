@@ -36,6 +36,7 @@ from api.registry import (
     FleetRegistry,
     NotFoundError,
     PilotStatus,
+    ProjectionIncompleteError,
     RegistryError,
 )
 from api.replay import DroneNotFoundError, ReplayError, ReplayStore, WindowTooLargeError
@@ -164,6 +165,10 @@ def _http(error: RegistryError) -> HTTPException:
         return HTTPException(status_code=404, detail=detail)
     if isinstance(error, ConflictError):
         return HTTPException(status_code=409, detail=detail)
+    if isinstance(error, ProjectionIncompleteError):
+        # The change was made; its effect on telemetry was not. A retry
+        # completes it, which is what 503 tells a client.
+        return HTTPException(status_code=503, detail=detail)
     return HTTPException(status_code=400, detail=detail)
 
 
