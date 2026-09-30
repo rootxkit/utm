@@ -256,7 +256,7 @@ class RelayServer:
         log = bind(_log, station_id=station_id)
 
         try:
-            hello = await self._handshake(connection, station_id, log)
+            hello, resume_from_seq = await self._handshake(connection, station_id, log)
         except ControlMessageError as error:
             log.warning("handshake rejected", extra={"error": str(error)})
             await connection.close(_CLOSE_PROTOCOL_ERROR, "bad hello")
@@ -280,13 +280,19 @@ class RelayServer:
             tracker=tracker,
             log=log,
             generation=self._next_generation(station_id),
+            resume_from_seq=resume_from_seq,
+            newest_seq_held=hello.newest_seq_held,
         )
         await session.run()
 
     async def _handshake(
         self, connection: ServerConnection, station_id: str, log: BoundLogger
-    ) -> Hello:
-        """Read `hello`, answer `welcome` with the durable resume point."""
+    ) -> tuple[Hello, int]:
+        """Read `hello`, answer `welcome` with the durable resume point.
+
+        Returns the `hello` and the `resume_from_seq` that was sent, which is
+        what a `gap` on this session is checked against.
+        """
         raw = await connection.recv()
         if isinstance(raw, bytes):
             raise ControlMessageError(
@@ -330,7 +336,7 @@ class RelayServer:
             )
 
         await connection.send(build_welcome(resume_from_seq))
-        return message
+        return message, resume_from_seq
 
 
 @dataclass
@@ -344,13 +350,20 @@ class _Session:
     tracker: StationLinkTracker
     log: BoundLogger
     generation: int = 0
+    # What `welcome` said, so a `gap` can be checked against it (§11).
+    resume_from_seq: int = 0
+    # What `hello` declared as the newest record on the relay's disk. A gap
+    # cannot end beyond it: the records past it were never assigned.
+    newest_seq_held: int = -1
 
     def __post_init__(self) -> None:
         # The highest seq durably stored for this epoch, cumulative. -1 means
         # nothing is storable yet, which is distinct from 0 - acknowledging
-        # seq 0 would claim a record that may never have arrived.
-        self._watermark = -1
-        self._acked = -1
+        # seq 0 would claim a record that may never have arrived. Starts at
+        # the durable watermark `welcome` was computed from, and is taken as
+        # already acknowledged: the relay learned it from `welcome`.
+        self._watermark = self.resume_from_seq - 1
+        self._acked = self._watermark
         self._last_state: LinkState | None = None
         self.tracker.start_session()
 
@@ -468,6 +481,27 @@ class _Session:
         if gap.epoch != self.epoch:
             raise ControlMessageError(
                 f"gap declares epoch {gap.epoch} on a session for {self.epoch}"
+            )
+        # §11: a gap is the relay's answer to `resume_from_seq` asking for
+        # records the cap discarded, so it starts exactly where we asked and
+        # ends no later than one past the newest record `hello` said the relay
+        # held. Anything else is not loss but confusion about which station
+        # or epoch is being discussed, and §11 says the two must never be
+        # conflated: recording it would advance the resume point over records
+        # that may still exist. Refused as a protocol error, which closes the
+        # connection; the relay reconnects with backoff (§12) and a gap that
+        # keeps failing this check is an operator problem the logs name.
+        if gap.from_seq != self._watermark + 1:
+            raise ControlMessageError(
+                f"gap starts at {gap.from_seq} but the resume point is "
+                f"{self._watermark + 1}; a gap begins where the server asked "
+                f"the relay to resume"
+            )
+        if gap.to_seq > self.newest_seq_held + 1:
+            raise ControlMessageError(
+                f"gap ends at {gap.to_seq} but hello declared "
+                f"newest_seq_held={self.newest_seq_held}; records past "
+                f"{self.newest_seq_held + 1} were never assigned"
             )
 
         # Recorded before the watermark moves. §11: a recorded gap advances the

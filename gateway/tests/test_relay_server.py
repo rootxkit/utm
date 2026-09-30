@@ -1123,3 +1123,101 @@ async def test_a_reporter_that_raises_does_not_break_ingest() -> None:
     assert ack["seq"] == 3
     assert reporter.attempts >= 3, "the reporter stopped after the first failure"
     assert len(store.records[(STATION, EPOCH)]) == 4
+
+
+# --- a gap is checked against the resume point and the hello (S-08) --------
+
+
+async def send_gap(connection: Any, from_seq: int, to_seq: int) -> None:
+    await connection.send(
+        json.dumps(
+            {
+                "type": "gap",
+                "epoch": EPOCH,
+                "from_seq": from_seq,
+                "to_seq": to_seq,
+                "reason": "queue_cap",
+            }
+        )
+    )
+
+
+async def expect_closed(connection: Any) -> websockets.ConnectionClosed:
+    with pytest.raises(websockets.ConnectionClosed) as caught:
+        for _ in range(20):
+            await asyncio.wait_for(connection.recv(), timeout=5.0)
+    return caught.value
+
+
+async def test_a_gap_that_does_not_start_at_the_resume_point_is_refused() -> None:
+    """§11: a gap begins where `welcome` asked the relay to resume. One that
+    starts elsewhere would advance the resume point over records that may
+    still exist, so it is a protocol error and nothing is recorded."""
+    store = OrderRecordingStore()
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(batch(0, 10))
+        await read_until(connection, "ack")
+        await send_gap(connection, 12, 40)
+        closed = await expect_closed(connection)
+
+    assert closed.rcvd is not None and closed.rcvd.code == 1008
+    assert "gap:12-40" not in store.calls
+    assert (STATION, EPOCH) not in store.gaps
+
+
+async def test_a_gap_ending_past_the_newest_record_held_is_refused() -> None:
+    """The records past `newest_seq_held + 1` were never assigned, so a gap
+    claiming them is confusion about the epoch, not loss."""
+    store = OrderRecordingStore()
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=50))
+        await send_gap(connection, 0, 52)
+        closed = await expect_closed(connection)
+
+    assert closed.rcvd is not None and closed.rcvd.code == 1008
+    assert (STATION, EPOCH) not in store.gaps
+
+
+async def test_a_gap_ending_exactly_one_past_the_newest_record_is_accepted() -> None:
+    """The presence half, on the boundary: the relay lost everything it held,
+    including the newest record, and says so with `to_seq = newest + 1`."""
+    store = OrderRecordingStore()
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=50))
+        await send_gap(connection, 0, 51)
+        ack = await read_until(connection, "ack")
+
+    assert ack["seq"] == 50
+    assert "gap:0-51" in store.calls
+
+
+async def test_a_gap_on_a_resumed_session_starts_at_the_durable_resume_point() -> None:
+    """The check uses what `welcome` said, not a watermark that starts at -1
+    on every connection. A relay resuming from 500 sends a gap from 500."""
+    store = OrderRecordingStore()
+    await store.store_records(
+        STATION,
+        EPOCH,
+        [Record(seq=n, recv_utc_ns=0, datagram=b"x") for n in range(500)],
+    )
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        welcome = await handshake(connection, hello())
+        assert welcome["resume_from_seq"] == 500
+        await send_gap(connection, 500, 600)
+        ack = await read_until(connection, "ack")
+
+    assert ack["seq"] == 599
+    assert "gap:500-600" in store.calls
