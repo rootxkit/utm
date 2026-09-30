@@ -26,6 +26,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import sqlalchemy as sa
@@ -53,7 +54,12 @@ class TerrainTiles(Protocol):
 
 class AuditLog(Protocol):
     async def record(
-        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+        self,
+        alert: Alert,
+        state: str,
+        *,
+        at: datetime,
+        reason: ClearReason | None = None,
     ) -> None: ...
 
 
@@ -80,8 +86,18 @@ class EventsAuditLog:
     engine: AsyncEngine
 
     async def record(
-        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+        self,
+        alert: Alert,
+        state: str,
+        *,
+        at: datetime | None = None,
+        reason: ClearReason | None = None,
     ) -> None:
+        """One row per aircraft, stamped `at`: when the transition happened,
+        not when the background writer got to it (S-13). The service always
+        passes it; a direct caller without one gets the write time."""
+        if at is None:
+            at = datetime.now(UTC)
         payload = alert.as_dict()
         if reason is not None:
             payload["reason"] = reason.value
@@ -89,12 +105,13 @@ class EventsAuditLog:
             for drone_id in alert.drone_ids:
                 await connection.execute(
                     sa.text(
-                        "INSERT INTO events (actor_type, entity_type, entity_id, "
-                        " event_type, payload) "
-                        "VALUES (:actor, 'drone', :drone_id, :event_type, "
+                        "INSERT INTO events (ts, actor_type, entity_type, "
+                        " entity_id, event_type, payload) "
+                        "VALUES (:ts, :actor, 'drone', :drone_id, :event_type, "
                         " CAST(:payload AS jsonb))"
                     ),
                     {
+                        "ts": at,
                         "actor": ACTOR_TYPE,
                         "drone_id": str(drone_id),
                         "event_type": f"airspace_alert_{state}",
@@ -103,7 +120,13 @@ class EventsAuditLog:
                 )
 
 
-AuditEntry = tuple[Alert, str, ClearReason | None]
+@dataclass(frozen=True, slots=True)
+class AuditEntry:
+    alert: Alert
+    state: str
+    reason: ClearReason | None
+    # When the transition happened, taken as the row is queued.
+    at: datetime
 
 
 @dataclass
@@ -129,7 +152,15 @@ class AirspaceService:
     # failures, audit queue), so a backlog or a broken tile shows up in a
     # log that is otherwise quiet. This is a log cadence, not policy.
     status_every_s: float = 60.0
+    # How long `close()` waits for queued audit rows before abandoning
+    # them, counted and logged. The default matches the settings.
+    close_timeout_s: float = 5.0
     audit_overflow: int = field(default=0, init=False)
+    # Rows the writer tried and the database refused (logged each time).
+    audit_failures: int = field(default=0, init=False)
+    # Rows never attempted: still queued, or in flight, when the writer
+    # was stopped.
+    audit_abandoned: int = field(default=0, init=False)
     _status_logged_at_s: float | None = field(default=None, init=False)
     _audit_queue: asyncio.Queue[AuditEntry] = field(init=False)
     _audit_writer: asyncio.Task[None] | None = field(default=None, init=False)
@@ -148,8 +179,22 @@ class AirspaceService:
         await self._audit_queue.join()
 
     async def close(self) -> None:
-        """Write what is queued, then stop the writer."""
-        await self.flush_audit()
+        """Write what is queued, for at most `close_timeout_s`, then stop
+        the writer. Rows still queued are abandoned, counted and logged;
+        the one in flight, if any, is counted by the writer as it stops."""
+        try:
+            await asyncio.wait_for(self.flush_audit(), timeout=self.close_timeout_s)
+        except TimeoutError:
+            left = self._audit_queue.qsize()
+            self.audit_abandoned += left
+            _log.error(
+                "audit rows abandoned at close: the database did not answer in time",
+                extra={
+                    "close_timeout_s": self.close_timeout_s,
+                    "abandoned_now": left,
+                    "audit_abandoned": self.audit_abandoned,
+                },
+            )
         if self._audit_writer is not None:
             self._audit_writer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -199,6 +244,8 @@ class AirspaceService:
             "check_failures": self.monitor.check_failures,
             "audit_pending": self.audit_pending,
             "audit_overflow": self.audit_overflow,
+            "audit_failures": self.audit_failures,
+            "audit_abandoned": self.audit_abandoned,
         }
 
     def _log_status(self, now_s: float) -> None:
@@ -251,7 +298,8 @@ class AirspaceService:
             ),
         )
         if self.audit is not None:
-            self._enqueue_audit((alert, state, reason))
+            at = datetime.fromtimestamp(self.clock(), tz=UTC)
+            self._enqueue_audit(AuditEntry(alert, state, reason, at))
 
     def _enqueue_audit(self, entry: AuditEntry) -> None:
         # Started on first use rather than in a `start()` a caller could
@@ -263,14 +311,11 @@ class AirspaceService:
         try:
             self._audit_queue.put_nowait(entry)
         except asyncio.QueueFull:
-            alert, state, reason = entry
             self.audit_overflow += 1
             _log.error(
                 "audit row dropped: the audit queue is full",
                 extra={
-                    "key": alert.key,
-                    "state": state,
-                    "reason": None if reason is None else reason.value,
+                    **_entry_context(entry),
                     "audit_queue_size": self.audit_queue_size,
                     "audit_overflow": self.audit_overflow,
                 },
@@ -279,11 +324,45 @@ class AirspaceService:
     async def _write_audit(self) -> None:
         assert self.audit is not None
         while True:
-            alert, state, reason = await self._audit_queue.get()
+            entry = await self._audit_queue.get()
             try:
-                await _guard("audit", self.audit.record(alert, state, reason=reason))
-            finally:
-                self._audit_queue.task_done()
+                written = await _guard(
+                    "audit",
+                    self.audit.record(
+                        entry.alert, entry.state, at=entry.at, reason=entry.reason
+                    ),
+                )
+            except asyncio.CancelledError:
+                # Stopped mid-write: the row is lost, and is not marked done,
+                # so nothing can take a join() for a promise it was written.
+                self.audit_abandoned += 1
+                _log.error(
+                    "audit row abandoned: the writer was stopped mid-write",
+                    extra={
+                        **_entry_context(entry),
+                        "audit_abandoned": self.audit_abandoned,
+                    },
+                )
+                raise
+            if not written:
+                self.audit_failures += 1
+                _log.error(
+                    "audit row not written",
+                    extra={
+                        **_entry_context(entry),
+                        "audit_failures": self.audit_failures,
+                    },
+                )
+            self._audit_queue.task_done()
+
+
+def _entry_context(entry: AuditEntry) -> dict[str, Any]:
+    return {
+        "key": entry.alert.key,
+        "state": entry.state,
+        "reason": None if entry.reason is None else entry.reason.value,
+        "at": entry.at.isoformat(),
+    }
 
 
 def _position(message: dict[str, Any]) -> tuple[float, float] | None:
@@ -331,7 +410,8 @@ async def run_ticker(
                 )
 
 
-async def _guard(what: str, action: Awaitable[None]) -> None:
+async def _guard(what: str, action: Awaitable[None]) -> bool:
+    """Run the delivery step; False, and a log line, when it raised."""
     try:
         await action
     except Exception as error:
@@ -339,3 +419,5 @@ async def _guard(what: str, action: Awaitable[None]) -> None:
             "could not deliver an airspace alert",
             extra={"step": what, "error": repr(error)},
         )
+        return False
+    return True

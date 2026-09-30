@@ -62,6 +62,7 @@ async def run(settings: AirspaceSettings) -> None:
         bus=bus,
         audit=EventsAuditLog(engine),
         audit_queue_size=settings.audit_queue_size,
+        close_timeout_s=settings.audit_close_timeout_s,
         tiles=terrain,
     )
     _log.info(

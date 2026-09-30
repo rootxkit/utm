@@ -60,3 +60,10 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     audit_queue_size: int = Field(
         default=1000, ge=1, validation_alias="AUDIT_QUEUE_SIZE"
     )
+    # S-13. How long shutdown waits for queued audit rows to be written.
+    # Rows still queued after it are abandoned, counted and logged. Five
+    # seconds is a few database round trips, and well inside the grace a
+    # container gets before SIGKILL.
+    audit_close_timeout_s: float = Field(
+        default=5.0, gt=0, validation_alias="AUDIT_CLOSE_TIMEOUT_S"
+    )

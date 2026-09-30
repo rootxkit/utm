@@ -63,18 +63,25 @@ class RecordingAudit:
         self, *, fail: bool = False, gate: asyncio.Event | None = None
     ) -> None:
         self.rows: list[tuple[str, str]] = []
+        self.times: list[datetime] = []
         self.fail = fail
         # When set, every write waits for it: a slow database.
         self.gate = gate
 
     async def record(
-        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+        self,
+        alert: Alert,
+        state: str,
+        *,
+        at: datetime,
+        reason: ClearReason | None = None,
     ) -> None:
         if self.gate is not None:
             await self.gate.wait()
         if self.fail:
             raise ConnectionError("database is gone")
         self.rows.append((alert.key, state if reason is None else f"{state}:{reason}"))
+        self.times.append(at)
 
 
 class Clock:
@@ -171,6 +178,11 @@ async def test_an_audit_failure_does_not_stop_the_publish_or_the_writer(
     await svc.flush_audit()
     assert len(bus.sent) == 1
     assert [r.step for r in _delivery_errors(caplog)] == ["audit"]
+    assert svc.audit_failures == 1
+    not_written: list[Any] = [
+        r for r in caplog.records if r.getMessage() == "audit row not written"
+    ]
+    assert [(r.state, r.audit_failures) for r in not_written] == [("raised", 1)]
 
     # The writer survived the failure: the next row is written.
     audit.fail = False
@@ -339,6 +351,54 @@ async def test_close_writes_what_is_queued() -> None:
 
     assert len(audit.rows) == 1
     assert svc._audit_writer is None
+    assert (svc.audit_abandoned, svc.audit_failures) == (0, 0)
+
+
+async def test_the_audit_row_keeps_the_time_of_the_transition_not_the_write() -> None:
+    """Should-fix 3. The database stalls for 100 s; the row, once written,
+    still says when the alert was raised."""
+    gate = asyncio.Event()
+    bus, audit = RecordingBus(), RecordingAudit(gate=gate)
+    svc, clock = service(bus, audit)
+    clock.now_s = 1_700_000_000.0
+    await svc.on_telemetry(payload(A, 0, 10, at_s=clock.now_s))
+    await svc.on_telemetry(payload(B, 500, -10, at_s=clock.now_s))
+    raised_at = datetime.fromtimestamp(clock.now_s, tz=UTC)
+
+    clock.now_s += 100.0
+    gate.set()
+    await asyncio.wait_for(svc.flush_audit(), timeout=5.0)
+
+    assert audit.times == [raised_at]
+    await svc.close()
+
+
+async def test_close_abandons_what_the_database_never_took_and_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Should-fix 4 and 5. The database never answers: one row is in flight,
+    one queued. `close()` gives up after the timeout, and both are counted
+    as abandoned, neither as written."""
+    bus, audit = RecordingBus(), RecordingAudit(gate=asyncio.Event())
+    svc, clock = service(bus, audit)
+    svc.close_timeout_s = 0.05
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    clock.now_s = 20.0
+    await svc.on_tick()
+    assert [body["state"] for _, body in bus.sent] == ["raised", "cleared"]
+
+    await asyncio.wait_for(svc.close(), timeout=5.0)
+
+    assert audit.rows == []
+    assert svc.audit_abandoned == 2
+    assert svc._audit_writer is None
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert messages == [
+        "audit rows abandoned at close: the database did not answer in time",
+        "audit row abandoned: the writer was stopped mid-write",
+    ]
+    assert svc.status()["audit_abandoned"] == 2
 
 
 async def test_a_garbled_message_is_skipped_and_the_next_one_counts() -> None:
