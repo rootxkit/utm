@@ -211,8 +211,14 @@ signed datagrams. Every position was compared with the same vehicle's
   observations each, with the same agreement.
   - SYSID 1 and 2: airborne at 685.1 m AMSL and 80.0 m over take-off.
   - SYSID 3: on the ground.
-- **Faults:** one message per datagram with 30% dropped. 24 datagrams were
-  sent, 17 were dropped, and 14 observations were stored.
+- **Faults:** one message per datagram with 30% dropped, and a new serial
+  on SYSID 1's transmitter address. 24 datagrams were sent and 17 dropped,
+  and 16 observations were stored. The first 2 were stored under the serial
+  of the run just before. The ingest joins messages by transmitter address
+  and keeps an identity for 60 s, so those Locations arrived before the new
+  Basic ID. A real module does not change its serial, but a spoofer on a
+  reused address would do the same. `--spoof-serial` therefore uses its own
+  address.
 - **What this does not check:** the real geoid model. It is not installed on
   the laptop, so both processes used a flat 15.9 m grid. The HAE to AMSL
   round trip is checked; EGM2008 itself is not.
