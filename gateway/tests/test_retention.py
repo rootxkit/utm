@@ -23,6 +23,7 @@ import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
@@ -32,7 +33,7 @@ from gateway.archive import RawArchive
 from gateway.ingest_store import StoreError
 from gateway.ingest_store_pg import TimescaleIngestStore
 from gateway.relay_records import Record
-from gateway.retention import ArchiveRetention
+from gateway.retention import ArchiveRetention, listing_query
 
 pytestmark = pytest.mark.postgres
 
@@ -795,3 +796,242 @@ async def test_a_file_with_many_index_rows_that_is_really_gone_is_reported_once(
     assert result.deleted_by_age == 4
     assert result.already_missing == 1
     assert "retention.missing_files" in await events_of(engine, station)
+
+
+# --- the listing is paged and indexed (S-07) -------------------------------
+
+
+async def test_the_listing_uses_the_retention_index(
+    store: TimescaleIngestStore, engine: AsyncEngine, station: str
+) -> None:
+    """The unscoped age listing, as production runs it, is shaped for the
+    two partial indexes of migration 0008. With sequential scans disabled
+    the planner must serve both the candidate scan and the newer-row probe
+    from them; if it cannot, the plan says so. EXPLAIN only: nothing here
+    reaches another station's rows."""
+
+    await store.store_records(station, EPOCH, records_at(NOW, 0, 5))
+    query = listing_query(station_id=None, stored_before=NOW, after=(NOW, ""), limit=10)
+    sql = str(
+        query.compile(dialect=engine.dialect, compile_kwargs={"literal_binds": True})
+    )
+    async with engine.begin() as connection:
+        await connection.execute(sa.text("SET LOCAL enable_seqscan = off"))
+        rows = await connection.execute(sa.text(f"EXPLAIN {sql}"))
+        plan = "\n".join(str(row[0]) for row in rows)
+
+    # Which index serves each side is a cost call the planner makes
+    # differently at five rows and at five million - in one run it took the
+    # unique constraint's index, which also orders by relative_path - so no
+    # index name is asserted. What is: the newer-row check is an anti-join,
+    # and with sequential scans off every side is served from an index, so
+    # the query has a shape the indexes of migration 0008 can serve.
+    assert "Anti Join" in plan, plan
+    assert "Seq Scan" not in plan, plan
+    assert "Index" in plan, plan
+
+
+async def test_a_path_with_many_index_rows_is_listed_once_and_deleted_whole(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    """One row per batch, 120 batches into one hour: one path, one unlink,
+    every row marked, and the totals add up."""
+    old = NOW - timedelta(days=RETENTION_DAYS + 1)
+    for n in range(120):
+        await store.store_records(station, EPOCH, records_at(old, n * 2, 2))
+    await backdate(store.engine, station, old)
+    assert await live_segments(engine, station) == 120
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_by_age == 120
+    assert result.records_destroyed == 240
+    assert result.already_missing == 0
+    assert await live_segments(engine, station) == 0
+    assert not list(archive.root.rglob("*.zst"))
+    assert (await events_of(engine, station)).count("retention.deleted.age") == 1
+
+
+async def test_the_age_sweep_pages_through_more_paths_than_one_listing(
+    store: TimescaleIngestStore,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    """Five hours past retention, listed two paths at a time: every page is
+    visited and every file goes. A keyset that skipped ties or stopped after
+    the first page would leave files behind with no error."""
+    retention = ArchiveRetention(
+        engine=engine,
+        archive=archive,
+        retention_days=RETENTION_DAYS,
+        max_bytes_per_station=10**9,
+        listing_page=2,
+    )
+    old = NOW - timedelta(days=RETENTION_DAYS + 1)
+    for hour in range(5):
+        await store.store_records(
+            station, EPOCH, records_at(old + timedelta(hours=hour), hour * 3, 3)
+        )
+    # All backdated to the same instant, so the keyset must break ties.
+    await backdate(store.engine, station, old)
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_by_age == 5
+    assert await live_segments(engine, station) == 0
+    assert not list(archive.root.rglob("*.zst"))
+
+
+async def test_the_ceiling_pages_until_the_station_is_under_it(
+    store: TimescaleIngestStore,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    """The presence half for the ceiling's paging: more over-ceiling paths
+    than one page holds, and it keeps going until the station fits."""
+    retention = ArchiveRetention(
+        engine=engine,
+        archive=archive,
+        retention_days=RETENTION_DAYS,
+        max_bytes_per_station=12_000,
+        listing_page=2,
+    )
+    base = NOW - timedelta(days=1)
+    for hour in range(8):
+        await store.store_records(
+            station, EPOCH, records_at(base + timedelta(hours=hour), hour * 20, 20)
+        )
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_by_ceiling > 2, "stopped after the first page"
+    async with engine.connect() as connection:
+        remaining = await connection.scalar(
+            sa.text(
+                "SELECT coalesce(sum(compressed_bytes), 0) FROM archive_segments "
+                "WHERE station_id = :s AND deleted_at IS NULL"
+            ),
+            {"s": station},
+        )
+    assert int(remaining) <= 12_000
+
+
+# --- an append between the listing and the lock (S-07) ---------------------
+
+
+class AppendsAfterListing(ArchiveRetention):
+    """Appends a batch to the first listed path right after listing it.
+
+    What a session does, minutes into a large sweep: the listing is stale,
+    and the file it named now holds acknowledged bytes the listing never
+    saw.
+    """
+
+    def __init__(self, *args: Any, store: TimescaleIngestStore, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.store = store
+        self.appended: list[str] = []
+
+    async def _list_paths(
+        self,
+        *,
+        station_id: str | None,
+        stored_before: datetime | None,
+        after: tuple[datetime, str] | None,
+    ) -> list[Any]:
+        page = await super()._list_paths(
+            station_id=station_id, stored_before=stored_before, after=after
+        )
+        if page and not self.appended:
+            first = page[0]
+            await self.store.store_records(
+                first.station_id, first.epoch, records_at(first.hour_start, 100, 5)
+            )
+            self.appended.append(first.relative_path)
+        return page
+
+
+async def test_a_file_appended_to_after_listing_survives_the_age_sweep(
+    store: TimescaleIngestStore,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    old = NOW - timedelta(days=RETENTION_DAYS + 1)
+    await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
+    retention = AppendsAfterListing(
+        engine=engine,
+        archive=archive,
+        retention_days=RETENTION_DAYS,
+        max_bytes_per_station=10**9,
+        store=store,
+    )
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert retention.appended, "the append never happened, so this proves nothing"
+    assert result.deleted_total == 0
+    assert result.skipped_appended == 1
+    assert await live_segments(engine, station) == 2
+    # The file is there, and both the old batch and the new one read back.
+    path = retention.appended[0]
+    stored = archive.read_segment(path)
+    assert [record.seq for record in stored] == list(range(10)) + list(range(100, 105))
+
+    # Presence: once the new row is old too, the file goes.
+    await backdate(store.engine, station, old)
+    later = await ArchiveRetention(
+        engine=engine,
+        archive=archive,
+        retention_days=RETENTION_DAYS,
+        max_bytes_per_station=10**9,
+    ).sweep(now=NOW, only_station=station)
+    assert later.deleted_by_age == 2
+    assert await live_segments(engine, station) == 0
+
+
+async def test_a_file_appended_to_after_listing_survives_the_ceiling_sweep(
+    store: TimescaleIngestStore,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    base = NOW - timedelta(days=1)
+    for hour in range(3):
+        await store.store_records(
+            station, EPOCH, records_at(base + timedelta(hours=hour), hour * 20, 20)
+        )
+    retention = AppendsAfterListing(
+        engine=engine,
+        archive=archive,
+        retention_days=RETENTION_DAYS,
+        # Under everything, so the ceiling wants the oldest path gone.
+        max_bytes_per_station=12_000,
+        store=store,
+    )
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert retention.appended
+    assert result.skipped_appended == 1
+    appended = retention.appended[0]
+    stored = archive.read_segment(appended)
+    assert list(range(100, 105)) == [r.seq for r in stored if r.seq >= 100]
+    async with engine.connect() as connection:
+        live = await connection.scalar(
+            sa.text(
+                "SELECT count(*) FROM archive_segments WHERE relative_path = :p "
+                "AND deleted_at IS NULL"
+            ),
+            {"p": appended},
+        )
+    assert live == 2
+    # The ceiling still acted, on the paths that were not touched.
+    assert result.deleted_by_ceiling >= 1
