@@ -54,7 +54,9 @@ and P5-09, not built here.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
@@ -155,6 +157,8 @@ class AirspaceMonitor:
     max_height_agl_m: float | None = None
     stale_after_s: float = 15.0
     clear_after_s: float = 3.0
+    # Wall time, for zones in force only at certain times (P5-18).
+    wall: Callable[[], datetime] = field(default=lambda: datetime.now(UTC))
 
     index: NeighbourIndex = field(init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
@@ -186,8 +190,13 @@ class AirspaceMonitor:
             self.index.upsert(track)
             self._last_seen_s[drone_id] = now_s
             raised.extend(self._check_conflicts(track, now_s))
-            raised.extend(self._check_zones(track, now_s))
-            raised.extend(self._check_height(track, now_s))
+            ground = (
+                None
+                if self.terrain is None
+                else self.terrain.elevation(track.lat_deg, track.lon_deg)
+            )
+            raised.extend(self._check_zones(track, ground, now_s))
+            raised.extend(self._check_height(track, ground, now_s))
             # Every active alert this aircraft is part of was just evaluated.
             # The ones not refreshed are false as of this message.
             for key, alert in self._active.items():
@@ -241,10 +250,18 @@ class AirspaceMonitor:
             },
         )
 
-    def _check_zones(self, track: Track, now_s: float) -> list[Alert]:
+    def _check_zones(
+        self, track: Track, ground: Elevation | None, now_s: float
+    ) -> list[Alert]:
         raised: list[Alert] = []
+        height_agl_m = None if ground is None else track.alt_amsl_m - ground.elevation_m
+        at = self.wall()
         for zone in self.zones:
-            if not zone.contains(track.lat_deg, track.lon_deg, track.alt_amsl_m):
+            if not zone.in_force(at):
+                continue
+            if not zone.contains(
+                track.lat_deg, track.lon_deg, track.alt_amsl_m, height_agl_m
+            ):
                 continue
             key = zone_key(track.drone_id, zone)
             alert = Alert(
@@ -262,6 +279,16 @@ class AirspaceMonitor:
                     "zone_name": zone.name,
                     "zone_type": zone.type.value,
                     "alt_amsl_m": round(track.alt_amsl_m, 1),
+                    # From an authority's file (P5-18); absent for hand-drawn.
+                    **(
+                        {
+                            "external_id": zone.external_id,
+                            "restriction": zone.restriction,
+                            "message": zone.message,
+                        }
+                        if zone.external_id is not None
+                        else {}
+                    ),
                 },
             )
             self._last_true_s[key] = now_s
@@ -270,11 +297,10 @@ class AirspaceMonitor:
             self._active[key] = alert
         return raised
 
-    def _check_height(self, track: Track, now_s: float) -> list[Alert]:
-        if self.terrain is None or self.max_height_agl_m is None:
-            return []
-        ground = self.terrain.elevation(track.lat_deg, track.lon_deg)
-        if ground is None:
+    def _check_height(
+        self, track: Track, ground: Elevation | None, now_s: float
+    ) -> list[Alert]:
+        if ground is None or self.max_height_agl_m is None:
             return []
         height_agl_m = track.alt_amsl_m - ground.elevation_m
         if height_agl_m <= self.max_height_agl_m:
