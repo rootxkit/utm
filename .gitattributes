@@ -9,6 +9,10 @@ Makefile      text eol=lf
 *.yml         text eol=lf
 *.yaml        text eol=lf
 
+# Sourced by run_sitl.sh inside WSL, where a CRLF line is a syntax error.
+# A Windows checkout copied to sim/sitl.env would otherwise break it.
+*.env.example text eol=lf
+
 # Binary flight artifacts, should any ever be committed deliberately.
 *.bin         binary
 *.tlog        binary
