@@ -125,7 +125,12 @@ class AirspaceService:
     # about 26 MB, and the old synchronous read stalled every message behind
     # it. Once cached, `observe` answers from memory.
     tiles: TerrainTiles | None = None
+    # How often the tick logs the running totals (rejected telemetry, check
+    # failures, audit queue), so a backlog or a broken tile shows up in a
+    # log that is otherwise quiet. This is a log cadence, not policy.
+    status_every_s: float = 60.0
     audit_overflow: int = field(default=0, init=False)
+    _status_logged_at_s: float | None = field(default=None, init=False)
     _audit_queue: asyncio.Queue[AuditEntry] = field(init=False)
     _audit_writer: asyncio.Task[None] | None = field(default=None, init=False)
 
@@ -183,8 +188,32 @@ class AirspaceService:
                 },
             )
 
+    def status(self) -> dict[str, int]:
+        """The running totals, as the status line logs them."""
+        return {
+            "tracked": self.monitor.tracked,
+            "active_alerts": len(self.monitor.active),
+            "rejected_backlog": self.monitor.rejected_backlog,
+            "rejected_out_of_order": self.monitor.rejected_out_of_order,
+            "without_capture_time": self.monitor.without_capture_time,
+            "check_failures": self.monitor.check_failures,
+            "audit_pending": self.audit_pending,
+            "audit_overflow": self.audit_overflow,
+        }
+
+    def _log_status(self, now_s: float) -> None:
+        if (
+            self._status_logged_at_s is not None
+            and now_s - self._status_logged_at_s < self.status_every_s
+        ):
+            return
+        self._status_logged_at_s = now_s
+        _log.info("airspace monitor status", extra=self.status())
+
     async def on_tick(self) -> None:
-        await self._emit(self.monitor.tick(now_s=self.clock()))
+        now_s = self.clock()
+        await self._emit(self.monitor.tick(now_s=now_s))
+        self._log_status(now_s)
         # Refresh what is still active, on the bus only. An alert's numbers
         # change as the pair closes; a console showing "closest 2.8 m in
         # 57 s" from the moment it was raised is wrong a second later. Not

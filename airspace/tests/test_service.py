@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from datetime import UTC, datetime
 from typing import Any
@@ -299,6 +300,33 @@ async def test_a_tile_that_cannot_be_read_is_logged_and_the_message_still_counts
     assert [r.drone_id for r in failures] == [str(A), str(B)]
     assert all(r.exc_info for r in failures)
     assert len(bus.sent) == 1
+
+
+async def test_the_tick_logs_the_running_totals_on_its_cadence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B1. The counters are only useful if someone can see them: one status
+    line per `status_every_s`, with the rejected totals."""
+    caplog.set_level(logging.INFO, logger="airspace.service")
+    bus = RecordingBus()
+    svc, clock = service(bus)
+    svc.status_every_s = 10.0
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    # A backlog message: the station's offset is 0, this one is 30 s late.
+    await svc.on_telemetry(payload(A, 0, 10, at_s=-30.0))
+
+    for clock.now_s in (1.0, 5.0, 12.0):
+        await svc.on_tick()
+
+    lines: list[Any] = [
+        r for r in caplog.records if r.getMessage() == "airspace monitor status"
+    ]
+    assert len(lines) == 2, "at the first tick and 10 s later, not every tick"
+    assert lines[-1].rejected_backlog == 1
+    assert lines[-1].active_alerts == 1
+    assert lines[-1].tracked == 2
+    assert svc.status()["rejected_backlog"] == 1
 
 
 async def test_close_writes_what_is_queued() -> None:
