@@ -5,14 +5,8 @@ aircraft *is*, on every telemetry tick: the monitoring half, which is what a
 supervisor watching the air needs whether or not anyone planned the flight.
 
 Zones come from `airspace_zones` in the relational database (P2-01): a WGS84
-polygon, an optional AMSL band and, for zones imported from an authority's
-ED-269 file (P5-18), an optional band above the ground and the times it is in
-force. A missing bound is unbounded, so a zone with none is a column from the
-ground up, at all times.
-
-A bound above the ground is checked against the DEM (P5-00). Where the ground
-is unknown, the aircraft is taken to be inside that bound: a zone that cannot
-be ruled out is alerted, the safe side for a no-fly zone.
+polygon and an optional AMSL altitude band. A missing bound is unbounded, so a
+zone with neither is a column from the ground up.
 
 The containment test is ray casting on longitude and latitude, treating edges
 as straight in degrees. For zones a few kilometres across, the difference from
@@ -24,16 +18,13 @@ zone the size of a country would need the database's own `ST_Contains` on
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
-
-from airspace.ed269 import in_force
 
 Ring = tuple[tuple[float, float], ...]
 
@@ -53,36 +44,12 @@ class Zone:
     holes: tuple[Ring, ...]
     min_alt_amsl_m: float | None
     max_alt_amsl_m: float | None
-    min_height_agl_m: float | None = None
-    max_height_agl_m: float | None = None
-    # None: always in force (ed269.in_force).
-    applicability: list[dict[str, Any]] | None = field(default=None, compare=False)
-    # From an authority's file: its identifier and what it says.
-    external_id: str | None = None
-    restriction: str | None = None
-    message: str | None = None
 
-    def in_force(self, at: datetime) -> bool:
-        return in_force(self.applicability, at)
-
-    def contains(
-        self,
-        lat_deg: float,
-        lon_deg: float,
-        alt_amsl_m: float,
-        height_agl_m: float | None = None,
-    ) -> bool:
-        """`height_agl_m` None: the ground is unknown, and a bound above the
-        ground cannot rule the aircraft out."""
+    def contains(self, lat_deg: float, lon_deg: float, alt_amsl_m: float) -> bool:
         if self.min_alt_amsl_m is not None and alt_amsl_m < self.min_alt_amsl_m:
             return False
         if self.max_alt_amsl_m is not None and alt_amsl_m > self.max_alt_amsl_m:
             return False
-        if height_agl_m is not None:
-            if self.min_height_agl_m is not None and height_agl_m < self.min_height_agl_m:
-                return False
-            if self.max_height_agl_m is not None and height_agl_m > self.max_height_agl_m:
-                return False
         if not _in_ring(self.exterior, lon_deg, lat_deg):
             return False
         return not any(_in_ring(hole, lon_deg, lat_deg) for hole in self.holes)
@@ -111,12 +78,6 @@ def zone_from_geojson(
     geojson: str,
     min_alt_amsl_m: float | None,
     max_alt_amsl_m: float | None,
-    min_height_agl_m: float | None = None,
-    max_height_agl_m: float | None = None,
-    applicability: list[dict[str, Any]] | None = None,
-    external_id: str | None = None,
-    restriction: str | None = None,
-    message: str | None = None,
 ) -> Zone:
     geometry: dict[str, Any] = json.loads(geojson)
     if geometry.get("type") != "Polygon":
@@ -133,20 +94,13 @@ def zone_from_geojson(
         holes=tuple(rings[1:]),
         min_alt_amsl_m=min_alt_amsl_m,
         max_alt_amsl_m=max_alt_amsl_m,
-        min_height_agl_m=min_height_agl_m,
-        max_height_agl_m=max_height_agl_m,
-        applicability=applicability,
-        external_id=external_id,
-        restriction=restriction,
-        message=message,
     )
 
 
 _ZONES = sa.text(
     """
     SELECT id, name, type, ST_AsGeoJSON(geom) AS geojson,
-           min_alt_amsl_m, max_alt_amsl_m, min_height_agl_m, max_height_agl_m,
-           applicability, external_id, restriction, message
+           min_alt_amsl_m, max_alt_amsl_m
     FROM airspace_zones
     WHERE type IN ('no_fly', 'restricted')
     ORDER BY name
@@ -165,12 +119,6 @@ async def load_zones(engine: AsyncEngine) -> list[Zone]:
             geojson=row.geojson,
             min_alt_amsl_m=row.min_alt_amsl_m,
             max_alt_amsl_m=row.max_alt_amsl_m,
-            min_height_agl_m=row.min_height_agl_m,
-            max_height_agl_m=row.max_height_agl_m,
-            applicability=row.applicability,
-            external_id=row.external_id,
-            restriction=row.restriction,
-            message=row.message,
         )
         for row in rows
     ]
