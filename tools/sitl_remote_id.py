@@ -523,19 +523,32 @@ class Bridge:
     def step(self) -> None:
         """Read everything waiting, broadcast what is due, deliver what is due."""
         now_s = self.clock_s()
+        # Vehicles may share a connection (one stream carrying several
+        # SYSIDs); each state keeps only its own vehicle's messages.
+        for source in self._sources():
+            while (msg := source.recv_match(blocking=False)) is not None:
+                if msg.get_type() == "BAD_DATA":
+                    continue
+                for vehicle in self.vehicles:
+                    if vehicle.source is source:
+                        vehicle.module.state.update(msg, now_s=now_s)
         for vehicle in self.vehicles:
-            while (msg := vehicle.source.recv_match(blocking=False)) is not None:
-                if msg.get_type() != "BAD_DATA":
-                    vehicle.module.state.update(msg, now_s=now_s)
             for payload in vehicle.module.tick(now_s):
                 self.link.submit(vehicle.transmitter, payload, now_s=now_s)
         for transmitter, payload in self.link.due(now_s):
             self.send(self.receiver.datagram(transmitter, payload))
             self.sent += 1
 
-    def close(self) -> None:
+    def _sources(self) -> list[MavlinkSource]:
+        unique: list[MavlinkSource] = []
         for vehicle in self.vehicles:
-            vehicle.source.close()
+            if not any(vehicle.source is seen for seen in unique):
+                unique.append(vehicle.source)
+        return unique
+
+    def close(self) -> None:
+        for source in self._sources():
+            source.close()
 
 
 # --- command line -------------------------------------------------------------
@@ -543,6 +556,8 @@ class Bridge:
 
 def mavlink_address(args: argparse.Namespace, sysid: int) -> str:
     """Where `make sim` puts instance i (SYSID base + i): UDP 14560 + i, TCP 5760 + 10 i."""
+    if args.mavlink is not None:
+        return str(args.mavlink)
     index = sysid - args.sysid_base
     if args.link == "tcp":
         return f"tcp:{args.mavlink_host}:{args.tcp_port_base + args.tcp_stride * index}"
@@ -575,6 +590,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--operator-id", action="append", default=[])
     parser.add_argument("--ua-type", type=int, default=UA_TYPE_MULTIROTOR)
     parser.add_argument("--link", choices=("udp", "tcp"), default="udp")
+    parser.add_argument(
+        "--mavlink",
+        help="one pymavlink address for every vehicle, e.g. udpin:127.0.0.1:14550",
+    )
     parser.add_argument("--mavlink-host", default="127.0.0.1")
     parser.add_argument("--udp-port-base", type=int, default=14560)
     parser.add_argument("--tcp-port-base", type=int, default=5760)
@@ -668,6 +687,7 @@ def main(
         stale_after_s=args.stale_after_s,
     )
     vehicles = []
+    sources: dict[str, MavlinkSource] = {}
     for sysid, serial, operator_id in zip(
         args.sysid, args.serial, args.operator_id, strict=True
     ):
@@ -681,7 +701,9 @@ def main(
             transport=args.transport,
             spoof_serial=args.spoof_serial,
         )
-        vehicles.append(Vehicle(module, connect(address), transmitter_for(sysid)))
+        if address not in sources:
+            sources[address] = connect(address)
+        vehicles.append(Vehicle(module, sources[address], transmitter_for(sysid)))
         claimed = f" (spoofing {args.spoof_serial})" if args.spoof_serial else ""
         print(f"SYSID {sysid} on {address} -> {serial}{claimed}")
 

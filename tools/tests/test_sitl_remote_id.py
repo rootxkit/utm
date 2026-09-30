@@ -835,3 +835,68 @@ def test_main_refuses_a_key_file_that_is_not_there(
     )
     assert status == 2
     assert capsys.readouterr().out.startswith("error:")
+
+
+def test_vehicles_sharing_one_stream_each_take_their_own_messages() -> None:
+    """--mavlink: one connection carrying several SYSIDs (QGC's fan-out)."""
+    shared = FakeSource(
+        [
+            position(sysid=1, lat_e7=411000000),
+            position(sysid=2, lat_e7=412000000),
+            heartbeat(armed=True),
+            system_time(),
+        ]
+    )
+    rids = {}
+    for sysid in (1, 2):
+        rids[sysid] = RidModule(
+            state=VehicleState(sysid=sysid),
+            identity=Identity(f"S{sysid}", "OP"),
+            geoid=FlatGeoid(),
+        )
+    datagrams: list[bytes] = []
+    b = Bridge(
+        vehicles=[Vehicle(rids[s], shared, bridge.transmitter_for(s)) for s in (1, 2)],
+        receiver=Receiver("rx"),
+        link=FaultyLink(),
+        send=datagrams.append,
+        clock_s=lambda: 0.0,
+    )
+
+    b.step()
+    b.close()
+
+    assert shared.messages == []
+    assert shared.closed
+    lats = {
+        one(
+            odid.decode(bytes.fromhex(json.loads(d)["payload_hex"])), odid.BasicId
+        ).ua_id: one(
+            odid.decode(bytes.fromhex(json.loads(d)["payload_hex"])), odid.Location
+        ).lat_deg
+        for d in datagrams
+    }
+    assert lats == {"S1": pytest.approx(41.1), "S2": pytest.approx(41.2)}
+
+
+def test_one_mavlink_address_serves_every_vehicle(tmp_path: Path) -> None:
+    args = bridge.parse_args(
+        ["--count", "2", *sys_args(tmp_path), "--mavlink", "udpin:127.0.0.1:14550"]
+    )
+    assert {bridge.mavlink_address(args, s) for s in args.sysid} == {
+        "udpin:127.0.0.1:14550"
+    }
+    connected: list[str] = []
+
+    def connect(address: str) -> FakeSource:
+        connected.append(address)
+        return FakeSource([])
+
+    keys = tmp_path / "keys"
+    keys.write_text(f"sitl-receiver: {base64.b64encode(KEY).decode()}\n")
+    geoid = flat_geoid_pgm(tmp_path / "flat.pgm", UNDULATION_M)
+    argv = ["--count", "2", "--serial", "S{sysid}", "--operator-id", "OP"]
+    argv += ["--geoid", str(geoid), "--mavlink", "udpin:127.0.0.1:14550"]
+    argv += ["--key-file", str(keys), "--duration-s", "0.05", "--port", "9"]
+    assert bridge.main(argv, connect=connect) == 0
+    assert connected == ["udpin:127.0.0.1:14550"]
