@@ -108,6 +108,18 @@ _events = sa.table(
 )
 
 
+# id, station_id, epoch, relative_path, hour_start, record_count, compressed_bytes
+_SegmentRow = sa.Row[tuple[int, str, str, str, datetime, int, int]]
+
+
+def _by_path(rows: list[_SegmentRow]) -> list[list[_SegmentRow]]:
+    """Group index rows by the file they describe, keeping first-seen order."""
+    groups: dict[str, list[_SegmentRow]] = {}
+    for row in rows:
+        groups.setdefault(row.relative_path, []).append(row)
+    return list(groups.values())
+
+
 @dataclass(frozen=True, slots=True)
 class Hold:
     """An epoch exempt from retention, and the date that exemption lapses."""
@@ -388,22 +400,20 @@ class ArchiveRetention:
                 continue
 
             over_by = total_bytes - self.max_bytes_per_station
-            # Oldest first, and because `_live_segments` orders by hour and
-            # then by epoch, oldest epoch first within an hour.
-            for segment in await self._live_segments(station_id=station_id):
+            # Oldest stored first. Whole files: every row of a path goes
+            # together, because the file is one unit on disk.
+            for rows in _by_path(await self._live_segments(station_id=station_id)):
                 if over_by <= 0:
                     break
-                if await self._is_held(segment.station_id, segment.epoch, now):
-                    held += 1
+                if await self._is_held(rows[0].station_id, rows[0].epoch, now):
+                    held += len(rows)
                     continue
-                freed, count, existed = await self._delete_one(
-                    segment, reason="ceiling"
-                )
-                deleted += 1
+                freed, count, existed = await self._delete_path(rows, reason="ceiling")
+                deleted += len(rows)
                 reclaimed += freed
                 records += count
                 missing += 0 if existed else 1
-                over_by -= segment.compressed_bytes
+                over_by -= sum(row.compressed_bytes for row in rows)
 
         return SweepResult(
             deleted_by_ceiling=deleted,
@@ -420,7 +430,7 @@ class ArchiveRetention:
         *,
         older_than: datetime | None = None,
         station_id: str | None = None,
-    ) -> list[sa.Row[tuple[int, str, str, str, datetime, int, int]]]:
+    ) -> list[_SegmentRow]:
         query = (
             sa.select(
                 _segments.c.id,
@@ -495,64 +505,71 @@ class ArchiveRetention:
 
     async def _delete_all(
         self,
-        segments: list[sa.Row[tuple[int, str, str, str, datetime, int, int]]],
+        segments: list[_SegmentRow],
         *,
         reason: str,
         now: datetime,
     ) -> tuple[int, int, int, int, int]:
         deleted = reclaimed = records = held = missing = 0
-        for segment in segments:
-            if await self._is_held(segment.station_id, segment.epoch, now):
-                held += 1
+        for rows in _by_path(segments):
+            if await self._is_held(rows[0].station_id, rows[0].epoch, now):
+                held += len(rows)
                 continue
-            freed, count, existed = await self._delete_one(segment, reason=reason)
-            deleted += 1
+            freed, count, existed = await self._delete_path(rows, reason=reason)
+            deleted += len(rows)
             reclaimed += freed
             records += count
             missing += 0 if existed else 1
         return deleted, reclaimed, records, held, missing
 
-    async def _delete_one(
-        self,
-        segment: sa.Row[tuple[int, str, str, str, datetime, int, int]],
-        *,
-        reason: str,
+    async def _delete_path(
+        self, rows: list[_SegmentRow], *, reason: str
     ) -> tuple[int, int, bool]:
-        """Delete the file, mark the index, record the event. In that order.
+        """Delete one file, mark every index row of it, record the event.
 
-        File first: a crash after deleting but before marking leaves an index
-        row for bytes that are gone, which the next sweep retries harmlessly.
-        The reverse leaves a file nothing points at, which nothing will ever
-        clean up.
+        In that order. File first: a crash after deleting but before marking
+        leaves index rows for bytes that are gone, which the next sweep
+        retries harmlessly. The reverse leaves a file nothing points at,
+        which nothing will ever clean up.
+
+        One file, all its rows at once. A segment has one index row per
+        batch appended to it, so unlinking on the first row and then
+        visiting the rest counted every later row as `already_missing`: each
+        sweep logged "index and disk disagree" and wrote a
+        `retention.missing_files` event for an archive that was fine, and a
+        warning that is always false is one nobody reads.
         """
+        first = rows[0]
         # Under the station lock, so the unlink cannot race an append to
         # the same hour file from a session of this station.
-        async with self.archive.station_lock(segment.station_id):
-            existed = (self.archive.root / segment.relative_path).exists()
-            freed = self.archive.delete_segment(segment.relative_path)
+        async with self.archive.station_lock(first.station_id):
+            existed = (self.archive.root / first.relative_path).exists()
+            freed = self.archive.delete_segment(first.relative_path)
 
             try:
                 async with self.engine.begin() as connection:
                     await connection.execute(
                         sa.update(_segments)
-                        .where(_segments.c.id == segment.id)
+                        .where(_segments.c.id.in_([row.id for row in rows]))
                         .values(deleted_at=sa.func.now(), deleted_reason=reason)
                     )
             except SQLAlchemyError as error:
                 raise StoreError(f"could not mark segment deleted: {error}") from error
 
+        record_count = sum(row.record_count for row in rows)
         await self._record_event(
-            segment.station_id,
-            segment.epoch,
+            first.station_id,
+            first.epoch,
             f"retention.deleted.{reason}",
             {
-                "relative_path": segment.relative_path,
-                "hour_start": segment.hour_start.isoformat(),
-                "record_count": segment.record_count,
+                "relative_path": first.relative_path,
+                "hour_start": first.hour_start.isoformat(),
+                "record_count": record_count,
+                "index_rows": len(rows),
                 "bytes_reclaimed": freed,
             },
         )
-        return freed, segment.record_count, existed
+        return freed, record_count, existed
 
     async def _record_event(
         self,

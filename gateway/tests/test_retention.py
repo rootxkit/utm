@@ -740,3 +740,58 @@ async def test_a_file_with_a_recently_stored_row_is_kept_whole(
 
     assert result.deleted_total == 0
     assert await live_segments(engine, station) == 2
+
+
+# --- one file, many index rows (S-07) --------------------------------------
+
+
+async def test_a_file_with_many_index_rows_is_deleted_once_and_reports_nothing_missing(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    """Every batch appended to an hour adds an index row. Unlinking on the
+    first row and then visiting the rest counted each later row as missing,
+    so every sweep of an ordinary archive cried "index and disk disagree"."""
+    old = NOW - timedelta(days=RETENTION_DAYS + 1)
+    for n in range(4):
+        await store.store_records(station, EPOCH, records_at(old, n * 5, 5))
+    await backdate(store.engine, station, old)
+    assert await live_segments(engine, station) == 4
+    assert len(list(archive.root.rglob("*.zst"))) == 1
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_by_age == 4
+    assert result.records_destroyed == 20
+    assert result.already_missing == 0
+    assert await live_segments(engine, station) == 0
+    assert not list(archive.root.rglob("*.zst"))
+    events = await events_of(engine, station)
+    assert events.count("retention.deleted.age") == 1
+    assert "retention.missing_files" not in events
+
+
+async def test_a_file_with_many_index_rows_that_is_really_gone_is_reported_once(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    """The presence half: a file that really is missing is still reported,
+    and counted once, not once per row."""
+    old = NOW - timedelta(days=RETENTION_DAYS + 1)
+    for n in range(4):
+        await store.store_records(station, EPOCH, records_at(old, n * 5, 5))
+    await backdate(store.engine, station, old)
+    for segment in archive.root.rglob("*.zst"):
+        segment.unlink()
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_by_age == 4
+    assert result.already_missing == 1
+    assert "retention.missing_files" in await events_of(engine, station)
