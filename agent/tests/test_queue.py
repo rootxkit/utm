@@ -687,3 +687,28 @@ def test_closing_while_the_disk_still_refuses_does_not_raise(
     queue.close()
 
     assert _persisted_intake_drops(queue_path) == 0
+
+
+def test_a_poisoned_queue_will_not_report_sequence_numbers(queue_path: Path) -> None:
+    """They are read through the connection that may still hold the failed
+    batch, so they could name records that were never committed."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        # Healthy: the branch that answers.
+        assert (queue.next_seq, queue.oldest_seq_held, queue.newest_seq_held) == (
+            5,
+            0,
+            4,
+        )
+        queue._connection = _FailingCommits(  # type: ignore[assignment]
+            queue._connection, fail_rollback=True
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+
+        with pytest.raises(QueuePoisonedError):
+            _ = queue.next_seq
+        with pytest.raises(QueuePoisonedError):
+            _ = queue.oldest_seq_held
+        with pytest.raises(QueuePoisonedError):
+            _ = queue.newest_seq_held

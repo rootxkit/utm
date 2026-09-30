@@ -207,6 +207,10 @@ class DurableQueue:
     @property
     def next_seq(self) -> int:
         with self._lock:
+            # These three read through the same connection as the failed
+            # transaction, so a poisoned queue could report sequence numbers
+            # that were never committed, and `hello` would claim them.
+            self._check_usable_locked()
             return self._get_int(_NEXT_SEQ)
 
     @property
@@ -218,6 +222,7 @@ class DurableQueue:
         relay-v1 §5 describes.
         """
         with self._lock:
+            self._check_usable_locked()
             row = self._connection.execute("SELECT MIN(seq) FROM records").fetchone()
             if row[0] is None:
                 return self._get_int(_NEXT_SEQ)
@@ -226,6 +231,7 @@ class DurableQueue:
     @property
     def newest_seq_held(self) -> int:
         with self._lock:
+            self._check_usable_locked()
             row = self._connection.execute("SELECT MAX(seq) FROM records").fetchone()
             if row[0] is None:
                 return self._get_int(_NEXT_SEQ) - 1
