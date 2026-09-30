@@ -545,3 +545,32 @@ def test_an_append_whose_commit_fails_is_rolled_back_and_retryable(
         assert [r.seq for r in reopened.read_from(0, max_bytes=1 << 20)] == list(
             range(8)
         )
+
+
+def test_a_failed_append_that_evicted_for_the_cap_restores_the_cap_count(
+    queue_path: Path,
+) -> None:
+    """The eviction rolls back with the insert, so its count must too."""
+    record_size = RECORD_HEADER_BYTES + 32
+    with DurableQueue(queue_path, max_bytes=record_size * 4) as queue:
+        queue.append(datagrams(4))
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        # Two more would evict the two oldest, but the commit fails.
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(2))
+
+        assert queue.dropped_cap_total == 0
+        assert queue.depth == 4
+        assert [r.seq for r in queue.read_from(0, max_bytes=1 << 20)] == [0, 1, 2, 3]
+
+        # The next append evicts one record, and only that one is counted.
+        failing.failing = False
+        assert [r.seq for r in queue.append(datagrams(1))] == [4]
+        assert queue.dropped_cap_total == 1
+        assert queue.depth == 4
+        assert [r.seq for r in queue.read_from(0, max_bytes=1 << 20)] == [1, 2, 3, 4]
+
+    with DurableQueue(queue_path, max_bytes=record_size * 4) as reopened:
+        assert reopened.dropped_cap_total == 1
