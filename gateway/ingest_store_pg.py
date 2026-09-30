@@ -368,6 +368,13 @@ class TimescaleIngestStore:
             else:
                 pending.extend(group)
         if skipped:
+            # The skipped records are still returned to the caller as
+            # `stored`, and that is deliberate: they were never below the
+            # watermark, so no session ever acknowledged them, and the
+            # pipeline runs only after `store_records` returns. The crash
+            # that left them indexed-but-unacknowledged happened before
+            # anything looked inside them, so this is their first and only
+            # trip through the pipeline, not a duplicate.
             _log.info(
                 "segments already indexed; advancing the watermark only",
                 extra={
