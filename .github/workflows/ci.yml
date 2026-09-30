@@ -109,11 +109,11 @@ jobs:
       # The SITL launcher and the commit-msg hook are executable code on the
       # critical path of every developer's day; they get linted too.
       - name: shellcheck
-        run: shellcheck sim/run_sitl.sh sim/stop_sitl.sh .githooks/commit-msg infra/basemap/fetch_basemap.sh
+        run: shellcheck sim/run_sitl.sh sim/stop_sitl.sh .githooks/commit-msg infra/basemap/fetch_basemap.sh infra/deploy/make_env.sh infra/deploy/backup.sh infra/deploy/restore_check.sh infra/deploy/deploy.sh
 
       - name: Scripts are executable
         run: |
-          for f in sim/run_sitl.sh sim/stop_sitl.sh .githooks/commit-msg infra/basemap/fetch_basemap.sh; do
+          for f in sim/run_sitl.sh sim/stop_sitl.sh .githooks/commit-msg infra/basemap/fetch_basemap.sh infra/deploy/make_env.sh infra/deploy/backup.sh infra/deploy/restore_check.sh infra/deploy/deploy.sh; do
             test -x "$f" || { echo "$f is not executable"; exit 1; }
           done
 

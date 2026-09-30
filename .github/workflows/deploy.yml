@@ -1,0 +1,52 @@
+name: Deploy
+
+# P0-09. A commit on main that passed CI is moved to the `deploy` branch.
+# The staging server follows that branch (infra/deploy/deploy.sh, run every
+# minute by utm-deploy.timer) with a read-only deploy key, builds it and
+# restarts what changed.
+#
+# Nothing here reaches the server, and no server credential is stored in
+# GitHub: the server pulls. A commit that failed CI never reaches `deploy`,
+# and `deploy` only moves forward, so a slow run for an older commit cannot
+# roll the server back.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Move deploy to the commit CI passed
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify -q origin/deploy >/dev/null; then
+            if git merge-base --is-ancestor "$SHA" origin/deploy; then
+              echo "deploy is already at or past $SHA; nothing to do"
+              exit 0
+            fi
+            if ! git merge-base --is-ancestor origin/deploy "$SHA"; then
+              echo "::error::$SHA does not descend from deploy; refusing to rewrite it"
+              exit 1
+            fi
+          fi
+          git push origin "$SHA:refs/heads/deploy"
+          echo "deploy -> $SHA"
