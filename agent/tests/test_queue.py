@@ -7,7 +7,10 @@ this package.
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -265,6 +268,105 @@ def test_read_from_past_the_end_is_empty(queue_path: Path) -> None:
         queue.append(datagrams(3))
 
         assert queue.read_from(99, max_bytes=1 << 20) == []
+
+
+class _CountingCursor:
+    """Counts the rows SQLite actually hands back, however they are fetched."""
+
+    def __init__(self, cursor: sqlite3.Cursor, owner: _CountingConnection) -> None:
+        self._cursor = cursor
+        self._owner = owner
+
+    def __iter__(self) -> Iterator[Any]:
+        for row in self._cursor:
+            self._owner.rows_fetched += 1
+            yield row
+
+    def fetchone(self) -> Any:
+        row = self._cursor.fetchone()
+        if row is not None:
+            self._owner.rows_fetched += 1
+        return row
+
+    def fetchall(self) -> list[Any]:
+        rows = self._cursor.fetchall()
+        self._owner.rows_fetched += len(rows)
+        return rows
+
+    def close(self) -> None:
+        self._cursor.close()
+
+
+class _CountingConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.rows_fetched = 0
+
+    def execute(self, sql: str, parameters: Any = ()) -> _CountingCursor:
+        return _CountingCursor(self._connection.execute(sql, parameters), self)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def _count_rows(queue: DurableQueue) -> _CountingConnection:
+    counting = _CountingConnection(queue._connection)
+    queue._connection = counting  # type: ignore[assignment]
+    return counting
+
+
+def test_read_from_a_large_backlog_fetches_only_what_the_budget_holds(
+    queue_path: Path,
+) -> None:
+    """S-01. The whole backlog used to be fetched to return ten records."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(20_000, size=32))
+        counting = _count_rows(queue)
+
+        batch = queue.read_from(0, max_bytes=(RECORD_HEADER_BYTES + 32) * 10)
+
+    assert len(batch) == 10
+    # Ten that fit, plus at most the one that proved the budget was spent.
+    assert counting.rows_fetched <= 11
+
+
+def test_an_oversized_first_record_is_read_without_the_backlog_behind_it(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append([(1, b"x" * 4096)])
+        queue.append(datagrams(5_000, size=32))
+        counting = _count_rows(queue)
+
+        batch = queue.read_from(0, max_bytes=1)
+
+    assert [r.seq for r in batch] == [0]
+    assert counting.rows_fetched <= 2
+
+
+def test_draining_a_backlog_fetches_each_record_about_once(
+    queue_path: Path,
+) -> None:
+    """Draining N records must cost O(N) rows, not O(N^2)."""
+    count = 5_000
+    budget = (RECORD_HEADER_BYTES + 32) * 50
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(count, size=32))
+        counting = _count_rows(queue)
+
+        drained = 0
+        next_seq = 0
+        batches = 0
+        while batch := queue.read_from(next_seq, max_bytes=budget):
+            drained += len(batch)
+            next_seq = batch[-1].seq + 1
+            batches += 1
+            queue.acknowledge(batch[-1].seq)
+
+    assert drained == count
+    # Each batch reads its own rows plus one look-ahead, and each ack reads one
+    # aggregate row. The old full read fetched about count**2 / 100 rows here.
+    assert counting.rows_fetched <= count + 2 * batches
 
 
 def test_datagrams_are_returned_byte_identical(queue_path: Path) -> None:

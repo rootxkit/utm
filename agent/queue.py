@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
 
-from agent.framing import Record
+from agent.framing import RECORD_HEADER_BYTES, Record
 
 __all__ = ["DEFAULT_QUEUE_MAX_BYTES", "DurableQueue"]
 
@@ -254,24 +254,38 @@ class DurableQueue:
         At least one record is returned when any exists at or after `seq`, even
         if it alone exceeds the budget — otherwise an oversized record would
         wedge the queue permanently.
-        """
-        with self._lock:
-            rows = self._connection.execute(
-                "SELECT seq, recv_utc_ns, datagram, nbytes FROM records "
-                "WHERE seq >= ? ORDER BY seq",
-                (seq,),
-            ).fetchall()
 
+        Only the rows the budget can hold are read. Every record costs at least
+        `RECORD_HEADER_BYTES`, so no batch can hold more rows than the LIMIT
+        below, and the cursor is stepped one row at a time and abandoned as
+        soon as the budget is spent. Reading the whole backlog here, under the
+        lock the writer needs, made draining a large backlog quadratic and
+        stalled intake while it ran.
+        """
+        row_limit = max(max_bytes // RECORD_HEADER_BYTES, 0) + 1
         records: list[Record] = []
         budget = 0
-        for row in rows:
-            size = int(row[3])
-            if records and budget + size > max_bytes:
-                break
-            records.append(
-                Record(seq=int(row[0]), recv_utc_ns=int(row[1]), datagram=bytes(row[2]))
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT seq, recv_utc_ns, datagram, nbytes FROM records "
+                "WHERE seq >= ? ORDER BY seq LIMIT ?",
+                (seq, row_limit),
             )
-            budget += size
+            try:
+                for row in cursor:
+                    size = int(row[3])
+                    if records and budget + size > max_bytes:
+                        break
+                    records.append(
+                        Record(
+                            seq=int(row[0]),
+                            recv_utc_ns=int(row[1]),
+                            datagram=bytes(row[2]),
+                        )
+                    )
+                    budget += size
+            finally:
+                cursor.close()
         return records
 
     def acknowledge(self, seq: int) -> int:
