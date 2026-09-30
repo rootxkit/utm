@@ -4,14 +4,14 @@ Revision ID: 0002_airspace_policy
 Revises: 0001_fleet
 Create Date: 2026-09-29
 
-P5-07. The thresholds `ARCHITECTURE.md` §7.2 alerts on. Policy, not code: an
+P5-07. The thresholds `ARCHITECTURE.md` §6.2 alerts on. Policy, not code: an
 operator changes them, and the change is a row update the API records in
 `events`, not a deploy.
 
-The seeded values are §7.2's **Stage 0** values: `t_cpa < 60 s` rather than
-30 s, because at Stage 0 a person executes the resolution in QGC and needs the
-reaction time. 60 m horizontal, 20 m vertical, 800 m neighbour radius. Tighten
-`t_cpa_max_s` when the command channel exists (P3B).
+The seeded values are §6.2's: `t_cpa < 60 s` rather than the 30 s an
+automated response would allow, because a person executes the advice in QGC
+and needs the reaction time; the system never commands, so that stays true.
+60 m horizontal, 20 m vertical, 800 m neighbour radius.
 
 The radius bounds how early a conflict can be seen: a pair closing at
 `v` m/s enters it `800 / v` seconds before they meet. Two aircraft at 15 m/s

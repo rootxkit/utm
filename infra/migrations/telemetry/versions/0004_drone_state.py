@@ -4,7 +4,7 @@ Revision ID: 0004_drone_state
 Revises: 0003_source_bindings
 Create Date: 2026-09-23
 
-`ARCHITECTURE.md` §4. One row per vehicle per telemetry tick, in SI, with a
+`ARCHITECTURE.md` §5. One row per vehicle per telemetry tick, in SI, with a
 `drone_id` resolved through `source_bindings` at the record's own timestamp.
 
 ## Altitudes

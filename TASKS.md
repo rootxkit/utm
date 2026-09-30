@@ -471,7 +471,7 @@ Goal: telemetry from many vehicles reaches the database and a browser map.
 Goal: operators and aircraft are registered, and every change is auditable.
 
 - [~] **P2-01** Alembic migrations for the full schema in
-      `docs/ARCHITECTURE.md` §4, with GiST indexes on all geometry.
+      `docs/ARCHITECTURE.md` §5, with GiST indexes on all geometry.
       *Done when:* `make migrate` runs clean up and down.
       *Partial* 2026-09-28: the relational tree exists with `bases`,
       `pilots`, `drones`, `airspace_zones` and `events` (GiST on every
@@ -618,13 +618,13 @@ never commands an aircraft.
       300 scattered aircraft, and a test asserts the slowest of 100 lookups
       at 100 drones is under 5 ms. The radius comes from `airspace_policy`.
 
-- [x] **P5-07** CPA computation per `ARCHITECTURE.md` §7.2.
+- [x] **P5-07** CPA computation per `ARCHITECTURE.md` §6.2.
       *Done when:* unit tests cover head-on, crossing, overtaking, parallel, and
       the zero-relative-velocity degenerate case.
       *Closed* 2026-09-29. All five, plus diverging pairs (judged on where
       they are now), vertical separation evaluated at the CPA time, and a
       climb that closes it. Thresholds live in `airspace_policy` (relational,
-      seeded with §7.2's Stage 0 values). `python -m airspace` raises a
+      seeded with §6.2's Stage 0 values). `python -m airspace` raises a
       critical alert per conflicting pair of armed aircraft, publishes it and
       writes it to `events`. Watched live with two SITL aircraft: raised when
       hovering 25 m apart, cleared when they separated, raised 57 s before a

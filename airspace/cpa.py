@@ -1,4 +1,4 @@
-"""Closest point of approach between two aircraft. P5-07, `ARCHITECTURE.md` §7.2.
+"""Closest point of approach between two aircraft. P5-07, `ARCHITECTURE.md` §6.2.
 
     rel_pos = p2 - p1
     rel_vel = v2 - v1
@@ -10,12 +10,12 @@ as WGS84 latitude/longitude and are projected about the midpoint of the pair;
 at the distances this is used for (the 800 m neighbour radius, P5-06) the
 error of that projection is centimetres, far below GPS error.
 
-**Horizontal and vertical are separate.** §7.2 alerts on horizontal distance
+**Horizontal and vertical are separate.** §6.2 alerts on horizontal distance
 at CPA *and* altitude difference, so the CPA time comes from the horizontal
 motion and the vertical separation is evaluated at that time. A single 3-D
 CPA would let a 200 m climb hide a head-on horizontal conflict.
 
-Altitude is AMSL throughout (CLAUDE.md, §7.1): two aircraft are only
+Altitude is AMSL throughout (CLAUDE.md, §6.1): two aircraft are only
 comparable against the same datum, and `alt_above_home_m` is relative to each
 aircraft's own home.
 
@@ -107,7 +107,7 @@ def horizontal_distance_m(a: Track, b: Track) -> float:
 
 
 def closest_approach(a: Track, b: Track) -> Approach:
-    """The pair's closest approach from now, per §7.2."""
+    """The pair's closest approach from now, per §6.2."""
     # Origin at the midpoint latitude, so neither aircraft is favoured by the
     # projection.
     lat0 = (a.lat_deg + b.lat_deg) / 2
@@ -146,7 +146,7 @@ def closest_approach(a: Track, b: Track) -> Approach:
 
 @dataclass(frozen=True, slots=True)
 class SeparationPolicy:
-    """§7.2's alert thresholds. No defaults in code: they are airspace policy,
+    """§6.2's alert thresholds. No defaults in code: they are airspace policy,
     held in the database where a change is audited (see `airspace/policy.py`).
     """
 
@@ -156,7 +156,7 @@ class SeparationPolicy:
     neighbour_radius_m: float
 
     def is_conflict(self, approach: Approach) -> bool:
-        """Alert when all three hold, as §7.2 specifies."""
+        """Alert when all three hold, as §6.2 specifies."""
         return (
             approach.t_cpa_s < self.t_cpa_max_s
             and approach.d_cpa_horizontal_m < self.d_horizontal_min_m

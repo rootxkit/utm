@@ -42,14 +42,10 @@ Stated first, because scope creep here is expensive.
 
 - **No commanding.** Nothing in the Gateway sends anything towards an aircraft.
   The Stage 0 guarantee runs from `agent/udp.py`'s receive-only socket through
-  this service and out to the console; P1-02 does not weaken it. When a command
-  path arrives it is P3B, through `mavlink-router`, as a separate component
-  with its own review.
-- **No dispatch.** Assignment is P4. The Gateway publishes state; it does not
-  choose which drone takes an order.
-- **No deconfliction.** Corridors, CPA and resolution are P5. The Gateway feeds
+  this service and out to the console; P1-02 does not weaken it. No command
+  path is planned anywhere: the system never commands an aircraft.
+- **No airspace checks.** CPA, zones and advice are P5. The Gateway feeds
   them; it does not compute them.
-- **No mission planning or validation.** That is P3.
 - **No direct UDP ingest as the primary path.** A UDP listener stays for SITL
   and bench work (see §11), but the production path is relay-v1.
 
@@ -364,7 +360,7 @@ a reconnect. Precedence: `data_lost`, `unreachable`, `radio_silent`, `lagging`,
 `healthy`.
 
 `radio_silent` and `unreachable` are different failure domains
-(`ARCHITECTURE.md` §3) and must never be presented identically: the first means
+(`ARCHITECTURE.md` §4) and must never be presented identically: the first means
 the ground station has lost the aircraft, which is a flight-safety event; the
 second means we have lost the ground station, and the pilot still has QGC.
 
@@ -391,10 +387,10 @@ one that does not.
 - **Events → `ingest_events` in the telemetry database**: gaps, intake-drop
   deltas, station state transitions, rejected SYSIDs, relay restarts.
 
-  Deliberately *not* `ARCHITECTURE.md` §4's `events` table, which lives in the
+  Deliberately *not* `ARCHITECTURE.md` §5's `events` table, which lives in the
   relational database. The Gateway does not connect to the relational database
   and keeping it that way is worth more than one shared table: ingest stays
-  isolated from the business schema in both directions. §4's `events` is
+  isolated from the business schema in both directions. §5's `events` is
   unchanged and remains the business audit log; the console reads both.
 
 Units and conventions are not negotiable here: SI at the parser boundary
@@ -405,7 +401,7 @@ conversion and its property tests.
 ### Why there is no `alt_agl_m`, and why it must not be added back
 
 `drone_state` carries `alt_amsl_m` and `alt_above_home_m`. It does **not**
-carry `alt_agl_m`, and the field was removed from `ARCHITECTURE.md` §4 rather
+carry `alt_agl_m`, and the field was removed from `ARCHITECTURE.md` §5 rather
 than left nullable.
 
 Nothing in the telemetry carries height above ground. From pymavlink's own
@@ -426,14 +422,12 @@ home point's elevation. Over rising terrain it overstates clearance.
 fill a nullable `alt_agl_m` from it. Do neither.** The resulting error is
 smooth, plausible and produces no signal anywhere: the track looks normal, the
 numbers look normal, and the aircraft is lower over the ground than the data
-says. It lands in deconfliction, where §7.2 alerts on `d_alt < 20 m` and §7.1's
-layers are 15 m apart — so a terrain difference of one layer's spacing is
-enough to judge two aircraft as separated when they are co-altitude, or the
-reverse.
+says. It lands in the airspace monitor, where §6.2 alerts on `d_alt < 20 m` —
+so a terrain difference of 20 m is enough to judge two aircraft as separated
+when they are co-altitude, or the reverse.
 
-That is why `ARCHITECTURE.md` §7's altitude layers are now expressed in AMSL
-against a reference elevation. AGL returns when **P5-00** provides a terrain
-source, and the column returns with it.
+That is why `ARCHITECTURE.md` §6.1 judges separation in AMSL. AGL returns when
+**P5-00** provides a terrain source, and the column returns with it.
 
 ## 11. Direct UDP ingest
 

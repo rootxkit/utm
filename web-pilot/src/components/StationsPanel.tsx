@@ -1,4 +1,4 @@
-// Ground stations and what they know about their links (ARCHITECTURE §9).
+// Ground stations and what they know about their links (p1-02 spec §9).
 import { num } from "../format";
 import { useT } from "../i18n";
 import type { Station, Unclaimed } from "../types";

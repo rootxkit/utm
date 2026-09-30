@@ -3,7 +3,7 @@
 `docs/specs/p1-02-gateway-ingest.md` §9 calls this the requirement most easily
 got wrong, and names the mistake: presenting "we have lost the ground station"
 and "the ground station has lost the aircraft" as the same thing. They are
-different failure domains (`ARCHITECTURE.md` §3) with different responses. The
+different failure domains (`ARCHITECTURE.md` §4) with different responses. The
 first leaves the pilot flying on QGC with telemetry buffering safely at the
 station; the second is a flight-safety event.
 

@@ -5,8 +5,8 @@ Status: **stage 1 of 2 run, 2026-09-29.** No decision yet.
 ## What was run
 
 Flight Blender at commit `be709a7` (openutm/flight-blender, Apache-2.0),
-built from source and run in Docker on the development laptop beside the
-courier stack: API, Celery worker, Celery beat, PostgreSQL 17, Valkey. Port
+built from source and run in Docker on the development laptop beside our
+own stack: API, Celery worker, Celery beat, PostgreSQL 17, Valkey. Port
 8090, auth bypass (local evaluation mode). Nothing of ours was changed; a
 bridge outside the repository forwarded the Gateway's `telemetry.*` to
 Blender's `/flight_stream/set_air_traffic`, one observation per message.

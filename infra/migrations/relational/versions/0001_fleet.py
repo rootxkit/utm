@@ -4,11 +4,11 @@ Revision ID: 0001_fleet
 Revises:
 Create Date: 2026-09-28
 
-P2-01, the fleet part of `ARCHITECTURE.md` §4. The delivery tables of the
+P2-01, the fleet part of `ARCHITECTURE.md` §5. The delivery tables of the
 earlier design were never created here, and have since left the design
 (P-01).
 
-## Departures from §4, each on purpose
+## Departures from §5, each on purpose
 
 - **`drones.status` is not a column.** P2-05 requires status to be derived
   from telemetry freshness, not set by hand, so a stored status could only

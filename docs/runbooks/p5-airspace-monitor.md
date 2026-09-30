@@ -4,7 +4,7 @@
 aircraft raises:
 
 - a **critical conflict** alert when a pair's closest point of approach
-  (`ARCHITECTURE.md` §7.2) is within `t_cpa_max_s`, closer than
+  (`ARCHITECTURE.md` §6.2) is within `t_cpa_max_s`, closer than
   `d_horizontal_min_m` horizontally and `d_vertical_min_m` vertically;
 - a **zone** alert when an aircraft is inside a `no_fly` (critical) or
   `restricted` (warning) zone of `airspace_zones`, within its AMSL band;
