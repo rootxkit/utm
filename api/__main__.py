@@ -9,9 +9,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any
-from uuid import UUID
 
 import redis.asyncio
 import uvicorn
@@ -21,20 +18,13 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from api.app import create_api_app
 from api.auth import OperatorStore
 from api.config import ApiSettings
+from api.live import RedisLiveState
+from api.ratelimit import LoginRateLimiter
 from api.registry import FleetRegistry
 from api.replay import ReplayStore
 from common import configure_logging, load_settings
 from common.terrain import Terrain
 from gateway.binding import BindingResolver
-from gateway.live_state import read_live_state
-
-
-@dataclass
-class RedisLiveState:
-    client: redis.asyncio.Redis
-
-    async def get(self, drone_id: UUID) -> dict[str, Any] | None:
-        return await read_live_state(self.client, drone_id)
 
 
 def build_app(settings: ApiSettings) -> FastAPI:
@@ -53,6 +43,7 @@ def build_app(settings: ApiSettings) -> FastAPI:
         evidence_slack_s=settings.replay_evidence_slack_s,
         flight_split_s=settings.replay_flight_split_s,
         max_samples=settings.replay_max_samples,
+        max_flight_window_s=settings.replay_max_flight_window_s,
     )
     operators = OperatorStore(
         engine=engine,
@@ -60,6 +51,7 @@ def build_app(settings: ApiSettings) -> FastAPI:
         idle_timeout_s=settings.session_idle_timeout_s,
         max_failed_logins=settings.login_max_failures,
         lockout_s=settings.login_lockout_s,
+        max_concurrent_hashes=settings.password_hash_concurrency,
     )
     app = create_api_app(
         registry,
@@ -72,6 +64,11 @@ def build_app(settings: ApiSettings) -> FastAPI:
         console_feed_url=settings.console_feed_url,
         console_app_dir=settings.console_app_dir,
         terrain=Terrain(settings.terrain_dir) if settings.terrain_dir else None,
+        login_limiter=LoginRateLimiter(
+            max_per_address=settings.login_rate_max_per_address,
+            max_per_username=settings.login_rate_max_per_username,
+            window_s=settings.login_rate_window_s,
+        ),
     )
 
     @asynccontextmanager
@@ -89,7 +86,12 @@ def build_app(settings: ApiSettings) -> FastAPI:
 def main() -> None:
     settings = load_settings(ApiSettings)
     configure_logging(service=settings.service_name, level=settings.log_level.value)
-    uvicorn.run(build_app(settings), host=settings.api_host, port=settings.api_port)
+    uvicorn.run(
+        build_app(settings),
+        host=settings.api_host,
+        port=settings.api_port,
+        **settings.uvicorn_proxy_options(),
+    )
 
 
 if __name__ == "__main__":

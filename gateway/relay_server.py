@@ -65,6 +65,12 @@ _CLOSE_PROTOCOL_ERROR: Final = 1008
 
 _AUTHORIZATION_SCHEME: Final = "Bearer "
 
+# protocol §2 and §14: the path carries the major version. A relay speaking
+# a version this Gateway does not serve is told so with 404 at the upgrade,
+# before its credential is looked at, rather than being welcomed onto a
+# protocol whose record layout or guarantees it may not share.
+RELAY_PATH: Final = "/relay/v1"
+
 
 class RecordProcessor(Protocol):
     """What happens to records once they are durably stored.
@@ -154,11 +160,60 @@ class RelayServer:
     def __post_init__(self) -> None:
         self._server: Server | None = None
         self._trackers: dict[str, StationLinkTracker] = {}
+        # S-06: the generation of the newest session per station. A session
+        # whose generation is no longer current has been superseded by a
+        # reconnect and must write nothing about the station's link state.
+        self._generations: dict[str, int] = {}
+        self._issued_generations: dict[str, int] = {}
+        self._open_generations: dict[str, set[int]] = {}
 
     @property
     def trackers(self) -> dict[str, StationLinkTracker]:
         """Live link state per station, for whoever publishes to the console."""
         return self._trackers
+
+    def _session_started(self, station_id: str) -> int:
+        """Issue the next generation and make it the station's current one."""
+        generation = self._issued_generations.get(station_id, 0) + 1
+        self._issued_generations[station_id] = generation
+        self._open_generations.setdefault(station_id, set()).add(generation)
+        self._generations[station_id] = generation
+        return generation
+
+    def _session_ended(self, station_id: str, generation: int) -> None:
+        """Hand the station back to the newest session still open, if any.
+
+        A reconnect that dies at once - a bad hello, a proxy that drops it -
+        would otherwise leave the older, healthy session superseded for
+        ever: mute, reporting nothing, with the console frozen. If nothing
+        else is open the ending session stays current, so its disconnect
+        report goes out.
+        """
+        still_open = self._open_generations.get(station_id, set())
+        still_open.discard(generation)
+        if self._generations.get(station_id) == generation and still_open:
+            successor = max(still_open)
+            self._generations[station_id] = successor
+            _log.info(
+                "station handed back to an older session",
+                extra={
+                    "station_id": station_id,
+                    "ended_generation": generation,
+                    "current_generation": successor,
+                },
+            )
+
+    def is_current(self, station_id: str, generation: int) -> bool:
+        """Whether a session of this generation still speaks for the station.
+
+        Trackers are shared per station, so two sessions can exist for one:
+        the relay reconnects after a half-open link, and the old session
+        notices only when its own pings time out, about 20 s later. Without
+        this check the old session's last act was to log and publish
+        `unreachable` for a station whose new session was healthy and
+        streaming (S-06).
+        """
+        return self._generations.get(station_id) == generation
 
     async def start(self) -> None:
         self._server = await serve(
@@ -199,6 +254,12 @@ class RelayServer:
         never ran while its tests passed - which is why `agent/` now has a test
         that drives a real 401.
         """
+        if request.path.split("?", 1)[0] != RELAY_PATH:
+            self._log_rejected_connection(
+                connection, f"unsupported path {request.path!r}"
+            )
+            return connection.respond(404, f"not found; relay-v1 is at {RELAY_PATH}\n")
+
         presented = request.headers.get("Authorization")
         if presented is None or not presented.startswith(_AUTHORIZATION_SCHEME):
             self._log_rejected_connection(connection, "missing bearer token")
@@ -235,7 +296,7 @@ class RelayServer:
         log = bind(_log, station_id=station_id)
 
         try:
-            hello = await self._handshake(connection, station_id, log)
+            hello, resume_from_seq = await self._handshake(connection, station_id, log)
         except ControlMessageError as error:
             log.warning("handshake rejected", extra={"error": str(error)})
             await connection.close(_CLOSE_PROTOCOL_ERROR, "bad hello")
@@ -258,13 +319,20 @@ class RelayServer:
             epoch=hello.epoch,
             tracker=tracker,
             log=log,
+            generation=self._session_started(station_id),
+            resume_from_seq=resume_from_seq,
+            newest_seq_held=hello.newest_seq_held,
         )
         await session.run()
 
     async def _handshake(
         self, connection: ServerConnection, station_id: str, log: BoundLogger
-    ) -> Hello:
-        """Read `hello`, answer `welcome` with the durable resume point."""
+    ) -> tuple[Hello, int]:
+        """Read `hello`, answer `welcome` with the durable resume point.
+
+        Returns the `hello` and the `resume_from_seq` that was sent, which is
+        what a `gap` on this session is checked against.
+        """
         raw = await connection.recv()
         if isinstance(raw, bytes):
             raise ControlMessageError(
@@ -308,7 +376,7 @@ class RelayServer:
             )
 
         await connection.send(build_welcome(resume_from_seq))
-        return message
+        return message, resume_from_seq
 
 
 @dataclass
@@ -321,26 +389,39 @@ class _Session:
     epoch: str
     tracker: StationLinkTracker
     log: BoundLogger
+    generation: int = 0
+    # What `welcome` said, so a `gap` can be checked against it (§11).
+    resume_from_seq: int = 0
+    # What `hello` declared as the newest record on the relay's disk. A gap
+    # cannot end beyond it: the records past it were never assigned.
+    newest_seq_held: int = -1
 
     def __post_init__(self) -> None:
         # The highest seq durably stored for this epoch, cumulative. -1 means
         # nothing is storable yet, which is distinct from 0 - acknowledging
-        # seq 0 would claim a record that may never have arrived.
-        self._watermark = -1
-        self._acked = -1
+        # seq 0 would claim a record that may never have arrived. Starts at
+        # the durable watermark `welcome` was computed from, and is taken as
+        # already acknowledged: the relay learned it from `welcome`.
+        self._watermark = self.resume_from_seq - 1
+        self._acked = self._watermark
         self._last_state: LinkState | None = None
         self.tracker.start_session()
 
+    @property
+    def superseded(self) -> bool:
+        """A newer session for this station exists; this one must stay quiet."""
+        return not self.server.is_current(self.station_id, self.generation)
+
     async def run(self) -> None:
-        # The state at connect, recorded and reported before anything is
-        # waited for. Without it both are left to a race: whether the log
-        # opens with `unreachable` depends on whether a timer tick beat the
-        # station's first `status`, and a console watching a station come up
-        # sees nothing until a tick has passed.
-        await self._tick()
         acker = asyncio.create_task(self._acknowledge_periodically())
         reporter = asyncio.create_task(self._report_periodically())
         try:
+            # The state at connect, recorded and reported before anything is
+            # waited for. Without it both are left to a race: whether the log
+            # opens with `unreachable` depends on whether a timer tick beat
+            # the station's first `status`, and a console watching a station
+            # come up sees nothing until a tick has passed.
+            await self._tick_logged()
             async for message in self.connection:
                 if isinstance(message, bytes):
                     await self._ingest_batch(message)
@@ -353,10 +434,22 @@ class _Session:
             with contextlib.suppress(websockets.WebSocketException):
                 await self.connection.close(_CLOSE_PROTOCOL_ERROR, str(error)[:120])
         finally:
-            for task in (acker, reporter):
+            # First, so that if an older session is still open it becomes
+            # current before this one decides whether to report a disconnect.
+            self.server._session_ended(self.station_id, self.generation)
+            # Each step here runs whatever the previous one did. A task that
+            # died with an exception used to re-raise from `await task` and
+            # skip the final ack and the disconnect report (S-06).
+            for name, task in (("acker", acker), ("reporter", reporter)):
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                try:
                     await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as error:
+                    self.log.error(
+                        "session task died", extra={"task": name, "error": repr(error)}
+                    )
             # A final ack for anything stored since the last tick. The relay
             # survives without it - protocol §5 makes a lost ack cost a
             # retransmission, never a gap - but sending it saves the station
@@ -372,19 +465,30 @@ class _Session:
         if not records:
             return
         with timings.measure("store"):
-            self._watermark = await self.server.store.store_records(
+            stored = await self.server.store.store_records(
                 self.station_id, self.epoch, records
             )
-        self.tracker.observe_stored(max(record.recv_utc_ns for record in records))
+        self._watermark = stored.watermark
+        if not stored.stored:
+            # A retransmission, in full. Nothing new to look inside, and
+            # counting it would count the same telemetry twice (S-05).
+            timings.count("retransmitted_batches", 1)
+            return
+        if not self.superseded:
+            self.tracker.observe_stored(
+                max(record.recv_utc_ns for record in stored.stored)
+            )
         # Only now, with the bytes durable and the watermark advanced, does
-        # anything look inside them. Obligation 9.
+        # anything look inside them. Obligation 9. Only the records that were
+        # new: the pipeline republishes what it parses and folds it into link
+        # quality, and a resent batch is not a second flight.
         if self.server.processor is not None:
             with timings.measure("process"):
                 await self.server.processor.process(
-                    self.station_id, self.epoch, records
+                    self.station_id, self.epoch, stored.stored
                 )
         timings.count("batches", 1)
-        timings.count("records", len(records))
+        timings.count("records", len(stored.stored))
         timings.report_if_due()
 
     async def _handle_control(self, payload: str) -> None:
@@ -392,9 +496,24 @@ class _Session:
         now_s = time.monotonic()
 
         if isinstance(message, Status):
+            if self.superseded:
+                # The tracker is shared and belongs to the current session.
+                # A status from a superseded socket would move its baseline
+                # and could log a loss, or a healthy state, for a link the
+                # station is no longer using.
+                return
             for loss in self.tracker.observe_status(message, now_s=now_s):
                 await self.server.store.record_loss(self.station_id, self.epoch, loss)
-            await self._record_state_change(now_s, message.utc_ns)
+            try:
+                await self._record_state_change(now_s, message.utc_ns)
+            except StoreError as error:
+                # Same as the timer path: the event log being unavailable is
+                # not a reason to drop the connection that carries telemetry.
+                # The transition is retried on the next tick.
+                self.log.error(
+                    "could not log the link state; retrying next tick",
+                    extra={"error": str(error)},
+                )
             return
 
         if isinstance(message, Gap):
@@ -404,7 +523,8 @@ class _Session:
         if isinstance(message, IgnoredMessage):
             # protocol §14: ignore, do not reject. Counted so that a relay
             # speaking a newer dialect is visible.
-            self.tracker.observe_ignored_message()
+            if not self.superseded:
+                self.tracker.observe_ignored_message()
             return
 
         # A second `hello` on an open connection. §5 sends one per connection.
@@ -415,6 +535,27 @@ class _Session:
             raise ControlMessageError(
                 f"gap declares epoch {gap.epoch} on a session for {self.epoch}"
             )
+        # §11: a gap is the relay's answer to `resume_from_seq` asking for
+        # records the cap discarded, so it starts exactly where we asked and
+        # ends no later than one past the newest record `hello` said the relay
+        # held. Anything else is not loss but confusion about which station
+        # or epoch is being discussed, and §11 says the two must never be
+        # conflated: recording it would advance the resume point over records
+        # that may still exist. Refused as a protocol error, which closes the
+        # connection; the relay reconnects with backoff (§12) and a gap that
+        # keeps failing this check is an operator problem the logs name.
+        if gap.from_seq != self._watermark + 1:
+            raise ControlMessageError(
+                f"gap starts at {gap.from_seq} but the resume point is "
+                f"{self._watermark + 1}; a gap begins where the server asked "
+                f"the relay to resume"
+            )
+        if gap.to_seq > self.newest_seq_held + 1:
+            raise ControlMessageError(
+                f"gap ends at {gap.to_seq} but hello declared "
+                f"newest_seq_held={self.newest_seq_held}; records past "
+                f"{self.newest_seq_held + 1} were never assigned"
+            )
 
         # Recorded before the watermark moves. §11: a recorded gap advances the
         # resume point, and the order matters on a crash - a watermark past a
@@ -424,10 +565,11 @@ class _Session:
         # it: a replay that draws a smooth track through missing data invents
         # evidence.
         await self.server.store.record_gap(self.station_id, self.epoch, gap)
-        self.tracker.observe_gap(gap, now_s=now_s)
-        self._watermark = await self.server.store.store_records(
-            self.station_id, self.epoch, []
-        )
+        if not self.superseded:
+            self.tracker.observe_gap(gap, now_s=now_s)
+        self._watermark = (
+            await self.server.store.store_records(self.station_id, self.epoch, [])
+        ).watermark
 
     async def _acknowledge_periodically(self) -> None:
         while True:
@@ -450,11 +592,13 @@ class _Session:
         an incident is reconstructed from.
         """
         state = self.tracker.state(now_s=now_s, now_utc_ns=time.time_ns())
-        if state != self._last_state:
-            self._last_state = state
+        if state != self._last_state and not self.superseded:
             await self.server.store.record_link_state(
                 self.station_id, state, at_utc_ns=at_utc_ns
             )
+            # After the write, so a write that failed is retried on the next
+            # tick rather than the transition going unlogged.
+            self._last_state = state
         return state
 
     async def _report_periodically(self) -> None:
@@ -473,10 +617,29 @@ class _Session:
         """
         while True:
             await asyncio.sleep(self.server.station_report_interval_s)
+            await self._tick_logged()
+
+    async def _tick_logged(self) -> None:
+        """One tick, with a store failure logged rather than raised.
+
+        A `StoreError` from the event log used to end this task, and with it
+        every report to the console for the rest of the session: the stations
+        panel froze on whatever was last published (S-06). The transition is
+        retried on the next tick because `_record_state_change` only notes
+        the state once it is written.
+        """
+        try:
             await self._tick()
+        except StoreError as error:
+            self.log.error(
+                "could not log the link state; retrying next tick",
+                extra={"error": str(error)},
+            )
 
     async def _tick(self) -> None:
         """Log the state if it changed, and report it either way."""
+        if self.superseded:
+            return
         now_s = time.monotonic()
         # `time.time_ns` because a transition detected by a timer has no
         # message to take a timestamp from.
@@ -494,7 +657,17 @@ class _Session:
         §9: a relay we cannot reach is presumed buffering, not losing.
         `unreachable` says that; `data_lost` stays reserved for loss that has
         actually been observed, and so is never overwritten here.
+
+        Unless this session has been superseded. Then the station is not
+        gone - it reconnected, and the new session speaks for it - and the
+        one thing this must not do is write `unreachable` over a live link.
         """
+        if self.superseded:
+            self.log.info(
+                "superseded session ended; link state left to the newer one",
+                extra={"generation": self.generation},
+            )
+            return
         state = self.tracker.state(now_s=time.monotonic())
         if state is not LinkState.DATA_LOST:
             state = LinkState.UNREACHABLE
@@ -526,13 +699,21 @@ class _Session:
         # and once the relay is unreachable we have no basis to advance it -
         # doing so would report radio silence we cannot observe, on a link
         # that may be carrying telemetry into a buffer perfectly well.
-        await reporter.publish_station(
-            self.station_id,
-            state,
-            last_datagram_age_ms=None
-            if status is None
-            else status.last_datagram_age_ms,
-            queue_depth=None if status is None else status.queue_depth,
-            losses=list(self.tracker.losses),
-            lag_s=self.tracker.lag_s(now_utc_ns=time.time_ns()),
-        )
+        try:
+            await reporter.publish_station(
+                self.station_id,
+                state,
+                last_datagram_age_ms=None
+                if status is None
+                else status.last_datagram_age_ms,
+                queue_depth=None if status is None else status.queue_depth,
+                losses=list(self.tracker.losses),
+                lag_s=self.tracker.lag_s(now_utc_ns=time.time_ns()),
+            )
+        except Exception as error:
+            # The console is a view of the record, never a condition of it.
+            # A bus that is down must not end the reporter, let alone the
+            # session that stores and acknowledges.
+            self.log.error(
+                "could not publish the station state", extra={"error": repr(error)}
+            )

@@ -30,6 +30,21 @@ from gateway.relay_records import Record
 from gateway.station_state import LinkState, LossEvent
 
 
+@dataclass(frozen=True, slots=True)
+class StoredBatch:
+    """What `store_records` did with a batch.
+
+    `stored` is the records that were new - the ones that are in the archive
+    now and were not before. Retransmissions (§10, at-least-once) are not in
+    it, so the pipeline behind the store never parses a datagram twice and
+    the link-quality counters never count one twice (S-05).
+    """
+
+    # The cumulative watermark: what may be acknowledged.
+    watermark: int
+    stored: list[Record] = field(default_factory=list)
+
+
 class StoreError(RuntimeError):
     """The store could not complete an operation durably.
 
@@ -66,13 +81,15 @@ class IngestStore(Protocol):
 
     async def store_records(
         self, station_id: str, epoch: str, records: list[Record]
-    ) -> int:
-        """Store records durably and return the new cumulative watermark.
+    ) -> StoredBatch:
+        """Store records durably; return the watermark and what was new.
 
-        The return value is what may be acknowledged: the highest `seq` such
+        The watermark is what may be acknowledged: the highest `seq` such
         that everything up to and including it is either stored or covered by a
         recorded gap. Duplicates are ignored - at-least-once on the wire,
-        exactly-once after dedupe on `(station_id, epoch, seq)` (protocol §10).
+        exactly-once after dedupe on `(station_id, epoch, seq)` (protocol §10)
+        - and are absent from `stored`, so whatever runs after the store sees
+        each record once.
         """
         ...
 
@@ -116,15 +133,18 @@ class InMemoryIngestStore:
 
     async def store_records(
         self, station_id: str, epoch: str, records: list[Record]
-    ) -> int:
+    ) -> StoredBatch:
         held = self.records.setdefault((station_id, epoch), {})
+        stored: list[Record] = []
         for record in records:
             # Dedupe: first write wins. A retransmission after a lost ack
             # carries identical bytes, so which one is kept does not matter,
             # but overwriting would hide a station sending two different
             # payloads under one seq - which would be worth seeing.
-            held.setdefault(record.seq, record)
-        return self._watermark(station_id, epoch)
+            if record.seq not in held:
+                held[record.seq] = record
+                stored.append(record)
+        return StoredBatch(self._watermark(station_id, epoch), stored)
 
     async def record_gap(self, station_id: str, epoch: str, gap: Gap) -> None:
         self.gaps.setdefault((station_id, epoch), []).append(gap)

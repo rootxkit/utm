@@ -115,6 +115,10 @@ services:
     command: ["python", "-m", "api"]
     environment:
       API_HOST: 0.0.0.0
+      # Only Caddy publishes ports, so every peer on this network is
+      # Caddy or another service of ours: trust its X-Forwarded-For, or
+      # every client would share one login rate-limit budget (S-15).
+      FORWARDED_ALLOW_IPS: "*"
     volumes:
       - ./data/terrain:/data/terrain:ro
       - ./data/basemap:/data/basemap:ro
@@ -124,6 +128,10 @@ services:
     command: ["python", "-m", "api.console"]
     environment:
       CONSOLE_HOST: 0.0.0.0
+      # Only Caddy publishes ports, so every peer on this network is
+      # Caddy or another service of ours: trust its X-Forwarded-For, or
+      # every client would share one login rate-limit budget (S-15).
+      FORWARDED_ALLOW_IPS: "*"
     volumes:
       - ./data/basemap:/data/basemap:ro
 

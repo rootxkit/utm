@@ -4,12 +4,14 @@ National drone-flight monitoring system. It observes every drone in the
 airspace it can hear and shows them on one map, with zones, violations, alerts,
 flight history and replay, for a control centre and the regulator.
 
-Data sources (`docs/ARCHITECTURE.md` §2):
+Data sources (`docs/ARCHITECTURE.md` §2), each its own adapter that can be
+switched off by type or one instance at a time (§2.1):
 
-- **Operator relays** — MAVLink forwarded by QGroundControl to a relay on the
-  operator's ground station, and on to the Gateway over TLS.
-- **Remote ID receivers** — broadcast Remote ID, shown as unverified.
-- **ADS-B** — manned aircraft (planned, P1-16).
+- **Remote ID** (primary) — direct broadcast from ground receivers, shown as
+  unverified, and network Remote ID from providers (planned, U-02).
+- **Operator relays** (optional feature) — MAVLink forwarded by QGroundControl
+  to a relay on the operator's ground station, and on to the Gateway over TLS.
+- **ADS-B** — manned aircraft (planned, U-07).
 - **Registry** — operators, drones and their serial numbers.
 
 The system is an **observer, never a controller**, permanently: it ingests

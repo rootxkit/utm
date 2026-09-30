@@ -27,7 +27,7 @@ from websockets.asyncio.client import connect
 
 from agent.framing import Record as RelayRecord
 from agent.framing import encode_records
-from gateway.ingest_store import InMemoryIngestStore
+from gateway.ingest_store import InMemoryIngestStore, StoredBatch, StoreError
 from gateway.rate_limit import RateLimiter
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
@@ -58,7 +58,7 @@ class OrderRecordingStore(InMemoryIngestStore):
 
     async def store_records(
         self, station_id: str, epoch: str, records: list[Record]
-    ) -> int:
+    ) -> StoredBatch:
         if records:
             self.calls.append(f"store:{records[0].seq}-{records[-1].seq}")
         return await super().store_records(station_id, epoch, records)
@@ -346,7 +346,7 @@ async def test_nothing_is_acknowledged_before_it_is_stored() -> None:
     class SlowStore(InMemoryIngestStore):
         async def store_records(
             self, station_id: str, epoch: str, records: list[Record]
-        ) -> int:
+        ) -> StoredBatch:
             if records:
                 await asyncio.sleep(0.3)
                 order.append("stored")
@@ -925,3 +925,401 @@ async def test_a_valid_token_logs_no_rejection(monkeypatch: pytest.MonkeyPatch) 
     assert not [
         r for r in handler.records if r.getMessage() == "rejected relay connection"
     ]
+
+
+# --- the pipeline sees each record once (S-05) -----------------------------
+
+
+@dataclass
+class RecordingProcessor:
+    """Notes every record handed to the pipeline, batch by batch."""
+
+    batches: list[list[int]] = field(default_factory=list)
+
+    async def process(self, station_id: str, epoch: str, records: list[Record]) -> None:
+        self.batches.append([record.seq for record in records])
+
+
+async def test_a_retransmitted_batch_is_not_processed_again() -> None:
+    """§10 at-least-once: the resend is stored-and-ignored, and the pipeline
+    must not see it either, or it republishes the telemetry and counts the
+    same datagrams twice in link quality."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(batch(0, 10))
+        await read_until(connection, "ack")
+        await connection.send(batch(0, 10))
+        await connection.send(batch(5, 10))
+        ack = await read_until(connection, "ack")
+        while ack["seq"] < 14:
+            ack = await read_until(connection, "ack")
+
+    # Presence: the first copy was processed, and the new tail of the
+    # overlapping batch. Absence: neither duplicate reached the pipeline.
+    assert processor.batches == [list(range(10)), list(range(10, 15))]
+
+
+# --- a superseded session writes nothing (S-06) ----------------------------
+#
+# Trackers are shared per station. After a half-open link the relay
+# reconnects in seconds; the old session notices only when its own pings time
+# out, and its last act was to log and publish `unreachable` over a station
+# whose new session was healthy and streaming.
+
+
+async def test_a_stale_session_closing_does_not_mark_a_live_station_unreachable() -> (
+    None
+):
+    store = InMemoryIngestStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        old = await connect(url(server), additional_headers=auth())
+        await handshake(old, hello())
+        await old.send(status())
+        await wait_for_state(reporter, LinkState.HEALTHY)
+
+        # The relay reconnects while the old socket is still open.
+        async with connect(url(server), additional_headers=auth()) as new:
+            await handshake(new, hello())
+            await new.send(status())
+            await wait_for_state(reporter, LinkState.HEALTHY)
+            since = len(reporter.reports)
+
+            # Now the old session finds out, the way it would after a ping
+            # timeout, and ends.
+            await old.close()
+            await asyncio.sleep(0.2)
+
+            assert LinkState.UNREACHABLE not in [
+                state for _, state in reporter.reports[since:]
+            ], "the stale session overwrote the live station's state"
+            logged_while_live = [state for _, state, _ in store.link_states]
+            assert logged_while_live[-1] is LinkState.HEALTHY
+
+        # Presence: when the session that speaks for the station ends, the
+        # station really is unreachable, and it is said.
+        await wait_for_state(reporter, LinkState.UNREACHABLE)
+
+    logged_after = [state for _, state, _ in store.link_states]
+    assert logged_after[-1] is LinkState.UNREACHABLE
+
+
+# --- the reporter outlives a store failure (S-06) --------------------------
+
+
+@dataclass
+class FailingLinkStateStore(InMemoryIngestStore):
+    """`record_link_state` raises for the states named, once each."""
+
+    fail_on: set[LinkState] = field(default_factory=set)
+    failures: list[LinkState] = field(default_factory=list)
+
+    async def record_link_state(
+        self, station_id: str, state: LinkState, *, at_utc_ns: int
+    ) -> None:
+        if state in self.fail_on:
+            self.fail_on.discard(state)
+            self.failures.append(state)
+            raise StoreError(f"event log unavailable while writing {state}")
+        await super().record_link_state(station_id, state, at_utc_ns=at_utc_ns)
+
+
+async def test_a_store_failure_in_one_tick_does_not_end_the_reporter() -> None:
+    """The console froze: a StoreError killed the reporter task, and nothing
+    was published for the rest of the session. The tick must log and go on,
+    and the transition it failed to write must reach the log on a later tick.
+    """
+    store = FailingLinkStateStore(fail_on={LinkState.HEALTHY})
+    reporter = RecordingReporter()
+    async with (
+        running(
+            store=store, station_reporter=reporter, station_report_interval_s=0.02
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(status())
+        await wait_for_state(reporter, LinkState.HEALTHY)
+        assert store.failures == [LinkState.HEALTHY]
+        # Still alive: reports keep arriving after the failure.
+        seen = len(reporter.reports)
+        await wait_for_reports(reporter, seen + 3)
+
+    # Retried, and logged, once the store came back.
+    assert LinkState.HEALTHY in [state for _, state, _ in store.link_states]
+
+
+async def test_a_failed_disconnect_write_still_reports_the_station_unreachable() -> (
+    None
+):
+    """The `except StoreError` in `_report_disconnected`, which had never run.
+
+    The session is over either way; what must survive the failure is the
+    report, so the console is not left showing `healthy` for a station that
+    left.
+    """
+    store = FailingLinkStateStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        async with connect(url(server), additional_headers=auth()) as connection:
+            await handshake(connection, hello())
+            await connection.send(status())
+            await wait_for_state(reporter, LinkState.HEALTHY)
+            # Arm the failure for the disconnect write only.
+            store.fail_on.add(LinkState.UNREACHABLE)
+        await wait_for_state(reporter, LinkState.UNREACHABLE)
+
+    assert store.failures == [LinkState.UNREACHABLE]
+    assert reporter.reports[-1] == (STATION, LinkState.UNREACHABLE)
+
+
+@dataclass
+class RaisingReporter:
+    """A bus that is down, from the session's point of view."""
+
+    attempts: int = 0
+
+    async def publish_station(
+        self,
+        station_id: str,
+        state: LinkState,
+        *,
+        last_datagram_age_ms: int | None = None,
+        queue_depth: int | None = None,
+        losses: Any = None,
+        lag_s: float | None = None,
+    ) -> None:
+        self.attempts += 1
+        raise RuntimeError("bus unavailable")
+
+
+async def test_a_reporter_that_raises_does_not_break_ingest() -> None:
+    """The console is a view of the record, never a condition of it."""
+    store = InMemoryIngestStore()
+    reporter = RaisingReporter()
+    async with (
+        running(
+            store=store,
+            station_reporter=reporter,
+            station_report_interval_s=0.02,
+            ack_interval_s=0.05,
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(status())
+        await asyncio.sleep(0.1)
+        await connection.send(batch(0, 4))
+        ack = await read_until(connection, "ack")
+
+    assert ack["seq"] == 3
+    assert reporter.attempts >= 3, "the reporter stopped after the first failure"
+    assert len(store.records[(STATION, EPOCH)]) == 4
+
+
+# --- a gap is checked against the resume point and the hello (S-08) --------
+
+
+async def send_gap(connection: Any, from_seq: int, to_seq: int) -> None:
+    await connection.send(
+        json.dumps(
+            {
+                "type": "gap",
+                "epoch": EPOCH,
+                "from_seq": from_seq,
+                "to_seq": to_seq,
+                "reason": "queue_cap",
+            }
+        )
+    )
+
+
+async def expect_closed(connection: Any) -> websockets.ConnectionClosed:
+    with pytest.raises(websockets.ConnectionClosed) as caught:
+        for _ in range(20):
+            await asyncio.wait_for(connection.recv(), timeout=5.0)
+    return caught.value
+
+
+async def test_a_gap_that_does_not_start_at_the_resume_point_is_refused() -> None:
+    """§11: a gap begins where `welcome` asked the relay to resume. One that
+    starts elsewhere would advance the resume point over records that may
+    still exist, so it is a protocol error and nothing is recorded."""
+    store = OrderRecordingStore()
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(batch(0, 10))
+        await read_until(connection, "ack")
+        await send_gap(connection, 12, 40)
+        closed = await expect_closed(connection)
+
+    assert closed.rcvd is not None and closed.rcvd.code == 1008
+    assert "gap:12-40" not in store.calls
+    assert (STATION, EPOCH) not in store.gaps
+
+
+async def test_a_gap_ending_past_the_newest_record_held_is_refused() -> None:
+    """The records past `newest_seq_held + 1` were never assigned, so a gap
+    claiming them is confusion about the epoch, not loss."""
+    store = OrderRecordingStore()
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=50))
+        await send_gap(connection, 0, 52)
+        closed = await expect_closed(connection)
+
+    assert closed.rcvd is not None and closed.rcvd.code == 1008
+    assert (STATION, EPOCH) not in store.gaps
+
+
+async def test_a_gap_ending_exactly_one_past_the_newest_record_is_accepted() -> None:
+    """The presence half, on the boundary: the relay lost everything it held,
+    including the newest record, and says so with `to_seq = newest + 1`."""
+    store = OrderRecordingStore()
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=50))
+        await send_gap(connection, 0, 51)
+        ack = await read_until(connection, "ack")
+
+    assert ack["seq"] == 50
+    assert "gap:0-51" in store.calls
+
+
+async def test_a_gap_on_a_resumed_session_starts_at_the_durable_resume_point() -> None:
+    """The check uses what `welcome` said, not a watermark that starts at -1
+    on every connection. A relay resuming from 500 sends a gap from 500."""
+    store = OrderRecordingStore()
+    await store.store_records(
+        STATION,
+        EPOCH,
+        [Record(seq=n, recv_utc_ns=0, datagram=b"x") for n in range(500)],
+    )
+    async with (
+        running(store=store, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        welcome = await handshake(connection, hello())
+        assert welcome["resume_from_seq"] == 500
+        await send_gap(connection, 500, 600)
+        ack = await read_until(connection, "ack")
+
+    assert ack["seq"] == 599
+    assert "gap:500-600" in store.calls
+
+
+# --- the path carries the protocol version (S-08, protocol §14) ------------
+
+
+async def test_a_connection_to_another_path_is_refused_with_http_404() -> None:
+    """A relay speaking a version this Gateway does not serve is told so at
+    the upgrade, before its token is looked at."""
+    async with running() as server:
+        with pytest.raises(websockets.InvalidStatus) as caught:
+            async with connect(
+                f"ws://127.0.0.1:{server.port_in_use}/relay/v2",
+                additional_headers=auth(),
+            ):
+                pass
+
+    assert caught.value.response.status_code == 404
+
+
+async def test_the_relay_v1_path_is_served() -> None:
+    """The presence half: `url()` is `/relay/v1`, and it is welcomed."""
+    async with (
+        running() as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        welcome = await handshake(connection, hello())
+
+    assert welcome["type"] == "welcome"
+
+
+# --- the station goes back to an older session when the newer dies (S-06) --
+
+
+async def test_the_station_is_handed_back_when_the_newer_session_dies() -> None:
+    """A reconnect that dies at once must not leave the older, healthy
+    session mute for ever. When the newer session ends and the older one is
+    still open, the older one speaks for the station again."""
+    store = InMemoryIngestStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        old = await connect(url(server), additional_headers=auth())
+        await handshake(old, hello())
+        await old.send(status())
+        await wait_for_state(reporter, LinkState.HEALTHY)
+
+        async with connect(url(server), additional_headers=auth()) as new:
+            await handshake(new, hello())
+            await new.send(status())
+            await wait_for_state(reporter, LinkState.HEALTHY)
+        # The newer session is gone; the older socket is still up.
+        since = len(reporter.reports)
+        await old.send(status())
+        await wait_for_reports(reporter, since + 3)
+
+        after = [state for _, state in reporter.reports[since:]]
+        assert LinkState.UNREACHABLE not in after, (
+            "the newer session's end was reported as the station leaving"
+        )
+        assert LinkState.HEALTHY in after, "the surviving session stayed mute"
+        logged = [state for _, state, _ in store.link_states]
+        assert logged[-1] is LinkState.HEALTHY
+
+        # Presence: when the survivor ends too, the station is unreachable.
+        await old.close()
+        await wait_for_state(reporter, LinkState.UNREACHABLE)
+
+    logged_after = [state for _, state, _ in store.link_states]
+    assert logged_after[-1] is LinkState.UNREACHABLE
+
+
+async def test_a_superseded_session_does_not_feed_the_tracker_or_the_loss_log() -> None:
+    """The tracker is shared. A status on the old socket must not move its
+    baseline or write a loss; the same status on the live socket must."""
+    store = InMemoryIngestStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        old = await connect(url(server), additional_headers=auth())
+        await handshake(old, hello())
+        await old.send(status(dropped_intake_total=0))
+        await wait_for_state(reporter, LinkState.HEALTHY)
+
+        async with connect(url(server), additional_headers=auth()) as new:
+            await handshake(new, hello())
+            await new.send(status(dropped_intake_total=0))
+            await wait_for_state(reporter, LinkState.HEALTHY)
+
+            # Absence: a loss reported on the superseded socket is not ours.
+            await old.send(status(dropped_intake_total=40))
+            await asyncio.sleep(0.2)
+            assert store.losses == []
+            assert reporter.reports[-1] == (STATION, LinkState.HEALTHY)
+
+            # Presence: the same delta on the live socket is a loss.
+            await new.send(status(dropped_intake_total=40))
+            await wait_for_state(reporter, LinkState.DATA_LOST)
+            assert [loss.datagram_count for _, _, loss in store.losses] == [40]
+
+        await old.close()

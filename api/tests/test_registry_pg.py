@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -25,7 +25,12 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from api.app import create_api_app
-from api.registry import FleetRegistry
+from api.registry import (
+    AirframeParams,
+    ConflictError,
+    FleetRegistry,
+    ProjectionIncompleteError,
+)
 from api.tests.auth_fakes import ADMIN_HEADERS, api_kwargs
 from api.tests.conftest import migrate_relational
 from gateway.binding import BindingConflictError, BindingResolver
@@ -39,9 +44,20 @@ STATION = "registry-test-station"
 class FakeLive:
     def __init__(self) -> None:
         self.states: dict[UUID, dict[str, Any]] = {}
+        self.reads: list[str] = []
+        self.fail = False
 
     async def get(self, drone_id: UUID) -> dict[str, Any] | None:
+        self.reads.append("get")
         return self.states.get(drone_id)
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        self.reads.append("get_many")
+        if self.fail:
+            raise ConnectionError("redis unreachable")
+        return {drone_id: self.states.get(drone_id) for drone_id in drone_ids}
 
 
 @pytest.fixture
@@ -182,6 +198,34 @@ async def test_a_duplicate_label_is_refused_and_projects_nothing(
         "/drones", json={"serial": unique("SN"), "label": first["label"]}
     )
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "duplicate"
+
+
+async def test_a_refusal_says_why_without_the_databases_words(
+    client: AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """S-16. The database's message names tables, constraints and other rows'
+    values; the client gets a stable code, and the log gets the detail."""
+    first = await a_drone(client)
+    label = unique("TEST")
+
+    with caplog.at_level("WARNING", logger="api.registry"):
+        response = await client.post(
+            "/drones", json={"serial": first["serial"], "label": label}
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "duplicate",
+        "message": f"drone {label!r} refused: it duplicates an existing record",
+    }
+    text = response.text.lower()
+    for leaked in ("drones_", "constraint", "key (", "unique", first["serial"].lower()):
+        assert leaked not in text, leaked
+    logged = [r for r in caplog.records if getattr(r, "code", None) == "duplicate"]
+    assert logged, "the database's reason was not logged"
+    assert "drones_serial_key" in logged[-1].__dict__["error"]
+    assert first["serial"] in logged[-1].__dict__["detail"]
 
 
 async def test_retiring_closes_bindings_and_marks_the_projection(
@@ -232,6 +276,189 @@ async def test_retiring_closes_bindings_and_marks_the_projection(
     assert again.status_code == 409
 
 
+class FlakyProjection:
+    """The real projection, which can be made to fail, and which records
+    every write that reached the telemetry database."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self.real = BindingResolver(engine=engine)
+        self.fail = False
+        self.writes: list[str] = []
+
+    async def register_drone(
+        self,
+        drone_id: UUID,
+        label: str,
+        *,
+        retired_at: datetime | None = None,
+        serial: str | None = None,
+    ) -> None:
+        self.writes.append("register_drone")
+        await self.real.register_drone(
+            drone_id, label, retired_at=retired_at, serial=serial
+        )
+
+    async def close_bindings_for_drone(self, drone_id: UUID, *, at: datetime) -> int:
+        if self.fail:
+            raise ConnectionError("telemetry database unreachable")
+        self.writes.append("close_bindings_for_drone")
+        return await self.real.close_bindings_for_drone(drone_id, at=at)
+
+
+async def open_bindings(engine: AsyncEngine, drone_id: str) -> int:
+    async with engine.connect() as connection:
+        found: int = (
+            await connection.execute(
+                sa.text(
+                    "SELECT count(*) FROM source_bindings "
+                    "WHERE drone_id = :d AND upper(valid) IS NULL"
+                ),
+                {"d": drone_id},
+            )
+        ).scalar_one()
+    return found
+
+
+async def retired_at(engine: AsyncEngine, table: str, drone_id: str) -> datetime | None:
+    column = "id" if table == "drones" else "drone_id"
+    async with engine.connect() as connection:
+        found: datetime | None = (
+            await connection.execute(
+                sa.text(f"SELECT retired_at FROM {table} WHERE {column} = :d"),
+                {"d": drone_id},
+            )
+        ).scalar_one()
+    return found
+
+
+@pytest.fixture
+async def flaky(
+    relational_engine: AsyncEngine, engine: AsyncEngine, live: FakeLive
+) -> AsyncIterator[tuple[FleetRegistry, FlakyProjection, dict[str, Any]]]:
+    """A registry over a flaky projection, and a drone with an open binding."""
+    projection = FlakyProjection(engine)
+    registry = FleetRegistry(engine=relational_engine, projection=projection, live=live)
+    drone = await registry.register_drone(
+        serial=unique("SN"),
+        label=unique("TEST"),
+        model=None,
+        params=AirframeParams(),
+        home_base_id=None,
+        current_pilot_id=None,
+    )
+    await projection.real.bind(
+        STATION,
+        SourceId(sysid=243, compid=1),
+        drone["id"],
+        bound_from=datetime(2026, 1, 1, tzinfo=UTC),
+        created_by="registry-test",
+    )
+    projection.writes.clear()
+    yield registry, projection, drone
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text("DELETE FROM source_bindings WHERE station_id = :s"),
+            {"s": STATION},
+        )
+
+
+async def test_a_retirement_that_fails_here_leaves_telemetry_untouched(
+    flaky: tuple[FleetRegistry, FlakyProjection, dict[str, Any]],
+    relational_engine: AsyncEngine,
+    engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S-16. The relational transaction rolls back, so nothing may have
+    been closed in the telemetry database, which a rollback cannot reach."""
+    registry, projection, drone = flaky
+
+    async def failing_audit(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("audit insert failed")
+
+    monkeypatch.setattr(registry, "_audit", failing_audit)
+
+    with pytest.raises(RuntimeError, match="audit insert failed"):
+        await registry.retire_drone(drone["id"])
+
+    assert projection.writes == []
+    assert await open_bindings(engine, str(drone["id"])) == 1
+    assert await retired_at(relational_engine, "drones", str(drone["id"])) is None
+    assert await retired_at(engine, "known_drones", str(drone["id"])) is None
+
+
+async def test_a_projection_that_fails_after_the_commit_is_finished_by_retrying(
+    flaky: tuple[FleetRegistry, FlakyProjection, dict[str, Any]],
+    relational_engine: AsyncEngine,
+    engine: AsyncEngine,
+) -> None:
+    """S-16, the compensating path: retired here, bindings still open there,
+    the caller told so, and retiring again closes them at the recorded time."""
+    registry, projection, drone = flaky
+    drone_id = str(drone["id"])
+    projection.fail = True
+
+    with pytest.raises(ProjectionIncompleteError):
+        await registry.retire_drone(drone["id"])
+
+    recorded = await retired_at(relational_engine, "drones", drone_id)
+    assert recorded is not None
+    assert await open_bindings(engine, drone_id) == 1
+    assert await retired_at(engine, "known_drones", drone_id) is None
+
+    projection.fail = False
+    with pytest.raises(ConflictError) as again:
+        await registry.retire_drone(drone["id"])
+
+    assert again.value.code == "already_retired"
+    assert await open_bindings(engine, drone_id) == 0
+    assert await retired_at(engine, "known_drones", drone_id) == recorded
+    trail = [
+        (event["event_type"], event["payload"])
+        for event in await registry.events(entity_type="drone", entity_id=drone_id)
+    ]
+    assert [event for event, _ in trail] == ["registered", "retired", "bindings_closed"]
+    assert trail[-1][1]["bindings_closed"] == 1
+
+
+async def test_a_retirement_closes_bindings_and_audits_it(
+    flaky: tuple[FleetRegistry, FlakyProjection, dict[str, Any]],
+    engine: AsyncEngine,
+) -> None:
+    """The paired presence: nothing fails, and the order is relational
+    first, then the projection."""
+    registry, projection, drone = flaky
+
+    retired = await registry.retire_drone(drone["id"])
+
+    assert retired["retired_at"] is not None
+    assert projection.writes == ["close_bindings_for_drone", "register_drone"]
+    assert await open_bindings(engine, str(drone["id"])) == 0
+    events = await registry.events(entity_type="drone", entity_id=str(drone["id"]))
+    assert [e["event_type"] for e in events] == [
+        "registered",
+        "retired",
+        "bindings_closed",
+    ]
+
+
+async def test_a_failed_projection_is_503_over_http(
+    flaky: tuple[FleetRegistry, FlakyProjection, dict[str, Any]],
+) -> None:
+    registry, projection, drone = flaky
+    projection.fail = True
+    app = create_api_app(registry, **api_kwargs())
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=ADMIN_HEADERS,
+    ) as http:
+        response = await http.post(f"/drones/{drone['id']}/retire")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "projection_incomplete"
+    assert "unreachable" not in response.text
+
+
 async def test_a_retired_drone_is_hidden_unless_asked_for(client: AsyncClient) -> None:
     drone = await a_drone(client)
     await client.post(f"/drones/{drone['id']}/retire")
@@ -266,6 +493,37 @@ async def test_status_follows_telemetry(client: AsyncClient, live: FakeLive) -> 
 
     del live.states[drone_id]
     assert (await client.get(f"/drones/{drone_id}")).json()["status"] == "OFFLINE"
+
+
+async def test_the_drone_list_reads_live_state_in_one_batch(
+    client: AsyncClient, live: FakeLive
+) -> None:
+    """S-16. One read for the fleet, not one per drone, with each drone's
+    status still its own."""
+    flying, idle, silent = [await a_drone(client) for _ in range(3)]
+    live.states[UUID(flying["id"])] = {"armed": True}
+    live.states[UUID(idle["id"])] = {"armed": False}
+    live.reads.clear()
+
+    listed = {d["id"]: d["status"] for d in (await client.get("/drones")).json()}
+
+    assert live.reads == ["get_many"]
+    assert listed[flying["id"]] == "IN_FLIGHT"
+    assert listed[idle["id"]] == "IDLE"
+    assert listed[silent["id"]] == "OFFLINE"
+
+
+async def test_the_drone_list_survives_live_state_being_unreachable(
+    client: AsyncClient, live: FakeLive
+) -> None:
+    drone = await a_drone(client)
+    live.states[UUID(drone["id"])] = {"armed": True}
+    live.fail = True
+
+    response = await client.get("/drones")
+
+    assert response.status_code == 200
+    assert {d["id"]: d["status"] for d in response.json()}[drone["id"]] == "OFFLINE"
 
 
 async def test_maintenance_is_set_by_a_person_and_wins(
@@ -318,6 +576,8 @@ async def test_a_drone_at_an_unknown_base_is_refused(client: AsyncClient) -> Non
         },
     )
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "unknown_reference"
+    assert "home_base_id" not in response.text
 
 
 async def test_a_pilot_status_changes_and_is_validated(client: AsyncClient) -> None:

@@ -49,8 +49,15 @@ NON_PYTHON_DIRS = ("web-pilot", "infra", "sim", "docs")
 # on (P1-00), where a silent parsing bug is not cheaper than one in a service,
 # only harder to notice; and agent because the ground relay is where the Stage
 # 0 guarantee — that the server cannot reach the aircraft — is enforced, and
-# where telemetry is lost for good if it is lost at all.
-STRICT_DIRS = ("common", "gateway", "airspace", "tools", "agent")
+# where telemetry is lost for good if it is lost at all. api because it is the
+# sign-in boundary and the only writer of the fleet registry and its telemetry
+# projection.
+STRICT_DIRS = ("common", "gateway", "airspace", "tools", "agent", "api")
+
+# Branch coverage is gated on these. api is strict-typed but not gated: its
+# coverage is best effort (CLAUDE.md), and the gate's figures were measured
+# without it.
+COVERED_DIRS = ("common", "gateway", "airspace", "tools", "agent")
 
 # The per-module half of mypy's --strict bundle. The rest of the bundle is set
 # globally and so is not repeated in the override.
@@ -134,7 +141,8 @@ def test_coverage_is_measured_on_the_safety_relevant_directories(
     pyproject: dict,
 ) -> None:
     measured = pyproject["tool"]["coverage"]["run"]["source"]
-    assert sorted(measured) == sorted(STRICT_DIRS)
+    assert sorted(measured) == sorted(COVERED_DIRS)
+    assert set(COVERED_DIRS) <= set(STRICT_DIRS)
 
 
 def test_only_tools_and_tests_may_print(pyproject: dict) -> None:

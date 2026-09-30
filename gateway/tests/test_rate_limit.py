@@ -58,3 +58,51 @@ def test_keys_are_limited_independently() -> None:
     rejections.admit("201/1")
 
     assert rejections.admit("202/1") == 0
+
+
+# --- per-key state is bounded (S-07) ---------------------------------------
+
+
+def test_expired_keys_are_evicted_before_live_ones() -> None:
+    """Keys are chosen by whoever is being rejected, so the table must not
+    grow with them. Expired keys go first."""
+    clock = Clock()
+    rejections = RateLimiter(interval_s=60.0, clock=clock, max_keys=3)
+    for key in ("a", "b", "c"):
+        rejections.admit(key)
+    assert rejections.tracked_keys == 3
+
+    clock.now_s += 61.0
+    rejections.admit("d")
+
+    assert rejections.tracked_keys == 1
+
+
+def test_the_least_recently_reported_key_is_evicted_when_none_expired() -> None:
+    clock = Clock()
+    rejections = RateLimiter(interval_s=60.0, clock=clock, max_keys=3)
+    rejections.admit("a")
+    clock.now_s += 1.0
+    for key in ("b", "c"):
+        rejections.admit(key)
+    for _ in range(5):
+        rejections.admit("a")  # counted against "a", which stays the oldest
+
+    rejections.admit("d")
+
+    assert rejections.tracked_keys == 3
+    # The evicted key is reported again as new, its count gone with it:
+    # what a bound costs, stated so it is not mistaken for a lost report.
+    # (Re-admitting it evicts the next oldest, "b", to make room.)
+    assert rejections.admit("a") == 0
+    # And a key that was kept is still suppressed.
+    assert rejections.admit("c") is None
+
+
+def test_keys_under_the_bound_are_all_kept() -> None:
+    """The presence half of the bound."""
+    rejections, _ = limiter()
+    for n in range(500):
+        rejections.admit(f"key-{n}")
+
+    assert rejections.tracked_keys == 500

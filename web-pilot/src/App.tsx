@@ -140,7 +140,7 @@ export function App() {
     location.replace("/login?next=/app/");
   };
 
-  if (!me) return <div className="loading">courier…</div>;
+  if (!me) return <div className="loading">{t("product_name")}…</div>;
 
   const canAcknowledge = me.role === "operator" || me.role === "admin";
   const selectedAlerts = selected
