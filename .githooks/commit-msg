@@ -37,6 +37,6 @@ fi
 
 # Warn, but do not block, when the subject carries no task ID. Some commits
 # legitimately have none; most should.
-if ! grep -qE '\[[A-Z]+[0-9]+[A-Za-z]*-[0-9]+\]' "$MSG_FILE"; then
+if ! grep -qE '\[[A-Z]+[0-9]*[A-Za-z]*-[0-9]+\]' "$MSG_FILE"; then
   echo "commit-msg: warning — no task ID (e.g. [P0-01]) found in the message" >&2
 fi
