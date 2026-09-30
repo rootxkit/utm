@@ -630,3 +630,60 @@ def test_a_queue_whose_rollbacks_succeed_is_never_poisoned(queue_path: Path) -> 
 
         assert not queue.poisoned
         assert [r.seq for r in queue.append(datagrams(1))] == [5]
+
+
+def _persisted_intake_drops(queue_path: Path) -> int:
+    """Read the counter from disk through a second connection."""
+    connection = sqlite3.connect(queue_path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'dropped_intake_total'"
+        ).fetchone()
+        return int(row[0])
+    finally:
+        connection.close()
+
+
+def test_an_acknowledgement_persists_intake_drops_the_disk_refused(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(3))
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            queue.record_intake_drops(6)
+        assert _persisted_intake_drops(queue_path) == 0
+
+        failing.failing = False
+        queue.acknowledge(0)
+
+        assert _persisted_intake_drops(queue_path) == 6
+
+
+def test_closing_persists_intake_drops_the_disk_refused(queue_path: Path) -> None:
+    queue = DurableQueue(queue_path)
+    failing = _FailingCommits(queue._connection)
+    queue._connection = failing  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError):
+        queue.record_intake_drops(4)
+    queue.count_intake_drops(1)
+
+    failing.failing = False
+    queue.close()
+
+    assert _persisted_intake_drops(queue_path) == 5
+    with DurableQueue(queue_path) as reopened:
+        assert reopened.dropped_intake_total == 5
+
+
+def test_closing_while_the_disk_still_refuses_does_not_raise(
+    queue_path: Path,
+) -> None:
+    queue = DurableQueue(queue_path)
+    queue._connection = _FailingCommits(queue._connection)  # type: ignore[assignment]
+    queue.count_intake_drops(2)
+
+    queue.close()
+
+    assert _persisted_intake_drops(queue_path) == 0

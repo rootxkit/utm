@@ -186,10 +186,19 @@ def test_stopping_with_a_full_disk_ends_the_writer_and_counts_what_it_held(
 
     relay.stop()
     udp.close()
+    reported = durable_queue.dropped_intake_total
+    # The page cap refuses new rows but not an in-place counter update, so
+    # close() can still persist the count, as it would on a disk with a few
+    # bytes left.
+    durable_queue.close()
+
+    with DurableQueue(config.queue_path) as reopened:
+        persisted = reopened.dropped_intake_total
 
     assert not relay.writer_alive
-    assert durable_queue.dropped_intake_total >= 1
-    durable_queue.close()
+    # All four held back by the full disk, none silently lost.
+    assert reported == 4
+    assert persisted == 4
 
 
 def test_a_dead_writer_stops_the_uplink(

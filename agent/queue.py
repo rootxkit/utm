@@ -434,6 +434,9 @@ class DurableQueue:
                     self._connection.execute(
                         "DELETE FROM records WHERE seq <= ?", (seq,)
                     )
+                # Carries any intake drops whose own write failed; on a link
+                # with no new telemetry, acks are the only commits there are.
+                self._set_int(_DROPPED_INTAKE, self._dropped_intake)
                 self._connection.commit()
             except sqlite3.Error:
                 self._rollback_locked()
@@ -446,9 +449,18 @@ class DurableQueue:
         return count
 
     def close(self) -> None:
+        """Close, writing any intake drops counted while the disk refused them.
+
+        Best effort: if the disk still refuses, the count is lost with the
+        process, which the Gateway sees as a restart (relay-v1 §11 loss #4).
+        """
         with self._lock:
             if not self.poisoned:
-                self._connection.commit()
+                try:
+                    self._set_int(_DROPPED_INTAKE, self._dropped_intake)
+                    self._connection.commit()
+                except sqlite3.Error:
+                    self._rollback_locked()
             # Closing discards whatever a poisoned connection still had open.
             self._connection.close()
 

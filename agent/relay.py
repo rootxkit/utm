@@ -16,7 +16,6 @@ block, it counts a drop and carries on.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import queue as queue_module
 import random
@@ -219,14 +218,16 @@ class Relay:
 
             self._set_storage_ok(False)
             if self._stop.is_set():
-                # Shutting down with a disk that refuses writes. These never
-                # got a sequence number, so they are intake drops by §11's
+                # Shutting down with a disk that refuses writes. The held
+                # batch and whatever is still waiting in intake never got a
+                # sequence number, so they are intake drops by §11's
                 # definition; counting them is all that can still be done.
-                with contextlib.suppress(Exception):
-                    self._queue.record_intake_drops(len(held))
+                # close() makes a last attempt to persist the count.
+                abandoned = len(held) + self._drain_intake()
+                self._queue.count_intake_drops(abandoned)
                 self._log.error(
                     "stopping with an unwritable queue; datagrams abandoned",
-                    extra={"abandoned": len(held), "error": repr(failure)},
+                    extra={"abandoned": abandoned, "error": repr(failure)},
                 )
                 return
             self._log.error(
@@ -240,6 +241,15 @@ class Relay:
             )
             self._wait_counting_drops(backoff_s)
             backoff_s = min(backoff_s * BACKOFF_FACTOR, WRITER_BACKOFF_MAX_S)
+
+    def _drain_intake(self) -> int:
+        drained = 0
+        while True:
+            try:
+                self._intake.get_nowait()
+            except queue_module.Empty:
+                return drained
+            drained += 1
 
     def _wait_counting_drops(self, delay_s: float) -> None:
         """Sleep before a retry, still moving intake drops into the counter.
