@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -164,6 +166,41 @@ def test_with_room_for_both_the_first_tile_is_still_held(tmp_path: Path) -> None
     assert terrain.cached == ["N41E044", "N42E044"]
     assert terrain.elevation(41.5, 44.5) is not None
     assert terrain.cached == ["N42E044", "N41E044"], "most recently used last"
+
+
+def test_a_cached_lookup_does_not_wait_for_another_tiles_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should-fix 6. A worker is parsing N42E044 (held here on an event);
+    a lookup of the cached N41E044 must answer meanwhile, not queue behind
+    the read. The worker's tile still lands in the cache afterwards."""
+    install(tmp_path, TWO_CELLS, TWO_TILES)
+    terrain = Terrain(tmp_path, max_tiles=2)
+    assert terrain.elevation(41.5, 44.5) is not None
+
+    parsing = threading.Event()
+    release = threading.Event()
+    real_parse = TerrainTile.parse
+
+    def slow_parse(data: bytes) -> TerrainTile:
+        parsing.set()
+        assert release.wait(timeout=5.0), "the test never released the read"
+        return real_parse(data)
+
+    monkeypatch.setattr(TerrainTile, "parse", staticmethod(slow_parse))
+    worker = threading.Thread(target=terrain.load, args=(42.5, 44.5))
+    worker.start()
+    try:
+        assert parsing.wait(timeout=5.0)
+        started = time.perf_counter()
+        assert terrain.elevation(41.5, 44.5) is not None
+        assert terrain.is_loaded(41.5, 44.5)
+        assert time.perf_counter() - started < 1.0, "blocked behind the read"
+        assert not terrain.is_loaded(42.5, 44.5)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+    assert terrain.cached == ["N41E044", "N42E044"]
 
 
 def test_a_cache_with_no_room_is_refused(tmp_path: Path) -> None:

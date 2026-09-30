@@ -156,6 +156,9 @@ class AirspaceService:
     # them, counted and logged. The default matches the settings.
     close_timeout_s: float = 5.0
     audit_overflow: int = field(default=0, init=False)
+    # Terrain tiles that could not be read; each leaves one message's
+    # height limit unevaluated.
+    tile_failures: int = field(default=0, init=False)
     # Rows the writer tried and the database refused (logged each time).
     audit_failures: int = field(default=0, init=False)
     # Rows never attempted: still queued, or in flight, when the writer
@@ -205,9 +208,12 @@ class AirspaceService:
         try:
             message: dict[str, Any] = json.loads(payload)
             position = _position(message)
+            height_available = True
             if position is not None and self.tiles is not None:
-                await self._load_tile(message, *position)
-            change = self.monitor.observe(message, now_s=self.clock())
+                height_available = await self._load_tile(message, *position)
+            change = self.monitor.observe(
+                message, now_s=self.clock(), height_available=height_available
+            )
         except (ValueError, KeyError, TypeError) as error:
             _log.warning("unusable telemetry message", extra={"error": repr(error)})
             return
@@ -215,23 +221,29 @@ class AirspaceService:
 
     async def _load_tile(
         self, message: dict[str, Any], lat_deg: float, lon_deg: float
-    ) -> None:
+    ) -> bool:
+        """Whether the ground under the message is in memory. False means
+        the tile could not be read: the monitor then leaves the height
+        limit unevaluated for this message rather than reading the file
+        again, synchronously, on the loop."""
         assert self.tiles is not None
         if self.tiles.is_loaded(lat_deg, lon_deg):
-            return
+            return True
         try:
             await asyncio.to_thread(self.tiles.load, lat_deg, lon_deg)
         except Exception:
-            # The monitor's height check will meet the same error and log
-            # it (S-12); this says the read was attempted off the loop.
+            self.tile_failures += 1
             _log.exception(
-                "could not load the terrain tile",
+                "could not load the terrain tile; height not evaluated",
                 extra={
                     "drone_id": str(message.get("drone_id")),
                     "lat_deg": lat_deg,
                     "lon_deg": lon_deg,
+                    "tile_failures": self.tile_failures,
                 },
             )
+            return False
+        return True
 
     def status(self) -> dict[str, int]:
         """The running totals, as the status line logs them."""
@@ -242,6 +254,7 @@ class AirspaceService:
             "rejected_out_of_order": self.monitor.rejected_out_of_order,
             "without_capture_time": self.monitor.without_capture_time,
             "check_failures": self.monitor.check_failures,
+            "tile_failures": self.tile_failures,
             "audit_pending": self.audit_pending,
             "audit_overflow": self.audit_overflow,
             "audit_failures": self.audit_failures,

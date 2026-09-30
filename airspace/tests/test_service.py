@@ -16,7 +16,7 @@ import pytest
 from airspace.cpa import SeparationPolicy, local_offset_m
 from airspace.monitor import AirspaceMonitor, Alert, ClearReason
 from airspace.service import AirspaceService, run_ticker
-from common.terrain import TerrainFileError, cell_name
+from common.terrain import Elevation, TerrainFileError, cell_name
 
 A = UUID(int=1)
 B = UUID(int=2)
@@ -294,24 +294,51 @@ async def test_the_terrain_tile_is_read_once_off_the_loop_before_observing() -> 
     assert len(bus.sent) == 1
 
 
-async def test_a_tile_that_cannot_be_read_is_logged_and_the_message_still_counts(
+class LoopTerrain:
+    """A terrain on the monitor that notes every `elevation` call, which,
+    after a failed warm-up, would be a synchronous read on the loop."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def elevation(self, lat_deg: float, lon_deg: float) -> Elevation | None:
+        self.calls += 1
+        return Elevation(elevation_m=0.0, dataset="COP-DEM GLO-30", spacing_m=30.9)
+
+
+async def test_a_tile_that_cannot_be_read_skips_the_height_check_only(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Should-fix 6. The warm-up fails: the monitor must not fall back to
+    reading the tile on the loop, so its terrain is not consulted for the
+    message; the conflict is still raised, and the failure is counted."""
     tiles = RecordingTiles(fail=True)
+    terrain = LoopTerrain()
     bus = RecordingBus()
     svc, _ = service(bus)
     svc.tiles = tiles
+    svc.monitor.terrain = terrain
+    svc.monitor.max_height_agl_m = 120.0
 
     await svc.on_telemetry(payload(A, 0, 10))
     await svc.on_telemetry(payload(B, 500, -10))
 
     assert len(tiles.load_threads) == 2, "tried again: nothing was cached"
+    assert terrain.calls == 0
     failures: list[Any] = [
-        r for r in caplog.records if r.getMessage() == "could not load the terrain tile"
+        r for r in caplog.records if r.getMessage().startswith("could not load the")
     ]
     assert [r.drone_id for r in failures] == [str(A), str(B)]
     assert all(r.exc_info for r in failures)
-    assert len(bus.sent) == 1
+    assert [body["kind"] for _, body in bus.sent] == ["conflict"]
+    assert svc.status()["tile_failures"] == 2
+
+    # The presence pair: with the tile readable, the height check runs and
+    # the aircraft, 550 m above ground 0, is over the limit.
+    tiles.fail = False
+    await svc.on_telemetry(payload(A, 10, 10, at_s=1.0))
+    assert terrain.calls == 1
+    assert [body["kind"] for _, body in bus.sent] == ["conflict", "height"]
 
 
 async def test_the_tick_logs_the_running_totals_on_its_cadence(

@@ -208,21 +208,26 @@ class Terrain:
             self._tile(name)
 
     def _tile(self, name: str) -> TerrainTile:
-        # One lock around lookup and read: two threads asking for the same
-        # tile read it once, and the cache never exceeds `max_tiles`.
+        # The lock covers the cache, never the disk: a cached lookup on the
+        # event loop must not wait behind a worker reading another 26 MB
+        # tile. Two threads reading the same tile at once both parse it and
+        # the first to insert wins; that costs a duplicate read, not a wait.
         with self._lock:
             tile = self._tiles.get(name)
             if tile is not None:
                 self._tiles.move_to_end(name)
                 return tile
-            path = self.directory / f"{name}.pgm"
-            try:
-                tile = TerrainTile.parse(path.read_bytes())
-            except OSError as error:
-                raise TerrainFileError(
-                    f"index lists {name} but {path}: {error}"
-                ) from error
-            self._tiles[name] = tile
-            while len(self._tiles) > self.max_tiles:
-                self._tiles.popitem(last=False)
+        path = self.directory / f"{name}.pgm"
+        try:
+            read = TerrainTile.parse(path.read_bytes())
+        except OSError as error:
+            raise TerrainFileError(f"index lists {name} but {path}: {error}") from error
+        with self._lock:
+            tile = self._tiles.get(name)
+            if tile is None:
+                tile = self._tiles[name] = read
+                while len(self._tiles) > self.max_tiles:
+                    self._tiles.popitem(last=False)
+            else:
+                self._tiles.move_to_end(name)
             return tile
