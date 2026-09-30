@@ -40,10 +40,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import nats
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -97,6 +98,41 @@ CONNECT_TIMEOUT_S = 5.0
 # P6-08. The feed closes with this when the browser has no valid ticket, or
 # its ticket has run out. In the 4000-4999 range reserved for applications.
 CLOSE_SIGN_IN_REQUIRED = 4401
+# S-16. Sent before the handshake completes, which the server turns into an
+# HTTP 403: a page on a host that may not open the feed.
+CLOSE_POLICY_VIOLATION = 1008
+
+
+def normalise_origin(origin: str) -> str:
+    return origin.strip().rstrip("/").lower()
+
+
+def origin_allowed(
+    origin: str | None, host: str | None, allowed: frozenset[str]
+) -> bool:
+    """May a page from `origin` open the feed served as `host`? S-16.
+
+    A browser always sends `Origin` on a WebSocket handshake, and a page on
+    another site can open one to any address, carrying this site's cookies
+    unless SameSite stops them. So the origin is checked:
+
+    - no `Origin` at all: not a browser, and so not a page acting on a
+      signed-in operator's cookies. Allowed; the feed ticket still decides.
+    - an origin in `allowed` (`CONSOLE_ALLOWED_ORIGINS`): allowed.
+    - otherwise the page's host name must be the feed's own. The port is not
+      compared: behind the TLS front the page and the feed share one origin,
+      but in development the API serves its pages on one port and the feed
+      listens on another, and cookies - the ticket included - are shared
+      across ports on a host anyway.
+    """
+    if origin is None:
+        return True
+    normalised = normalise_origin(origin)
+    if normalised in allowed:
+        return True
+    page_host = urlsplit(normalised).hostname
+    feed_host = urlsplit(f"//{host}").hostname if host else None
+    return page_host is not None and page_host == feed_host
 
 
 @dataclass
@@ -182,6 +218,7 @@ def create_app(
     connect_timeout_s: float = CONNECT_TIMEOUT_S,
     basemap_dir: Path | None = None,
     clock_s: Callable[[], float] = wall_clock_s,
+    allowed_origins: Iterable[str] = (),
 ) -> FastAPI:
     """Build the app. The NATS URL is injected so tests can point elsewhere.
 
@@ -192,8 +229,12 @@ def create_app(
     `connect_timeout_s` is injected for the same reason: a test that only needs
     to prove the app serves without a bus should not pay the production
     timeout to do it.
+
+    `allowed_origins` are pages on other hosts that may open the feed, in
+    addition to pages on the feed's own host (`origin_allowed`).
     """
     hub = ConsoleHub()
+    allowed = frozenset(normalise_origin(origin) for origin in allowed_origins)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -252,8 +293,15 @@ def create_app(
 
     @app.websocket("/ws/telemetry")
     async def telemetry(websocket: WebSocket) -> None:
-        # Accepted before it is checked, so a refusal is a close code the
-        # page can read (4401) rather than a failed handshake it cannot.
+        origin = websocket.headers.get("origin")
+        if not origin_allowed(origin, websocket.headers.get("host"), allowed):
+            # Refused at the handshake (HTTP 403): a page from another site
+            # has no business reading a close code from this feed.
+            _log.warning("console feed refused an origin", extra={"origin": origin})
+            await websocket.close(code=CLOSE_POLICY_VIOLATION)
+            return
+        # Accepted before the ticket is checked, so a refusal is a close
+        # code the page can read (4401) rather than a failed handshake.
         await websocket.accept()
         ticket = verify_feed_ticket(
             feed_secret, websocket.cookies.get(FEED_COOKIE, ""), now_s=clock_s()

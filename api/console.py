@@ -26,6 +26,7 @@ def main() -> None:
             str(settings.nats_url),
             feed_secret=settings.feed_ticket_secret.get_secret_value().encode("utf-8"),
             basemap_dir=settings.basemap_dir,
+            allowed_origins=settings.allowed_origins,
         ),
         host=settings.console_host,
         port=settings.console_port,

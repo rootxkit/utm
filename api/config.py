@@ -155,3 +155,17 @@ class ConsoleSettings(FeedTicketSettings, NatsSettings):
     basemap_dir: Path = Field(
         default=Path("local/basemap"), validation_alias="BASEMAP_DIR"
     )
+    # S-16. Comma-separated page origins on other hosts that may open the
+    # feed, e.g. `https://ops.example.ge`. Pages on the feed's own host are
+    # always allowed (`api.telemetry_ws.origin_allowed`); empty adds none.
+    console_allowed_origins: str = Field(
+        default="", validation_alias="CONSOLE_ALLOWED_ORIGINS"
+    )
+
+    @property
+    def allowed_origins(self) -> tuple[str, ...]:
+        return tuple(
+            origin.strip()
+            for origin in self.console_allowed_origins.split(",")
+            if origin.strip()
+        )
