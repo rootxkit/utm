@@ -143,6 +143,8 @@ class Relay:
         self._pending_intake_drops = 0
         self._storage_ok = True
         self._writer_heartbeat_monotonic = time.monotonic()
+        self._held_count = 0
+
         self._counters_lock = threading.Lock()
 
     # --- intake -----------------------------------------------------------
@@ -194,6 +196,7 @@ class Relay:
             self._beat()
             if not held:
                 held = self._collect_batch()
+            self._set_held(len(held))
 
             # Only these two: anything else is a bug, and retrying a bug
             # forever as if it were a disk outage would hide it. It ends the
@@ -204,6 +207,7 @@ class Relay:
                 try:
                     self._queue.append(held)
                     held = []
+                    self._set_held(0)
                     wrote = True
                 except (sqlite3.Error, OSError) as error:
                     failure = error
@@ -279,6 +283,7 @@ class Relay:
                     thread.join(timeout=INTAKE_JOIN_TIMEOUT_S)
         abandoned = len(held) + self._drain_intake()
         self._queue.count_intake_drops(abandoned)
+        self._set_held(0)
         # Drops intake made while it was still running.
         self._transfer_pending_drops()
         return abandoned
@@ -308,6 +313,21 @@ class Relay:
             self._stop.wait(min(remaining_s, WRITER_DROP_FLUSH_INTERVAL_S))
             self._beat()
             self._transfer_pending_drops()
+
+    def _set_held(self, count: int) -> None:
+        with self._counters_lock:
+            self._held_count = count
+
+    @property
+    def held_datagrams(self) -> int:
+        """Datagrams the writer has taken from intake but not yet stored."""
+        with self._counters_lock:
+            return self._held_count
+
+    @property
+    def intake_backlog(self) -> int:
+        """Datagrams waiting in intake for the writer."""
+        return self._intake.qsize()
 
     def _beat(self) -> None:
         """Mark the writer as making progress. See `writer_stalled`."""

@@ -481,13 +481,25 @@ class DurableQueue:
             self._publish_stats()
         return count
 
-    def close(self) -> None:
+    def close(self, *, timeout_s: float | None = None) -> bool:
         """Close, writing any intake drops counted while the disk refused them.
 
         Best effort: if the disk still refuses, the count is lost with the
         process, which the Gateway sees as a restart (relay-v1 §11 loss #4).
+
+        With `timeout_s`, gives up if the lock cannot be had in that time -
+        a write hung in fsync holds it indefinitely - and returns False with
+        the connection left as it is; the caller decides what to report.
+        Returns True once closed.
         """
-        with self._lock:
+        acquired = (
+            self._lock.acquire()
+            if timeout_s is None
+            else self._lock.acquire(timeout=timeout_s)
+        )
+        if not acquired:
+            return False
+        try:
             if not self.poisoned:
                 try:
                     self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
@@ -496,6 +508,14 @@ class DurableQueue:
                     self._rollback_locked()
             # Closing discards whatever a poisoned connection still had open.
             self._connection.close()
+        finally:
+            self._lock.release()
+        return True
+
+    @property
+    def unpersisted_intake_drops(self) -> int:
+        """Intake drops counted in memory but not yet written to disk."""
+        return self._intake_drops_total() - self._dropped_intake_persisted
 
     def __enter__(self) -> DurableQueue:
         return self

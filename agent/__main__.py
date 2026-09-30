@@ -21,6 +21,9 @@ from agent.udp import PortInUseError
 from common.config import ConfigurationError
 from common.logging import bind, configure_logging, get_logger
 
+# How long shutdown waits for a write in progress before abandoning the queue.
+QUEUE_CLOSE_TIMEOUT_S = 5.0
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -98,7 +101,23 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         relay.stop()
         udp.close()
-        durable_queue.close()
+        # Bounded: a write hung in fsync holds the queue's lock for as long as
+        # the disk likes, and stop() has already given up waiting for it.
+        if not durable_queue.close(timeout_s=QUEUE_CLOSE_TIMEOUT_S):
+            bound.error(
+                "durable queue still busy at shutdown; abandoning it",
+                extra={
+                    # The hung write's batch: never committed, so the
+                    # Gateway sees the restart as loss #4 (relay-v1 §11).
+                    "held_datagrams": relay.held_datagrams,
+                    "intake_backlog": relay.intake_backlog,
+                    "unpersisted_intake_drops": (
+                        durable_queue.unpersisted_intake_drops
+                    ),
+                    "close_timeout_s": QUEUE_CLOSE_TIMEOUT_S,
+                },
+            )
+            exit_code = exit_code or 1
         bound.info("relay stopped")
 
     return exit_code

@@ -8,6 +8,8 @@ this package.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -750,3 +752,31 @@ def test_an_ack_writes_a_drop_count_that_changed(queue_path: Path) -> None:
     updates = [s for s in traced if s.startswith("UPDATE meta")]
     assert len(updates) == 1, traced
     assert _persisted_intake_drops(queue_path) == 3
+
+
+def test_close_gives_up_on_a_write_that_never_finishes(queue_path: Path) -> None:
+    """A hung fsync holds the lock; shutdown must not wait for it forever."""
+    queue = DurableQueue(queue_path)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hung_write() -> None:
+        with queue._lock:
+            held.set()
+            release.wait(10.0)
+
+    writer = threading.Thread(target=hung_write)
+    writer.start()
+    held.wait()
+    try:
+        started = time.monotonic()
+        closed = queue.close(timeout_s=0.2)
+        waited_s = time.monotonic() - started
+    finally:
+        release.set()
+        writer.join()
+
+    assert closed is False
+    assert waited_s < 2.0
+    # The pair: once the write finishes, closing works.
+    assert queue.close(timeout_s=0.2) is True

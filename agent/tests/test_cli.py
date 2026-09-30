@@ -292,3 +292,61 @@ def test_a_poisoned_queue_ends_the_process_with_a_failure_code(
         line.get("message") == "durable queue is poisoned; the relay must restart"
         for line in logs
     )
+
+
+def test_shutdown_does_not_wait_forever_for_a_hung_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ctrl-C during a write stuck in fsync must still end the process."""
+    queues: list[DurableQueue] = []
+
+    def capturing_queue(path: Path, **kwargs: Any) -> DurableQueue:
+        queue = DurableQueue(path, **kwargs)
+        queues.append(queue)
+        return queue
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def hung_write() -> None:
+        with queues[0]._lock:
+            held.set()
+            release.wait(30.0)
+
+    writer = threading.Thread(target=hung_write, daemon=True)
+
+    def interrupted_run(coro: object) -> None:
+        getattr(coro, "close", lambda: None)()
+        writer.start()
+        held.wait()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("agent.__main__.DurableQueue", capturing_queue)
+    monkeypatch.setattr("agent.__main__.asyncio.run", interrupted_run)
+    monkeypatch.setattr("agent.__main__.QUEUE_CLOSE_TIMEOUT_S", 0.2)
+
+    station = tmp_path / "station"
+    station.mkdir()
+    (station / "relay.toml").write_text(valid_config(), encoding="utf-8")
+    (station / "relay.token").write_text("a-real-token", encoding="utf-8")
+
+    try:
+        started = time.monotonic()
+        code = main(["--config", str(station / "relay.toml")])
+        elapsed_s = time.monotonic() - started
+    finally:
+        release.set()
+        writer.join()
+        queues[0].close()
+
+    logs = capture(capsys)
+    abandoned = [
+        line
+        for line in logs
+        if line.get("message") == "durable queue still busy at shutdown; abandoning it"
+    ]
+    assert code == 1
+    assert elapsed_s < 5.0
+    assert len(abandoned) == 1, logs
+    assert abandoned[0]["held_datagrams"] == 0
+    assert abandoned[0]["unpersisted_intake_drops"] == 0
