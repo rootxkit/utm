@@ -39,7 +39,11 @@ async def run(settings: AirspaceSettings) -> None:
     terrain = (
         None
         if settings.terrain_dir is None
-        else Terrain(settings.terrain_dir, max_tiles=settings.terrain_cache_tiles)
+        else Terrain(
+            settings.terrain_dir,
+            max_tiles=settings.terrain_cache_tiles,
+            retry_missing_s=settings.terrain_retry_missing_s,
+        )
     )
     if max_height_agl_m is not None and terrain is None:
         _log.warning(
@@ -64,6 +68,7 @@ async def run(settings: AirspaceSettings) -> None:
         audit_queue_size=settings.audit_queue_size,
         close_timeout_s=settings.audit_close_timeout_s,
         tiles=terrain,
+        tile_log_every_s=settings.terrain_retry_missing_s,
     )
     _log.info(
         "airspace monitor running",

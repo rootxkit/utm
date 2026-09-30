@@ -28,6 +28,14 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     terrain_cache_tiles: int = Field(
         default=8, ge=1, validation_alias="TERRAIN_CACHE_TILES"
     )
+    # A listed tile that cannot be read is remembered as missing for this
+    # long before the disk is tried again, and its failure is logged once
+    # per this interval per cell with a count. A minute notices an operator
+    # copying the file in soon enough, and costs one failed open a minute
+    # instead of one, with a traceback, per telemetry message.
+    terrain_retry_missing_s: float = Field(
+        default=60.0, gt=0, validation_alias="TERRAIN_RETRY_MISSING_S"
+    )
     # S-11. A telemetry message that reaches the monitor more than this
     # after the Gateway received it (`rx_ts`) is late: the bus or this
     # service is behind. It is counted and logged, never evaluated as "now".

@@ -33,7 +33,9 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -140,10 +142,18 @@ class Terrain:
 
     directory: Path
     max_tiles: int = 8
+    # A tile the index lists but that could not be read is remembered as
+    # missing for this long before the disk is tried again: an operator
+    # copying the file in is noticed within a minute, and a missing tile
+    # costs one failed open a minute rather than one per telemetry message.
+    retry_missing_s: float = 60.0
+    clock: Callable[[], float] = time.monotonic
     index: dict[str, str] = field(init=False)
     _tiles: OrderedDict[str, TerrainTile] = field(
         default_factory=OrderedDict, init=False
     )
+    # Cell name -> (when it failed, the error's message).
+    _missing: dict[str, tuple[float, str]] = field(default_factory=dict, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def __post_init__(self) -> None:
@@ -217,11 +227,24 @@ class Terrain:
             if tile is not None:
                 self._tiles.move_to_end(name)
                 return tile
+            missing = self._missing.get(name)
+            if missing is not None:
+                failed_at, message = missing
+                if self.clock() - failed_at < self.retry_missing_s:
+                    raise TerrainFileError(message)
+                del self._missing[name]
         path = self.directory / f"{name}.pgm"
         try:
             read = TerrainTile.parse(path.read_bytes())
-        except OSError as error:
-            raise TerrainFileError(f"index lists {name} but {path}: {error}") from error
+        except (OSError, TerrainFileError) as error:
+            message = (
+                f"index lists {name} but {path}: {error}"
+                if isinstance(error, OSError)
+                else f"{path}: {error}"
+            )
+            with self._lock:
+                self._missing[name] = (self.clock(), message)
+            raise TerrainFileError(message) from error
         with self._lock:
             tile = self._tiles.get(name)
             if tile is None:

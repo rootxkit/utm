@@ -203,6 +203,41 @@ def test_a_cached_lookup_does_not_wait_for_another_tiles_read(
     assert terrain.cached == ["N41E044", "N42E044"]
 
 
+def test_a_missing_tile_is_remembered_and_the_disk_left_alone_for_a_while(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found in SITL: a listed tile that is not there was opened again on
+    every telemetry message. It is opened once per `retry_missing_s`; once
+    it appears, the next retry loads it."""
+    install(tmp_path, {"N41E044": "COP-DEM GLO-30"}, {})
+    clock = [0.0]
+    terrain = Terrain(tmp_path, retry_missing_s=60.0, clock=lambda: clock[0])
+    opens = [0]
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(path: Path) -> bytes:
+        opens[0] += 1
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+
+    for _ in range(50):
+        with pytest.raises(TerrainFileError, match="index lists N41E044"):
+            terrain.elevation(41.5, 44.5)
+    assert opens[0] == 1, "one failed open, then the answer is remembered"
+    assert not terrain.is_loaded(41.5, 44.5)
+
+    clock[0] = 59.0
+    with pytest.raises(TerrainFileError):
+        terrain.load(41.5, 44.5)
+    assert opens[0] == 1
+
+    (tmp_path / "N41E044.pgm").write_bytes(tile_bytes())
+    clock[0] = 60.0
+    assert terrain.elevation(41.5, 44.5) is not None
+    assert opens[0] == 2 and terrain.cached == ["N41E044"]
+
+
 def test_a_cache_with_no_room_is_refused(tmp_path: Path) -> None:
     install(tmp_path, {}, {})
     with pytest.raises(ValueError, match="max_tiles"):

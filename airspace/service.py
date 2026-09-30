@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from airspace.monitor import AirspaceMonitor, Alert, Change, ClearReason
 from common import get_logger
+from common.terrain import cell_name
 
 _log = get_logger(__name__)
 
@@ -148,6 +149,12 @@ class AirspaceService:
     # about 26 MB, and the old synchronous read stalled every message behind
     # it. Once cached, `observe` answers from memory.
     tiles: TerrainTiles | None = None
+    # How often a cell whose tile cannot be read is logged; the count in
+    # between goes on the next line. The default matches the settings.
+    tile_log_every_s: float = 60.0
+    _tile_failure_logged: dict[str, tuple[float | None, int]] = field(
+        default_factory=dict, init=False
+    )
     # How often the tick logs the running totals (rejected telemetry, check
     # failures, audit queue), so a backlog or a broken tile shows up in a
     # log that is otherwise quiet. This is a log cadence, not policy.
@@ -233,17 +240,35 @@ class AirspaceService:
             await asyncio.to_thread(self.tiles.load, lat_deg, lon_deg)
         except Exception:
             self.tile_failures += 1
-            _log.exception(
-                "could not load the terrain tile; height not evaluated",
-                extra={
-                    "drone_id": str(message.get("drone_id")),
-                    "lat_deg": lat_deg,
-                    "lon_deg": lon_deg,
-                    "tile_failures": self.tile_failures,
-                },
-            )
+            self._log_tile_failure(message, lat_deg, lon_deg)
             return False
         return True
+
+    def _log_tile_failure(
+        self, message: dict[str, Any], lat_deg: float, lon_deg: float
+    ) -> None:
+        """One line, with its traceback, per cell per `tile_log_every_s`,
+        carrying the count suppressed since the last one. Found in SITL: a
+        missing tile logged a full traceback on every message, twelve a
+        second, which is how an operator stops reading the log."""
+        cell = cell_name(lat_deg, lon_deg)
+        now_s = self.clock()
+        logged_at_s, suppressed = self._tile_failure_logged.get(cell, (None, 0))
+        if logged_at_s is not None and now_s - logged_at_s < self.tile_log_every_s:
+            self._tile_failure_logged[cell] = (logged_at_s, suppressed + 1)
+            return
+        self._tile_failure_logged[cell] = (now_s, 0)
+        _log.exception(
+            "could not load the terrain tile; height not evaluated",
+            extra={
+                "cell": cell,
+                "drone_id": str(message.get("drone_id")),
+                "lat_deg": lat_deg,
+                "lon_deg": lon_deg,
+                "suppressed": suppressed,
+                "tile_failures": self.tile_failures,
+            },
+        )
 
     def status(self) -> dict[str, int]:
         """The running totals, as the status line logs them."""

@@ -339,7 +339,10 @@ async def test_a_tile_that_cannot_be_read_skips_the_height_check_only(
     failures: list[Any] = [
         r for r in caplog.records if r.getMessage().startswith("could not load the")
     ]
-    assert [r.drone_id for r in failures] == [str(A), str(B)]
+    # Both aircraft are over the same cell: one line, the second counted.
+    assert [(r.drone_id, r.cell, r.suppressed) for r in failures] == [
+        (str(A), cell_name(LAT0, LON0), 0)
+    ]
     assert all(r.exc_info for r in failures)
     assert [body["kind"] for _, body in bus.sent] == ["conflict"]
     assert svc.status()["tile_failures"] == 2
@@ -350,6 +353,33 @@ async def test_a_tile_that_cannot_be_read_skips_the_height_check_only(
     await svc.on_telemetry(payload(A, 10, 10, at_s=1.0))
     assert terrain.calls == 1
     assert [body["kind"] for _, body in bus.sent] == ["conflict", "height"]
+
+
+async def test_a_missing_tile_is_logged_once_per_interval_with_a_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Found in SITL: a missing tile logged a traceback on every message,
+    twelve a second. One line per cell per `tile_log_every_s`, and the next
+    line says how many were suppressed in between."""
+    tiles = RecordingTiles(fail=True)
+    bus = RecordingBus()
+    svc, clock = service(bus)
+    svc.tiles = tiles
+    svc.tile_log_every_s = 60.0
+
+    for n in range(25):
+        clock.now_s = float(n)
+        await svc.on_telemetry(payload(A, 10 * n, 10, at_s=float(n)))
+    clock.now_s = 61.0
+    await svc.on_telemetry(payload(A, 250, 10, at_s=61.0))
+
+    failures: list[Any] = [
+        r for r in caplog.records if r.getMessage().startswith("could not load the")
+    ]
+    assert [r.suppressed for r in failures] == [0, 24]
+    assert all(r.exc_info for r in failures)
+    assert svc.tile_failures == 26
+    assert len(tiles.load_threads) == 26, "every message still tries the cache"
 
 
 async def test_the_tick_logs_the_running_totals_on_its_cadence(
