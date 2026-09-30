@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -44,9 +44,20 @@ STATION = "registry-test-station"
 class FakeLive:
     def __init__(self) -> None:
         self.states: dict[UUID, dict[str, Any]] = {}
+        self.reads: list[str] = []
+        self.fail = False
 
     async def get(self, drone_id: UUID) -> dict[str, Any] | None:
+        self.reads.append("get")
         return self.states.get(drone_id)
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        self.reads.append("get_many")
+        if self.fail:
+            raise ConnectionError("redis unreachable")
+        return {drone_id: self.states.get(drone_id) for drone_id in drone_ids}
 
 
 @pytest.fixture
@@ -482,6 +493,37 @@ async def test_status_follows_telemetry(client: AsyncClient, live: FakeLive) -> 
 
     del live.states[drone_id]
     assert (await client.get(f"/drones/{drone_id}")).json()["status"] == "OFFLINE"
+
+
+async def test_the_drone_list_reads_live_state_in_one_batch(
+    client: AsyncClient, live: FakeLive
+) -> None:
+    """S-16. One read for the fleet, not one per drone, with each drone's
+    status still its own."""
+    flying, idle, silent = [await a_drone(client) for _ in range(3)]
+    live.states[UUID(flying["id"])] = {"armed": True}
+    live.states[UUID(idle["id"])] = {"armed": False}
+    live.reads.clear()
+
+    listed = {d["id"]: d["status"] for d in (await client.get("/drones")).json()}
+
+    assert live.reads == ["get_many"]
+    assert listed[flying["id"]] == "IN_FLIGHT"
+    assert listed[idle["id"]] == "IDLE"
+    assert listed[silent["id"]] == "OFFLINE"
+
+
+async def test_the_drone_list_survives_live_state_being_unreachable(
+    client: AsyncClient, live: FakeLive
+) -> None:
+    drone = await a_drone(client)
+    live.states[UUID(drone["id"])] = {"armed": True}
+    live.fail = True
+
+    response = await client.get("/drones")
+
+    assert response.status_code == 200
+    assert {d["id"]: d["status"] for d in response.json()}[drone["id"]] == "OFFLINE"
 
 
 async def test_maintenance_is_set_by_a_person_and_wins(

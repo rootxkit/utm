@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -484,6 +484,11 @@ async def http(
 class _NoLive:
     async def get(self, drone_id: UUID) -> dict[str, Any] | None:
         return None
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        return dict.fromkeys(drone_ids)
 
 
 async def test_a_change_through_the_api_names_the_operator_who_made_it(

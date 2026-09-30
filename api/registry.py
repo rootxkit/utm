@@ -36,7 +36,7 @@ retirement. See `derive_status`.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -157,6 +157,12 @@ class LiveStateReader(Protocol):
     """Reads a drone's live state: None when its link is lost (P1-05)."""
 
     async def get(self, drone_id: UUID) -> dict[str, Any] | None: ...
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        """Several at once, in one round trip (`api.live.RedisLiveState`)."""
+        ...
 
 
 def derive_status(
@@ -494,7 +500,18 @@ class FleetRegistry:
                 sa.text(f"SELECT {_DRONE_COLUMNS} FROM drones {where} ORDER BY label")
             )
             drones = [_row(row) for row in rows]
-        return [await self._with_status(drone) for drone in drones]
+        try:
+            live = await self.live.get_many([drone["id"] for drone in drones])
+        except Exception as error:
+            # As in `_with_status`: unknown is reported as OFFLINE.
+            _log.warning(
+                "could not read live state",
+                extra={"drone_count": len(drones), "error": repr(error)},
+            )
+            live = {}
+        for drone in drones:
+            _set_status(drone, live.get(drone["id"]))
+        return drones
 
     async def set_maintenance(
         self, drone_id: UUID, in_maintenance: bool, *, actor: Actor = SYSTEM
@@ -623,12 +640,18 @@ class FleetRegistry:
                 extra={"drone_id": str(drone["id"]), "error": repr(error)},
             )
             live = None
-        drone["status"] = derive_status(
-            in_maintenance=bool(drone["in_maintenance"]),
-            retired=drone["retired_at"] is not None,
-            live=live,
-        )
-        return drone
+        return _set_status(drone, live)
+
+
+def _set_status(
+    drone: dict[str, Any], live: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    drone["status"] = derive_status(
+        in_maintenance=bool(drone["in_maintenance"]),
+        retired=drone["retired_at"] is not None,
+        live=live,
+    )
+    return drone
 
 
 def _opt(value: UUID | None) -> str | None:

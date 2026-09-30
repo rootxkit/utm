@@ -12,7 +12,7 @@ across the session.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -51,6 +51,11 @@ def ns(when: datetime) -> int:
 class NoLive:
     async def get(self, drone_id: UUID) -> dict[str, Any] | None:
         return None
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        return dict.fromkeys(drone_ids)
 
 
 def store_for(
