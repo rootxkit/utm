@@ -17,7 +17,9 @@ bug: the archive grows until the disk decides the policy instead.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -617,3 +619,43 @@ async def test_re_running_a_sweep_is_still_safe(
     assert first.deleted_by_age == 1
     assert second.deleted_total == 0
     assert second.already_missing == 0
+
+
+# --- the schedule, against the real thing (S-07) ---------------------------
+
+
+async def test_the_scheduled_pass_deletes_a_segment_past_retention(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    archive: RawArchive,
+    station: str,
+) -> None:
+    """Retention had no production caller. This drives the same schedule
+    `python -m gateway` starts, scoped to this test's station, and watches
+    it delete: a pass that ran and removed nothing would look identical to
+    one that never ran."""
+    from gateway.retention import RetentionSchedule
+
+    old = datetime.now(tz=UTC) - timedelta(days=RETENTION_DAYS + 1)
+    await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    assert await live_segments(engine, station) == 1
+
+    schedule = RetentionSchedule(
+        retention=retention, store=store, interval_s=0.05, only_station=station
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(schedule.run_until(stop))
+    try:
+        started = time.monotonic()
+        while await live_segments(engine, station) and time.monotonic() - started < 5:
+            await asyncio.sleep(0.02)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert schedule.passes >= 1
+    assert schedule.failures == 0
+    assert await live_segments(engine, station) == 0
+    assert not list(archive.root.rglob("*.zst"))
+    assert "retention.deleted.age" in await events_of(engine, station)

@@ -44,16 +44,18 @@ deletion would let a forgotten date destroy evidence.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import contextlib
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from common import get_logger
-from gateway.archive import RawArchive
+from gateway.archive import ArchiveError, RawArchive
 from gateway.ingest_store import StoreError
 
 _log = get_logger(__name__)
@@ -546,3 +548,98 @@ class ArchiveRetention:
                 )
         except SQLAlchemyError as error:
             raise StoreError(f"could not record {event_type}: {error}") from error
+
+
+# --- running it ------------------------------------------------------------
+#
+# Everything above had no production caller (S-07). `sweep` and
+# `purge_closed_epochs` were designed, tested against a real database, and
+# never scheduled, so the archive was bounded by policy on paper and by the
+# disk in practice - exactly the failure the module docstring opens with.
+
+
+class Sweeper(Protocol):
+    """What the schedule needs from `ArchiveRetention`."""
+
+    async def sweep(
+        self, *, now: datetime | None = None, only_station: str | None = None
+    ) -> SweepResult: ...
+
+    async def holds_expiring_within(
+        self, days: int = HOLD_WARNING_DAYS, *, now: datetime | None = None
+    ) -> list[Hold]: ...
+
+
+class EpochPurger(Protocol):
+    """What the schedule needs from the ingest store."""
+
+    async def purge_closed_epochs(self) -> int: ...
+
+
+@dataclass
+class RetentionSchedule:
+    """Runs the retention pass on a timer, and keeps running when one fails.
+
+    A pass that fails - the database away for a minute - is logged and
+    retried at the next interval. Nothing here is on the ingest path, and a
+    sweep that stopped for good after one bad pass would return the archive
+    to being bounded by the disk, silently.
+    """
+
+    retention: Sweeper
+    store: EpochPurger
+    interval_s: float
+    # Production sweeps every station. A caller working on one station's
+    # data - a test - must not be able to reach the rest; see `sweep`.
+    only_station: str | None = None
+    passes: int = field(default=0, init=False)
+    failures: int = field(default=0, init=False)
+
+    async def run_until(self, stop: asyncio.Event) -> None:
+        """One pass now, then one per interval, until `stop` is set."""
+        while not stop.is_set():
+            await self.run_once()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), self.interval_s)
+
+    async def run_once(self) -> None:
+        try:
+            result = await self.retention.sweep(only_station=self.only_station)
+            purged = await self.store.purge_closed_epochs()
+            expiring = await self.retention.holds_expiring_within()
+        except (StoreError, ArchiveError) as error:
+            self.failures += 1
+            _log.error(
+                "retention pass failed; retrying at the next interval",
+                extra={"error": str(error), "interval_s": self.interval_s},
+            )
+            return
+        finally:
+            self.passes += 1
+
+        _log.info(
+            "retention pass complete",
+            extra={
+                "deleted_by_age": result.deleted_by_age,
+                "deleted_by_ceiling": result.deleted_by_ceiling,
+                "bytes_reclaimed": result.bytes_reclaimed,
+                "records_destroyed": result.records_destroyed,
+                "skipped_held": result.skipped_held,
+                "already_missing": result.already_missing,
+                "epochs_purged": purged,
+                "station_id": self.only_station,
+            },
+        )
+        for hold in expiring:
+            # The warning that has to arrive before the date, not after it.
+            _log.warning(
+                "retention hold expires soon",
+                extra={
+                    "station_id": hold.station_id,
+                    "epoch": hold.epoch,
+                    "hold_until": hold.hold_until.isoformat(),
+                    "days_remaining": hold.days_remaining(),
+                    "set_by": hold.set_by,
+                    "reason": hold.reason,
+                },
+            )

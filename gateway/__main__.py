@@ -44,6 +44,7 @@ from gateway.live_state import LiveState
 from gateway.pipeline import StationPipelines
 from gateway.publisher import TelemetryPublisher
 from gateway.relay_server import RelayServer
+from gateway.retention import BYTES_PER_GIB, ArchiveRetention, RetentionSchedule
 from gateway.state_buffer import BufferedStateWriter
 from gateway.state_writer import DroneStateWriter
 
@@ -175,6 +176,35 @@ async def run(args: argparse.Namespace) -> int:
 
     stopping = asyncio.Event()
 
+    # S-07. Retention had no caller: the archive was bounded by policy on
+    # paper and by the disk in practice.
+    sweeper: asyncio.Task[None] | None = None
+    if settings.retention_sweep_enabled:
+        schedule = RetentionSchedule(
+            retention=ArchiveRetention(
+                engine=engine,
+                archive=archive,
+                retention_days=settings.telemetry_retention_days,
+                max_bytes_per_station=settings.archive_max_gib_per_station
+                * BYTES_PER_GIB,
+            ),
+            store=store,
+            interval_s=settings.retention_sweep_interval_s,
+        )
+        sweeper = asyncio.create_task(schedule.run_until(stopping))
+        _log.info(
+            "retention sweep scheduled",
+            extra={
+                "interval_s": settings.retention_sweep_interval_s,
+                "retention_days": settings.telemetry_retention_days,
+                "max_gib_per_station": settings.archive_max_gib_per_station,
+            },
+        )
+    else:
+        _log.warning(
+            "retention sweep disabled; the archive is bounded only by the disk"
+        )
+
     def stop() -> None:
         stopping.set()
 
@@ -190,6 +220,9 @@ async def run(args: argparse.Namespace) -> int:
         await stopping.wait()
     finally:
         _log.info("gateway stopping")
+        stopping.set()
+        if sweeper is not None:
+            await sweeper
         await server.stop()
         # After the server, so no batch can arrive once the last flush ran.
         await state_writer.close()
