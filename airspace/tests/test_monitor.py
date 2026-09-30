@@ -203,6 +203,23 @@ def test_the_alert_serialises_for_the_bus() -> None:
     assert sorted(encoded["drone_ids"]) == sorted([str(A), str(B)])
 
 
+# --- S-12: a number that is not a number -----------------------------------
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize("name", ["lat_deg", "lon_deg", "alt_amsl_m", "vx_ms"])
+def test_a_non_finite_number_is_refused_before_it_reaches_the_grid(
+    name: str, value: float
+) -> None:
+    monitor = AirspaceMonitor(policy=POLICY)
+    monitor.observe(message(B, 100), now_s=0.0)
+    bad = message(A, 0)
+    bad[name] = value
+    with pytest.raises(ValueError, match=name):
+        monitor.observe(bad, now_s=0.0)
+    assert len(monitor.index) == 1
+
+
 # --- S-11: time is the capture time -----------------------------------------
 
 

@@ -67,6 +67,8 @@ and P5-09, not built here.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -144,19 +146,24 @@ def track_from_telemetry(message: dict[str, Any]) -> Track | None:
     """A Track, or None if the message cannot place the aircraft in 3-D.
 
     Raises ValueError for a message that has the fields but cannot be used:
-    no capture time.
+    no capture time, or a number that is not finite (an `inf` latitude would
+    reach `math.floor` in the neighbour grid and overflow there, S-12).
     """
     needed = ("lat_deg", "lon_deg", "alt_amsl_m", "vx_ms", "vy_ms", "vz_ms")
     if any(message.get(name) is None for name in needed):
         return None
+    values = {name: float(message[name]) for name in needed}
+    for name, value in values.items():
+        if not math.isfinite(value):
+            raise ValueError(f"{name} is not finite: {value}")
     return Track(
         drone_id=UUID(str(message["drone_id"])),
-        lat_deg=float(message["lat_deg"]),
-        lon_deg=float(message["lon_deg"]),
-        alt_amsl_m=float(message["alt_amsl_m"]),
-        vn_ms=float(message["vx_ms"]),
-        ve_ms=float(message["vy_ms"]),
-        vd_ms=float(message["vz_ms"]),
+        lat_deg=values["lat_deg"],
+        lon_deg=values["lon_deg"],
+        alt_amsl_m=values["alt_amsl_m"],
+        vn_ms=values["vx_ms"],
+        ve_ms=values["vy_ms"],
+        vd_ms=values["vz_ms"],
         captured_at_s=captured_at_s(message),
     )
 
@@ -202,6 +209,9 @@ class AirspaceMonitor:
     # ground-station clock, shows in the log rather than in the silence.
     rejected: int = field(default=0, init=False)
     _rejected_logged: set[UUID] = field(default_factory=set, init=False)
+    # Checks that raised instead of answering (S-12). Each is logged with its
+    # traceback; the count is here so a test, or a health report, can see it.
+    check_failures: int = field(default=0, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     _active: dict[str, Alert] = field(default_factory=dict, init=False)
@@ -236,17 +246,57 @@ class AirspaceMonitor:
             at_s = track.captured_at_s
             self.index.upsert(track)
             self._last_seen_s[drone_id] = at_s
-            raised.extend(self._check_conflicts(track, at_s))
-            raised.extend(self._check_zones(track, at_s))
-            raised.extend(self._check_height(track, at_s))
+            # Each check on its own: a missing terrain tile must not silence
+            # the conflict and zone alerts already found (S-12).
+            not_evaluated: set[AlertKind] = set()
+            for kind, check in (
+                (AlertKind.CONFLICT, self._check_conflicts),
+                (AlertKind.ZONE, self._check_zones),
+                (AlertKind.HEIGHT, self._check_height),
+            ):
+                found = self._guarded(kind, check, track, at_s)
+                if found is None:
+                    not_evaluated.add(kind)
+                else:
+                    raised.extend(found)
             # Every active alert this aircraft is part of was just evaluated.
-            # The ones not refreshed are false as of this message.
+            # The ones not refreshed are false as of this message. A check
+            # that failed evaluated nothing: its alerts are neither refreshed
+            # nor shown false, so an error cannot clear one.
             for key, alert in self._active.items():
-                if drone_id in alert.drone_ids and self._last_true_s[key] != at_s:
+                if (
+                    drone_id in alert.drone_ids
+                    and alert.kind not in not_evaluated
+                    and self._last_true_s[key] != at_s
+                ):
                     self._last_false_s[key] = at_s
 
         cleared = self._expire(now_s)
         return Change(raised=raised, cleared=cleared)
+
+    def _guarded(
+        self,
+        kind: AlertKind,
+        check: Callable[[Track, float], list[Alert]],
+        track: Track,
+        at_s: float,
+    ) -> list[Alert] | None:
+        """The check's alerts, or None when it raised instead of answering."""
+        try:
+            return check(track, at_s)
+        except Exception:
+            self.check_failures += 1
+            _log.exception(
+                "airspace check failed; this message is not evaluated for it",
+                extra={
+                    "check": kind.value,
+                    "drone_id": str(track.drone_id),
+                    "lat_deg": track.lat_deg,
+                    "lon_deg": track.lon_deg,
+                    "check_failures": self.check_failures,
+                },
+            )
+            return None
 
     def _rejects(self, track: Track, now_s: float) -> bool:
         """Whether the sample must not be evaluated: not live, or older than

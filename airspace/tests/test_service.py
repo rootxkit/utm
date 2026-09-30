@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+import pytest
+
 from airspace.cpa import SeparationPolicy, local_offset_m
 from airspace.monitor import AirspaceMonitor, Alert
 from airspace.service import AirspaceService
@@ -144,6 +146,26 @@ async def test_a_garbled_message_is_skipped_and_the_next_one_counts() -> None:
     await svc.on_telemetry(payload(A, 0, 10))
     await svc.on_telemetry(payload(B, 500, -10))
 
+    assert len(bus.sent) == 1
+
+
+async def test_a_non_finite_position_is_logged_and_the_next_message_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S-12: `inf` used to reach math.floor in the grid as OverflowError,
+    which nothing caught."""
+    bus = RecordingBus()
+    svc, _ = service(bus)
+    broken = json.loads(payload(A, 0, 10))
+    broken["lat_deg"] = float("inf")
+
+    await svc.on_telemetry(json.dumps(broken).encode())
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+
+    assert [r.getMessage() for r in caplog.records if r.levelname == "WARNING"] == [
+        "unusable telemetry message"
+    ]
     assert len(bus.sent) == 1
 
 

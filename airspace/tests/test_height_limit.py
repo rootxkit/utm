@@ -12,8 +12,8 @@ from uuid import UUID
 import pytest
 
 from airspace.monitor import AirspaceMonitor, AlertKind, Severity, height_key
-from airspace.tests.test_monitor import LAT0, POLICY, message
-from common.terrain import Elevation
+from airspace.tests.test_monitor import LAT0, POLICY, B, message, zone
+from common.terrain import Elevation, TerrainFileError
 
 A = UUID(int=1)
 LIMIT_M = 120.0
@@ -131,6 +131,85 @@ def test_an_aircraft_on_the_ground_is_not_evaluated() -> None:
     assert (
         m.observe(message(A, 0, alt_amsl_m=650.0, armed=False), now_s=0.0).raised == []
     )
+
+
+class Broken:
+    """A terrain whose tile cannot be read, as `Terrain` reports it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def elevation(self, lat_deg: float, lon_deg: float) -> Elevation | None:
+        self.calls += 1
+        raise TerrainFileError("index lists N41E044 but N41E044.pgm: missing")
+
+
+def test_a_failing_height_check_does_not_silence_the_other_alerts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S-12. Head-on inside a no-fly zone, over a tile that cannot be read:
+    the conflict and the zone alert are still raised, and the failure is
+    logged with the aircraft and its position."""
+    broken = Broken()
+    m = AirspaceMonitor(
+        policy=POLICY, zones=[zone("no_fly")], terrain=broken, max_height_agl_m=LIMIT_M
+    )
+    m.observe(message(A, 0, vn=10), now_s=0.0)
+    raised = m.observe(message(B, 500, vn=-10), now_s=0.0).raised
+
+    assert sorted(alert.kind for alert in raised) == [
+        AlertKind.CONFLICT,
+        AlertKind.ZONE,
+    ]
+    assert broken.calls == 2
+    assert m.check_failures == 2
+    failures: list[Any] = [
+        r for r in caplog.records if r.getMessage().startswith("airspace check")
+    ]
+    assert [(r.check, r.drone_id) for r in failures] == [
+        ("height", str(A)),
+        ("height", str(B)),
+    ]
+    assert all(r.exc_info for r in failures)
+
+
+def test_with_a_readable_tile_all_three_alerts_are_raised() -> None:
+    """The presence pair of the test above."""
+    m = AirspaceMonitor(
+        policy=POLICY, zones=[zone("no_fly")], terrain=Slope(), max_height_agl_m=LIMIT_M
+    )
+    m.observe(message(A, 0, vn=10, alt_amsl_m=650.0), now_s=0.0)
+    raised = m.observe(message(B, 500, vn=-10, alt_amsl_m=650.0), now_s=0.0).raised
+    assert sorted(alert.kind for alert in raised) == [
+        AlertKind.CONFLICT,
+        AlertKind.HEIGHT,
+        AlertKind.ZONE,
+    ]
+    assert m.check_failures == 0
+
+
+def test_a_failing_check_does_not_clear_the_alert_it_could_not_evaluate() -> None:
+    """Raised over readable ground, then the tile becomes unreadable: the
+    height alert must stay, since nothing showed the aircraft below the
+    limit. With the ground readable again, it is refreshed while the aircraft
+    is still high and clears once it has been shown low for the hysteresis."""
+    m = monitor()
+    m.observe(message(A, 0, alt_amsl_m=650.0), now_s=0.0)
+    m.terrain = Broken()
+    for at_s in (1.0, 3.0, 5.0):
+        change = m.observe(message(A, 0, alt_amsl_m=650.0, at_s=at_s), now_s=at_s)
+        assert change.cleared == []
+    assert [alert.kind for alert in m.active] == [AlertKind.HEIGHT]
+
+    m.terrain = Slope()
+    assert m.observe(message(A, 0, alt_amsl_m=650.0, at_s=6.0), now_s=6.0).cleared == []
+    for at_s in (7.0, 9.0):
+        assert (
+            m.observe(message(A, 0, alt_amsl_m=600.0, at_s=at_s), now_s=at_s).cleared
+            == []
+        )
+    cleared = m.observe(message(A, 0, alt_amsl_m=600.0, at_s=9.5), now_s=9.5).cleared
+    assert [alert.key for alert in cleared] == [height_key(A)]
 
 
 def test_a_remote_id_aircraft_declared_airborne_is_evaluated() -> None:
