@@ -9,7 +9,9 @@ each alert raised or cleared:
   numbers a console shows are current;
 - appends an `events` row in the relational database, so an incident can be
   reconstructed from the audit log (P2-06) and not only from whoever was
-  watching.
+  watching. The rows go through a bounded queue and a background writer
+  (S-13), so the database is off the telemetry path; an overflow is counted
+  and logged, never silent.
 
 A publish or audit failure is logged and never stops the monitor: the next
 message must still be evaluated.
@@ -18,10 +20,11 @@ message must still be evaluated.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import sqlalchemy as sa
@@ -92,6 +95,9 @@ class EventsAuditLog:
                 )
 
 
+AuditEntry = tuple[Alert, str, ClearReason | None]
+
+
 @dataclass
 class AirspaceService:
     monitor: AirspaceMonitor
@@ -100,6 +106,37 @@ class AirspaceService:
     # Wall clock, on the same epoch as telemetry's `ts` (S-11): the monitor
     # compares the two to tell live telemetry from a replayed backlog.
     clock: Callable[[], float] = time.time
+    # S-13. Audit rows are written by a background task from a bounded
+    # queue, so a slow database does not hold up the telemetry path; the
+    # publish stays inline, since the console is the one that must be
+    # current. A full queue drops the row, counted and logged, never
+    # silently. The default matches `airspace.config.AirspaceSettings`.
+    audit_queue_size: int = 1000
+    audit_overflow: int = field(default=0, init=False)
+    _audit_queue: asyncio.Queue[AuditEntry] = field(init=False)
+    _audit_writer: asyncio.Task[None] | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.audit_queue_size < 1:
+            raise ValueError("audit_queue_size must be at least 1")
+        self._audit_queue = asyncio.Queue(maxsize=self.audit_queue_size)
+
+    @property
+    def audit_pending(self) -> int:
+        return self._audit_queue.qsize()
+
+    async def flush_audit(self) -> None:
+        """Wait until every queued audit row has been attempted."""
+        await self._audit_queue.join()
+
+    async def close(self) -> None:
+        """Write what is queued, then stop the writer."""
+        await self.flush_audit()
+        if self._audit_writer is not None:
+            self._audit_writer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._audit_writer
+            self._audit_writer = None
 
     async def on_telemetry(self, payload: bytes) -> None:
         try:
@@ -149,7 +186,39 @@ class AirspaceService:
             ),
         )
         if self.audit is not None:
-            await _guard("audit", self.audit.record(alert, state, reason=reason))
+            self._enqueue_audit((alert, state, reason))
+
+    def _enqueue_audit(self, entry: AuditEntry) -> None:
+        # Started on first use rather than in a `start()` a caller could
+        # forget: a forgotten start would queue rows for ever and write none.
+        if self._audit_writer is None or self._audit_writer.done():
+            self._audit_writer = asyncio.create_task(
+                self._write_audit(), name="airspace-audit-writer"
+            )
+        try:
+            self._audit_queue.put_nowait(entry)
+        except asyncio.QueueFull:
+            alert, state, reason = entry
+            self.audit_overflow += 1
+            _log.error(
+                "audit row dropped: the audit queue is full",
+                extra={
+                    "key": alert.key,
+                    "state": state,
+                    "reason": None if reason is None else reason.value,
+                    "audit_queue_size": self.audit_queue_size,
+                    "audit_overflow": self.audit_overflow,
+                },
+            )
+
+    async def _write_audit(self) -> None:
+        assert self.audit is not None
+        while True:
+            alert, state, reason = await self._audit_queue.get()
+            try:
+                await _guard("audit", self.audit.record(alert, state, reason=reason))
+            finally:
+                self._audit_queue.task_done()
 
 
 async def run_ticker(

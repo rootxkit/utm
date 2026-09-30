@@ -52,7 +52,12 @@ async def run(settings: AirspaceSettings) -> None:
         neighbour_max_age_s=settings.neighbour_max_age_s,
     )
     bus = await nats.connect(str(settings.nats_url))
-    service = AirspaceService(monitor=monitor, bus=bus, audit=EventsAuditLog(engine))
+    service = AirspaceService(
+        monitor=monitor,
+        bus=bus,
+        audit=EventsAuditLog(engine),
+        audit_queue_size=settings.audit_queue_size,
+    )
     _log.info(
         "airspace monitor running",
         extra={
@@ -109,6 +114,8 @@ async def run(settings: AirspaceSettings) -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         await bus.drain()
+        # Queued audit rows are written before the engine goes.
+        await service.close()
         await engine.dispose()
 
 

@@ -37,3 +37,10 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     neighbour_max_age_s: float = Field(
         default=10.0, gt=0, validation_alias="NEIGHBOUR_MAX_AGE_S"
     )
+    # S-13. Audit rows waiting for the background writer. Transitions are
+    # rare (the 2026-09-29 SITL run wrote 16 rows in four minutes), so 1000
+    # entries, each a small tuple, cover hours of a slow or absent database
+    # before a row is dropped, while a flapping fleet stays bounded.
+    audit_queue_size: int = Field(
+        default=1000, ge=1, validation_alias="AUDIT_QUEUE_SIZE"
+    )

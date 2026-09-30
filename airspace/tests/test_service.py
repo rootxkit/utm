@@ -56,13 +56,19 @@ class RecordingBus:
 
 
 class RecordingAudit:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self, *, fail: bool = False, gate: asyncio.Event | None = None
+    ) -> None:
         self.rows: list[tuple[str, str]] = []
         self.fail = fail
+        # When set, every write waits for it: a slow database.
+        self.gate = gate
 
     async def record(
         self, alert: Alert, state: str, *, reason: ClearReason | None = None
     ) -> None:
+        if self.gate is not None:
+            await self.gate.wait()
         if self.fail:
             raise ConnectionError("database is gone")
         self.rows.append((alert.key, state if reason is None else f"{state}:{reason}"))
@@ -104,6 +110,7 @@ async def test_a_conflict_is_published_and_audited_once() -> None:
     assert subject.startswith("alert.conflict:")
     assert body["state"] == "raised"
     assert body["severity"] == "critical"
+    await svc.flush_audit()
     assert audit.rows == [(body["key"], "raised")]
 
 
@@ -120,6 +127,7 @@ async def test_the_tick_clears_what_went_silent_and_says_so() -> None:
     assert "reason" not in bus.sent[0][1]
     assert bus.sent[1][1]["reason"] == "stale"
     key = bus.sent[0][1]["key"]
+    await svc.flush_audit()
     assert audit.rows == [(key, "raised"), (key, "cleared:stale")]
 
 
@@ -143,18 +151,108 @@ async def test_a_bus_failure_does_not_stop_the_audit_or_the_monitor() -> None:
     await svc.on_telemetry(payload(A, 0, 10))
     await svc.on_telemetry(payload(B, 500, -10))
 
+    await svc.flush_audit()
     assert len(audit.rows) == 1
     assert len(svc.monitor.active) == 1
 
 
-async def test_an_audit_failure_does_not_stop_the_publish() -> None:
+async def test_an_audit_failure_does_not_stop_the_publish_or_the_writer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     bus = RecordingBus()
-    svc, _ = service(bus, RecordingAudit(fail=True))
+    audit = RecordingAudit(fail=True)
+    svc, clock = service(bus, audit)
 
     await svc.on_telemetry(payload(A, 0, 10))
     await svc.on_telemetry(payload(B, 500, -10))
-
+    await svc.flush_audit()
     assert len(bus.sent) == 1
+    assert [r.step for r in _delivery_errors(caplog)] == ["audit"]
+
+    # The writer survived the failure: the next row is written.
+    audit.fail = False
+    clock.now_s = 20.0
+    await svc.on_tick()
+    await svc.flush_audit()
+    assert [state for _, state in audit.rows] == ["cleared:stale"]
+
+
+def _delivery_errors(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [r for r in caplog.records if r.getMessage().startswith("could not deliver")]
+
+
+async def test_the_audit_is_off_the_telemetry_path_and_written_in_order() -> None:
+    """S-13. With the database stalled, telemetry is still evaluated and
+    published; the rows are written, in order, once it answers."""
+    gate = asyncio.Event()
+    bus, audit = RecordingBus(), RecordingAudit(gate=gate)
+    svc, clock = service(bus, audit)
+
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    clock.now_s = 20.0
+    await svc.on_tick()
+
+    assert [body["state"] for _, body in bus.sent] == ["raised", "cleared"]
+    assert audit.rows == []
+    assert svc.audit_pending >= 1
+
+    gate.set()
+    await asyncio.wait_for(svc.flush_audit(), timeout=5.0)
+    key = bus.sent[0][1]["key"]
+    assert audit.rows == [(key, "raised"), (key, "cleared:stale")]
+    assert svc.audit_overflow == 0
+    await svc.close()
+
+
+async def test_an_overflowing_audit_queue_is_counted_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The presence pair: a queue of one, a stalled database, and three
+    transitions. What does not fit is dropped, and says so."""
+    gate = asyncio.Event()
+    bus, audit = RecordingBus(), RecordingAudit(gate=gate)
+    clock = Clock()
+    svc = AirspaceService(
+        monitor=AirspaceMonitor(policy=POLICY, stale_after_s=15.0, clear_after_s=1.0),
+        bus=bus,
+        audit=audit,
+        clock=clock,
+        audit_queue_size=1,
+    )
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    for at_s in (1.0, 3.0):  # B turns away: the conflict resolves.
+        clock.now_s = at_s
+        await svc.on_telemetry(payload(B, 500 + 10 * at_s, 10, at_s=at_s))
+    clock.now_s = 4.0
+    await svc.on_telemetry(payload(B, 450, -10, at_s=4.0))  # and comes back.
+
+    assert [body["state"] for _, body in bus.sent] == ["raised", "cleared", "raised"]
+    assert svc.audit_overflow >= 1
+    dropped: list[Any] = [
+        r for r in caplog.records if r.getMessage().startswith("audit row dropped")
+    ]
+    assert len(dropped) == svc.audit_overflow
+    assert dropped[0].audit_queue_size == 1
+    assert dropped[0].key == bus.sent[0][1]["key"]
+
+    gate.set()
+    await asyncio.wait_for(svc.flush_audit(), timeout=5.0)
+    assert len(audit.rows) + svc.audit_overflow == 3
+    await svc.close()
+
+
+async def test_close_writes_what_is_queued() -> None:
+    bus, audit = RecordingBus(), RecordingAudit()
+    svc, _ = service(bus, audit)
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+
+    await svc.close()
+
+    assert len(audit.rows) == 1
+    assert svc._audit_writer is None
 
 
 async def test_a_garbled_message_is_skipped_and_the_next_one_counts() -> None:
@@ -256,4 +354,5 @@ async def test_an_active_alert_is_refreshed_on_each_tick_but_not_audited() -> No
     await svc.on_tick()
 
     assert [body["state"] for _, body in bus.sent] == ["raised", "active"]
+    await svc.flush_audit()
     assert audit.rows == [(bus.sent[0][1]["key"], "raised")]
