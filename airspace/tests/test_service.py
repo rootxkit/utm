@@ -3,6 +3,7 @@ going when either fails."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -12,7 +13,7 @@ import pytest
 
 from airspace.cpa import SeparationPolicy, local_offset_m
 from airspace.monitor import AirspaceMonitor, Alert, ClearReason
-from airspace.service import AirspaceService
+from airspace.service import AirspaceService, run_ticker
 
 A = UUID(int=1)
 B = UUID(int=2)
@@ -186,6 +187,61 @@ async def test_a_non_finite_position_is_logged_and_the_next_message_counts(
         "unusable telemetry message"
     ]
     assert len(bus.sent) == 1
+
+
+class FlakyService(AirspaceService):
+    """Fails its first tick, then behaves."""
+
+    ticks = 0
+
+    async def on_tick(self) -> None:
+        self.ticks += 1
+        if self.ticks == 1:
+            raise RuntimeError("tick blew up")
+        await super().on_tick()
+
+
+async def test_the_ticker_outlives_a_failing_tick_and_a_failing_refresh(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S-13. The ticker clears stale alerts; if it died the alerts would show
+    for ever. Its first tick raises, its first refresh raises, and it goes on
+    to tick, refresh and clear the stale pair."""
+    bus = RecordingBus()
+    clock = Clock()
+    svc = FlakyService(
+        monitor=AirspaceMonitor(policy=POLICY, stale_after_s=15.0), bus=bus, clock=clock
+    )
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    clock.now_s = 20.0
+
+    refreshes = 0
+    stop = asyncio.Event()
+
+    async def refresh() -> None:
+        nonlocal refreshes
+        refreshes += 1
+        if refreshes == 1:
+            raise ConnectionError("database is gone")
+        if refreshes == 3:
+            stop.set()
+
+    await asyncio.wait_for(
+        run_ticker(
+            svc, stop=stop, tick_s=0.001, refresh_every_s=0.002, refresh=refresh
+        ),
+        timeout=5.0,
+    )
+
+    assert svc.ticks >= 3 and refreshes == 3
+    assert [body["state"] for _, body in bus.sent] == ["raised", "cleared"]
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert [r.getMessage().split(";")[0] for r in errors] == [
+        "tick failed",
+        "could not reload the zones, the policy or the height limit",
+    ]
+    assert all(r.exc_info for r in errors)
 
 
 async def test_an_active_alert_is_refreshed_on_each_tick_but_not_audited() -> None:

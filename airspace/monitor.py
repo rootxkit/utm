@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -241,6 +241,24 @@ class AirspaceMonitor:
     @property
     def active(self) -> list[Alert]:
         return list(self._active.values())
+
+    def update_policy(self, policy: SeparationPolicy) -> bool:
+        """Take a re-read policy (S-13). Logs what changed and returns whether
+        anything did. A new neighbour radius rebuilds the index, since the
+        grid's cell size comes from it."""
+        if policy == self.policy:
+            return False
+        _log.info(
+            "separation policy changed",
+            extra={"before": asdict(self.policy), "after": asdict(policy)},
+        )
+        if policy.neighbour_radius_m != self.policy.neighbour_radius_m:
+            index = NeighbourIndex(radius_m=policy.neighbour_radius_m)
+            for track in self.index.tracks():
+                index.upsert(track)
+            self.index = index
+        self.policy = policy
+        return True
 
     def observe(self, message: dict[str, Any], *, now_s: float) -> Change:
         """Take one telemetry message; return the alerts it raised or cleared.

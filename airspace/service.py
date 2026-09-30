@@ -17,6 +17,7 @@ message must still be evaluated.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -149,6 +150,39 @@ class AirspaceService:
         )
         if self.audit is not None:
             await _guard("audit", self.audit.record(alert, state, reason=reason))
+
+
+async def run_ticker(
+    service: AirspaceService,
+    *,
+    stop: asyncio.Event,
+    tick_s: float,
+    refresh_every_s: float,
+    refresh: Callable[[], Awaitable[None]],
+) -> None:
+    """Tick the service every `tick_s` until `stop`, and call `refresh` (the
+    zones, the policy and the height limit from the database) every
+    `refresh_every_s`. Neither a failing tick nor a failing refresh ends the
+    loop (S-13): the ticker is what clears stale alerts, and a task that died
+    silently would leave every one of them showing for ever. Both are logged
+    with their traceback; a refresh failure keeps what is loaded."""
+    since_refresh_s = 0.0
+    while not stop.is_set():
+        await asyncio.sleep(tick_s)
+        try:
+            await service.on_tick()
+        except Exception:
+            _log.exception("tick failed; the ticker continues")
+        since_refresh_s += tick_s
+        if since_refresh_s >= refresh_every_s:
+            since_refresh_s = 0.0
+            try:
+                await refresh()
+            except Exception:
+                _log.exception(
+                    "could not reload the zones, the policy or the height "
+                    "limit; keeping what is loaded"
+                )
 
 
 async def _guard(what: str, action: Awaitable[None]) -> None:

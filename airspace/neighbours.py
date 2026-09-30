@@ -71,6 +71,10 @@ class NeighbourIndex:
     def track(self, drone_id: UUID) -> Track | None:
         return self._tracks.get(drone_id)
 
+    def tracks(self) -> list[Track]:
+        """Every tracked aircraft, for rebuilding the index at a new radius."""
+        return list(self._tracks.values())
+
     def neighbours(self, drone_id: UUID) -> list[Track]:
         """Every other tracked aircraft within `radius_m` of this one."""
         me = self._tracks.get(drone_id)

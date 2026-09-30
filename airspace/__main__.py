@@ -3,8 +3,9 @@
 Reads the separation policy, the height limit and the zones from the
 relational database, and the terrain tiles from `TERRAIN_DIR`, then
 follows the Gateway's telemetry on the bus. Zones are re-read every
-`ZONE_REFRESH_S`, and so is the height limit, so a zone added or a limit changed
-through the database takes effect without a restart.
+`ZONE_REFRESH_S`, and so are the separation policy and the height limit, so
+a zone added or a threshold changed through the database takes effect
+without a restart; a change is logged with the values before and after.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from airspace.config import AirspaceSettings
 from airspace.monitor import AirspaceMonitor
 from airspace.policy import load_height_limit, load_policy
-from airspace.service import AirspaceService, EventsAuditLog
+from airspace.service import AirspaceService, EventsAuditLog, run_ticker
 from airspace.zones import load_zones
 from common import configure_logging, get_logger, load_settings
 from common.terrain import Terrain
@@ -77,26 +78,30 @@ async def run(settings: AirspaceSettings) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
 
-    async def ticker() -> None:
-        since_refresh_s = 0.0
-        while not stop.is_set():
-            await asyncio.sleep(TICK_S)
-            await service.on_tick()
-            since_refresh_s += TICK_S
-            if since_refresh_s >= ZONE_REFRESH_S:
-                since_refresh_s = 0.0
-                try:
-                    monitor.zones = await load_zones(engine)
-                    monitor.max_height_agl_m = await load_height_limit(engine)
-                except Exception as error:
-                    # Keep what we have: a database hiccup must not silently
-                    # make every zone, or the height limit, disappear.
-                    _log.error(
-                        "could not reload zones or the height limit",
-                        extra={"error": repr(error)},
-                    )
+    async def refresh() -> None:
+        # Read everything before changing anything, so a failure part-way
+        # leaves the monitor consistent with one database state.
+        zones = await load_zones(engine)
+        new_policy = await load_policy(engine)
+        new_limit_m = await load_height_limit(engine)
+        monitor.zones = zones
+        if new_limit_m != monitor.max_height_agl_m:
+            _log.info(
+                "height limit changed",
+                extra={"before": monitor.max_height_agl_m, "after": new_limit_m},
+            )
+            monitor.max_height_agl_m = new_limit_m
+        monitor.update_policy(new_policy)
 
-    task = asyncio.create_task(ticker())
+    task = asyncio.create_task(
+        run_ticker(
+            service,
+            stop=stop,
+            tick_s=TICK_S,
+            refresh_every_s=ZONE_REFRESH_S,
+            refresh=refresh,
+        )
+    )
     try:
         await stop.wait()
     finally:

@@ -4,6 +4,7 @@ and never for aircraft on the ground."""
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -213,6 +214,53 @@ def test_the_alert_serialises_for_the_bus() -> None:
     assert encoded["kind"] == "conflict"
     assert encoded["severity"] == "critical"
     assert sorted(encoded["drone_ids"]) == sorted([str(A), str(B)])
+
+
+# --- S-13: the policy can change while running -----------------------------
+
+
+def test_a_re_read_policy_that_is_the_same_changes_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="airspace.monitor")
+    monitor = AirspaceMonitor(policy=POLICY)
+    index = monitor.index
+    assert monitor.update_policy(SeparationPolicy(60, 60, 20, 800)) is False
+    assert monitor.index is index
+    assert [r for r in caplog.records if "policy" in r.getMessage()] == []
+
+
+def test_a_new_neighbour_radius_rebuilds_the_index_with_its_aircraft(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Head-on at 500 m is a conflict at the 800 m radius. Re-read with a
+    400 m radius the pair are not neighbours; back at 800 m they are again,
+    without either aircraft having to report."""
+    caplog.set_level(logging.INFO, logger="airspace.monitor")
+    monitor = AirspaceMonitor(policy=POLICY)
+    head_on(monitor, now_s=0.0)
+    assert len(monitor.index.neighbours(A)) == 1
+
+    narrow = SeparationPolicy(60, 60, 20, neighbour_radius_m=400)
+    assert monitor.update_policy(narrow) is True
+    assert monitor.index.radius_m == 400 and len(monitor.index) == 2
+    assert monitor.index.neighbours(A) == []
+
+    assert monitor.update_policy(POLICY) is True
+    assert len(monitor.index.neighbours(A)) == 1
+    changes: list[Any] = [r for r in caplog.records if "policy" in r.getMessage()]
+    assert [c.after["neighbour_radius_m"] for c in changes] == [400, 800]
+
+
+def test_a_new_threshold_applies_to_the_next_message() -> None:
+    """A pair 500 m apart and closing, meeting in 25 s: not a conflict once
+    the lead time is 20 s, and one again at 60 s."""
+    monitor = AirspaceMonitor(policy=SeparationPolicy(20, 60, 20, 800))
+    head_on(monitor, now_s=0.0)
+    assert monitor.active == []
+    monitor.update_policy(POLICY)
+    head_on(monitor, now_s=1.0)
+    assert [alert.kind for alert in monitor.active] == [AlertKind.CONFLICT]
 
 
 # --- S-12: a number that is not a number -----------------------------------
