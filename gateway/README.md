@@ -46,11 +46,16 @@ Every published telemetry message carries these time-related fields:
     since drain barely exceeds intake (§10). The Gateway sees a drain
     without any clock: a frame at or above 32 KiB, half the §6 size bound,
     only occurs when more than 100 ms of records were waiting (three
-    aircraft produce under 1 KiB per 100 ms), and a `status.queue_depth`
-    (§8, records awaiting acknowledgement) above `RelayServer.drain_queue_depth`
-    (default 1000, about four acknowledgement intervals of three aircraft
-    at 84 Hz) says the same. Either starts the drain; it ends when a frame
-    under the bound arrives and the last reported depth is under the
-    threshold. Once it ends, `captured_at` is within a batch of `rx_ts`.
+    aircraft produce under 1 KiB per 100 ms), and a real drain always
+    sends one first. That, and only that, starts the drain. It ends on a
+    frame under the bound once the last reported `status.queue_depth` (§8,
+    records awaiting acknowledgement) is within `RelayServer.drain_clear_s`
+    (3 s) of the session's own record rate, measured on the records'
+    `recv_utc_ns`, with a floor of 100 records; with no depth or rate known
+    yet, a small frame clears it. Depth is never compared with a fixed
+    count: a healthy twelve-aircraft station holds over a thousand
+    unacknowledged records before each 1 s ack, and a fixed count would
+    flag it for ever. Once the drain ends, `captured_at` is within a batch
+    of `rx_ts`.
   Those positions are history: the airspace monitor records them but raises
   no live alert from them. Always `false` for Remote ID, which has no queue.
