@@ -540,7 +540,9 @@ collected, so the loss shows exactly as above.
 If the writer thread itself stops, the relay stops sending `status` and exits
 with a non-zero code rather than run on, bound to the socket and looking alive
 while nothing reaches disk. The Gateway sees `unreachable`, and a restart shows
-as loss #4.
+as loss #4. The same happens when a failed write cannot even be rolled back:
+the queue's state is then unknown, no retry can be trusted, and only a restart
+reopens it cleanly.
 
 ## 12. Reconnection
 
