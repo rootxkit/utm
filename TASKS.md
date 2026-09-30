@@ -1018,7 +1018,9 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
 
 ## Wave M — Monitoring features for the ministry
 
-Sequenced by value to the demonstration. Each is its own branch.
+Sequenced by value to the demonstration. Each is its own branch. M-03, M-04
+and M-08 are superseded by Wave U, which follows the EU U-space model; they
+stay here, closed as superseded, so their IDs keep resolving.
 
 - [ ] **M-01** Finish Remote ID (P1-15): verified and unverified tracks told
       apart in the console by colour and legend, receiver state shown, and
@@ -1034,13 +1036,13 @@ Sequenced by value to the demonstration. Each is its own branch.
       an operator can move it through its statuses with each change in
       `events`.
 
-- [ ] **M-03** Registry (P2-08): third-party operators and drones by serial
+- [!] **M-03** *(superseded by U-01 and U-02)* Registry (P2-08): third-party operators and drones by serial
       number. A Remote ID serial is matched against the registry, and an
       `unregistered` warning is raised when it is absent.
       *Done when:* a broadcast with an unknown serial raises `unregistered`,
       and registering that serial clears it.
 
-- [ ] **M-04** Official zones (P5-18, ED-269): import and validation, with
+- [!] **M-04** *(superseded by U-03)* Official zones (P5-18, ED-269): import and validation, with
       checks. This was unfinished work in progress and is completed here.
       *Done when:* P5-18's criterion is met and an invalid file is refused
       with a named reason.
@@ -1062,7 +1064,7 @@ Sequenced by value to the demonstration. Each is its own branch.
       *Done when:* each report is produced from a SITL run's data and its
       figures match the database.
 
-- [ ] **M-08** ADS-B (P1-16): manned aircraft on the map, and an alert when a
+- [!] **M-08** *(superseded by U-07)* ADS-B (P1-16): manned aircraft on the map, and an alert when a
       drone approaches one.
       *Done when:* P1-16's criterion is met in the console.
 
@@ -1070,6 +1072,139 @@ Sequenced by value to the demonstration. Each is its own branch.
       legend, and a printable view where needed.
       *Done when:* a Georgian-speaking reviewer signs off the console and
       reports in `ka`.
+
+---
+
+## Wave U — U-space services (EU model)
+
+The target is the EU U-space framework: Regulations (EU) 2021/664, 2021/665
+and 2021/666 on top of 2019/947 and 2019/945. Georgia's UAS rules (GCAA,
+in force since 2021-01-01) mirror 2019/947 and the EU–Georgia Common
+Aviation Area Agreement has been in force since 2020-08-02, so this is the
+model a Georgian authority will be measured against.
+
+Two invariants carry over unchanged. **The system never commands an
+aircraft**: authorisation, geo-awareness and conformance act on *operators*
+and on the authority's picture, never on a vehicle. **Every service is
+observable in SITL** before it is done (`CLAUDE.md` hard rule 5).
+
+The four services 2021/664 makes mandatory inside a U-space airspace are
+U-02, U-03, U-05 and U-07. U-06 (conformance) and U-08 (weather) are
+optional there and can be made mandatory by the authority.
+
+- [ ] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
+      from console users, with a registration number, contact and status;
+      remote pilots with competency records; UAS with serial, class label
+      (C0-C6), MTOM and the operator that owns them. Import from a
+      `uas.gov.ge` export when one is available, manual entry until then.
+      *Done when:* an operator, a pilot and two UAS can be registered,
+      suspended and looked up by registration number or serial, with every
+      change in `events`.
+
+- [ ] **U-02** Network identification service: every track, whatever its
+      source, is resolved to *registered*, *registered but suspended*,
+      *unknown operator* or *unidentified*. Direct Remote ID's operator
+      registration number and serial are matched against U-01; a mismatch
+      between the two is itself an alert. Network Remote ID (ASTM F3411
+      network, as served by other USSPs) is ingested as a further source.
+      Absorbs S-10's spoofing guard.
+      *Done when:* four simulated broadcasts, one per status, show their
+      status in the console, and an `unidentified` or `unknown operator`
+      track in a zone opens an incident (U-12).
+
+- [ ] **U-03** Geo-awareness: the zone model follows EUROCAE ED-269
+      (identifier, restriction type, reason, vertical limits with their
+      reference, applicability windows, authority), with import and export
+      in ED-269 JSON, an editor in the console for the authority, and an
+      import from `airspace.gov.ge`. Replaces P5-18 and absorbs its paused
+      work (commit `e9cf2a2`).
+      *Done when:* an ED-269 file round-trips unchanged, an invalid one is
+      refused with a named reason, a zone drawn in the editor alerts in
+      SITL, and a zone outside its applicability window does not.
+
+- [ ] **U-04** Dynamic airspace reconfiguration (2021/665): the authority
+      activates a temporary restriction (for example `TEMPO RESTR. AREA`),
+      every console receives it at once, aircraft already inside are
+      alerted, and affected authorisations (U-05) are flagged.
+      *Done when:* activating a restriction over a SITL aircraft raises its
+      alert within one telemetry tick and marks the authorisation.
+
+- [ ] **U-05** UAS flight authorisation (2021/664 Art. 10): an operator
+      submits an operational intent (4D volumes: polygon, altitude band
+      AMSL, time window). It is checked against zones and against every
+      other accepted intent (spatial, temporal and altitude overlap), then
+      accepted, refused with the conflicting item named, or sent to the
+      authority for decision. Priority rules for special operations. This
+      brings back the strategic check removed with the delivery scope, as a
+      service to operators rather than a planner.
+      *Done when:* two overlapping intents submitted in either order give
+      the same result, and a refusal names the zone or intent it conflicts
+      with.
+
+- [ ] **U-06** Conformance monitoring: each flight is matched to its
+      authorisation and a track leaving its accepted volumes, or flying
+      without one where authorisation is required, raises a
+      non-conformance alert and an incident.
+      *Done when:* a SITL aircraft flown out of its volume alerts, and one
+      flown inside it does not.
+
+- [ ] **U-07** Traffic information (2021/664 Art. 11; 2021/666
+      e-conspicuity): manned aircraft from ADS-B (a local receiver or a
+      feed) and ADS-L / FLARM where available, drawn on the map and
+      included in proximity alerts with drones. Replaces P1-16.
+      *Done when:* a recorded ADS-B track near a SITL drone raises a
+      traffic alert, and a stale manned track ages out visibly.
+
+- [ ] **U-08** Weather information service: wind, gusts, visibility and
+      precipitation for the operating area from METAR and a forecast
+      source, shown per area, with thresholds in configuration.
+      *Done when:* a wind above the configured threshold raises an area
+      advisory in the console.
+
+- [ ] **U-09** Common Information Service (2021/664 Art. 5): a read API
+      publishing U-space airspace boundaries, geo-zones, active dynamic
+      restrictions and the list of certified USSPs, aligned with EUROCAE
+      ED-318.
+      *Done when:* an external client reads every published item, and a
+      restriction activated in U-04 appears in the API within one second.
+
+- [ ] **U-10** USSP interoperability: exchange operational intents and
+      constraints with other USSPs using ASTM F3548 through an InterUSS DSS,
+      so a flight authorised elsewhere is visible and deconflicted here.
+      Deferred until Georgia has more than one USSP, but the data model in
+      U-05 is chosen so this needs no migration.
+      *Done when:* the InterUSS `monitoring` test suite passes against a
+      local DSS.
+
+- [ ] **U-11** Operator portal: public web pages where an operator checks
+      zones, submits an operational intent (U-05) and sees its decision,
+      in `ka` and `en`. The equivalent of ENAIRE Drones, DroneTower or
+      B4UFLY.
+      *Done when:* a test operator registers, submits an intent and
+      receives the decision without console access.
+
+- [ ] **U-12** Incidents and evidence: incidents (M-02) gain persisted,
+      audited acknowledgement, assignment and closure, and an evidence
+      pack per incident (track excerpt, raw Remote ID frames, zone and
+      authorisation at the time, audit trail) exported as PDF and CSV with
+      a content hash. Absorbs P6-07 and the incident part of M-07.
+      *Done when:* an incident from a SITL run exports a pack whose hash
+      verifies and whose contents match the database.
+
+- [ ] **U-13** Authority role and oversight: a `regulator` role (read
+      everything, change nothing but incidents and zones), the audit of
+      views and exports (M-06), and oversight views over operators and
+      USSPs.
+      *Done when:* every other changing route refuses the role, and a view
+      and an export by it appear in `events`.
+
+- [ ] **U-14** Non-cooperative detection: an adapter for third-party
+      sensors (RF detectors, radar) so detections appear as
+      `non-cooperative` tracks correlated with cooperative ones. Hardware
+      and legal authority lie with security agencies; this is the data path
+      only.
+      *Done when:* a recorded sensor feed produces tracks, and one
+      coinciding with a Remote ID track is merged rather than duplicated.
 
 ---
 
@@ -1104,7 +1239,10 @@ Sequenced by value to the demonstration. Each is its own branch.
 Wave 0   Remove the delivery scope        P-01 → P-04
 Wave S   Stability and security           S-A … S-F in parallel,
                                           then S-09; S-14 optional, last
-Wave M   Monitoring features              M-01 → M-09, by demo value
+Wave M   Monitoring features              M-01, M-02, M-05, M-07, M-09
+Wave U   U-space services (EU model)      U-01 → U-03 → U-12 → U-05 → U-06
+                                          → U-07 → U-04 → U-13 → U-08
+                                          → U-09 → U-11; U-10, U-14 last
 Wave D   Demo readiness                   D-01 → D-04
 
 Open tasks in Phases 1-10 are taken up where a wave needs them.
@@ -1119,9 +1257,11 @@ ahead of whatever remains of Wave M.
 **Working rules.** One task is one agent, in its own git worktree and on its
 own branch (`fix/S-03-airspace-stale-track`, `feat/M-02-violations`).
 Parallel agents in one wave never touch the same file. The main session
-reviews each diff and runs ruff, mypy and pytest locally; a branch is pushed
-only with the owner's consent, and the owner opens the pull request and
-merges. CI runs on `main` and the deploy is automatic.
+reviews each diff and runs ruff, mypy and pytest locally, with SITL in WSL
+for anything that alerts. The main session opens the pull request, merges
+it once every CI job including SITL is green, and deletes the branch. Pull
+requests touching `agent/`, `gateway/` or `airspace/` get an independent
+review before merge. The deploy from `main` is automatic.
 
 **What receive-only buys.** The system cannot touch an aircraft, so no bug in
 it can cause a crash. That was the Stage 0 guarantee; it is now permanent.
