@@ -64,7 +64,7 @@ be launched and observed. No real hardware.
       *Done when:* every service imports it and no service reads `os.environ`
       directly.
 
-- [ ] **P0-09** Staging server on the owner's DigitalOcean droplet: the dev
+- [~] **P0-09** Staging server on the owner's DigitalOcean droplet: the dev
       stack plus Gateway, API, console and airspace monitor under Docker
       Compose, TLS on the owner's domain, SSH-key access only (no root
       password), nightly backups of both databases, and nothing listening
@@ -74,6 +74,18 @@ be launched and observed. No real hardware.
       a relay on the laptop delivers to it, and restoring last night's backup
       into a scratch database succeeds.
       *Added* 2026-09-29 with the owner, for the monitoring direction.
+      *Partial* 2026-09-30, on the droplet in Frankfurt (2 vCPU, 4 GB),
+      `docs/runbooks/p0-09-staging.md`:
+      - `https://utm.chikox.net` serves the console and API; Caddy holds
+        Let's Encrypt certificates for it and for `ingest.chikox.net`.
+      - The laptop relay delivered a SITL flight over
+        `wss://ingest.chikox.net`: 318 rows and 8,847 archived records.
+      - A nightly backup is taken, and a restore into throwaway databases
+        read back 631 `drone_state` rows.
+      - A merge to main deploys itself once CI passes.
+      Still to do:
+      - The owner applies the firewall and key-only SSH.
+      - The backups are copied off the droplet.
 
 ---
 

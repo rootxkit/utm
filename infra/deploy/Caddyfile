@@ -1,0 +1,21 @@
+# The only thing listening publicly (P0-09). Certificates are Let's Encrypt,
+# obtained and renewed by Caddy itself.
+
+{$UTM_HOST} {
+	encode zstd gzip
+	# The console feed (P1-08): a WebSocket, served by the console service.
+	handle /ws/* {
+		reverse_proxy console:8000
+	}
+	# Everything else: the API, which also serves the console app at /app,
+	# sign-in and replay.
+	handle {
+		reverse_proxy api:8010
+	}
+	header Strict-Transport-Security "max-age=31536000"
+}
+
+# relay-v1: stations deliver telemetry here over WSS, with their bearer token.
+{$INGEST_HOST} {
+	reverse_proxy gateway:8081
+}

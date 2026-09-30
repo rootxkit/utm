@@ -1,0 +1,6 @@
+# /etc/cron.d/utm-backup (P0-09). Times are UTC.
+# Nightly dumps of both databases; a restore of the newest every Sunday.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+30 2 * * * root /srv/utm/infra/deploy/backup.sh >> /var/log/utm-backup.log 2>&1
+30 3 * * 0 root /srv/utm/infra/deploy/restore_check.sh >> /var/log/utm-backup.log 2>&1

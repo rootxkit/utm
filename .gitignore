@@ -82,3 +82,7 @@ Thumbs.db
 
 # Local per-developer tool overrides
 .claude/settings.local.json
+
+# P0-09: staging server secrets and data, never committed.
+infra/deploy/secrets/
+infra/deploy/data/

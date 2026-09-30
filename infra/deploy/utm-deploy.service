@@ -1,0 +1,8 @@
+[Unit]
+Description=Deploy the UTM stack when origin/deploy moves (P0-09)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/srv/utm/infra/deploy/deploy.sh

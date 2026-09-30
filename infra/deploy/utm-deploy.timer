@@ -1,0 +1,9 @@
+[Unit]
+Description=Check for a new deploy every minute (P0-09)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
