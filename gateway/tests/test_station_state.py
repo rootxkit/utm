@@ -13,6 +13,7 @@ from typing import Any
 
 from gateway.relay_messages import Gap, Status
 from gateway.station_state import (
+    MAX_RETAINED_LOSSES,
     LinkState,
     LossKind,
     StationLinkTracker,
@@ -72,7 +73,7 @@ def test_unreachable_is_not_data_lost() -> None:
     station.observe_status(status(), now_s=10.0)
 
     assert station.state(now_s=60.0) == LinkState.UNREACHABLE
-    assert station.losses == []
+    assert list(station.losses) == []
 
 
 def test_the_disagreement_window_never_reports_loss() -> None:
@@ -90,7 +91,7 @@ def test_the_disagreement_window_never_reports_loss() -> None:
             LinkState.HEALTHY,
             LinkState.UNREACHABLE,
         }
-    assert station.losses == []
+    assert list(station.losses) == []
 
 
 def test_a_station_that_returns_becomes_healthy_again() -> None:
@@ -100,7 +101,7 @@ def test_a_station_that_returns_becomes_healthy_again() -> None:
 
     station.observe_status(status(uptime_s=110), now_s=10.0)
     assert station.state(now_s=10.2) == LinkState.HEALTHY
-    assert station.losses == []
+    assert list(station.losses) == []
 
 
 # --- radio silent ----------------------------------------------------------
@@ -127,7 +128,7 @@ def test_radio_silent_is_not_data_lost() -> None:
     station = tracker()
     station.observe_status(status(last_datagram_age_ms=30_000), now_s=10.0)
     assert station.state(now_s=10.5) == LinkState.RADIO_SILENT
-    assert station.losses == []
+    assert list(station.losses) == []
 
 
 def test_no_datagram_ever_received_is_not_radio_silent() -> None:
@@ -360,3 +361,30 @@ def test_a_new_session_does_not_inherit_the_old_trend() -> None:
     station.start_session()
     station.observe_status(status(queue_depth=9_000), now_s=30.0)
     assert station.state(now_s=30.0, now_utc_ns=NOW_NS) is LinkState.HEALTHY
+
+
+# --- the losses a tracker keeps are bounded (S-07) -------------------------
+
+
+def test_losses_are_bounded_and_keep_the_newest() -> None:
+    """A station dropping datagrams every second, for the life of the
+    Gateway, must not grow the tracker without limit. The event log has
+    every loss; the console is shown the most recent."""
+    station = tracker()
+    total = MAX_RETAINED_LOSSES + 50
+    for n in range(total + 1):
+        station.observe_status(status(dropped_intake_total=n), now_s=float(n))
+
+    assert len(station.losses) == MAX_RETAINED_LOSSES
+    # Each status dropped one more datagram, so the newest loss is the last.
+    assert station.losses[-1].datagram_count == 1
+    assert station.state(now_s=float(total) + 0.5) == LinkState.DATA_LOST
+
+
+def test_a_tracker_under_the_bound_keeps_every_loss() -> None:
+    """The presence half: nothing is dropped until the bound is reached."""
+    station = tracker()
+    for n in range(MAX_RETAINED_LOSSES + 1):
+        station.observe_status(status(dropped_intake_total=n), now_s=float(n))
+
+    assert len(station.losses) == MAX_RETAINED_LOSSES

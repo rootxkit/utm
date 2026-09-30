@@ -25,6 +25,11 @@ from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 
 DEFAULT_INTERVAL_S = 60.0
+# S-07. Keys are remote addresses and source ids chosen by whoever is being
+# rejected, so without a ceiling the per-key state is memory a stranger can
+# grow. Expired keys go first; if none have expired, the least recently
+# reported key does, and it is simply reported again as new next time.
+DEFAULT_MAX_KEYS = 10_000
 
 
 @dataclass
@@ -33,6 +38,7 @@ class RateLimiter:
 
     interval_s: float = DEFAULT_INTERVAL_S
     clock: Callable[[], float] = time.monotonic
+    max_keys: int = DEFAULT_MAX_KEYS
 
     _last_reported: dict[Hashable, float] = field(default_factory=dict, init=False)
     _suppressed: dict[Hashable, int] = field(default_factory=dict, init=False)
@@ -49,5 +55,28 @@ class RateLimiter:
         if last is not None and now - last < self.interval_s:
             self._suppressed[key] = self._suppressed.get(key, 0) + 1
             return None
+        if key not in self._last_reported and len(self._last_reported) >= self.max_keys:
+            self._evict(now)
+        # Removed and re-added so insertion order is report order, which is
+        # what `_evict` falls back on.
+        self._last_reported.pop(key, None)
         self._last_reported[key] = now
         return self._suppressed.pop(key, 0)
+
+    @property
+    def tracked_keys(self) -> int:
+        return len(self._last_reported)
+
+    def _evict(self, now: float) -> None:
+        expired = [
+            key
+            for key, last in self._last_reported.items()
+            if now - last >= self.interval_s
+        ]
+        for key in expired:
+            del self._last_reported[key]
+            self._suppressed.pop(key, None)
+        if len(self._last_reported) >= self.max_keys:
+            oldest = next(iter(self._last_reported))
+            del self._last_reported[oldest]
+            self._suppressed.pop(oldest, None)

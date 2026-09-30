@@ -47,6 +47,7 @@ from common.geoid import GeoidGrid
 from gateway import odid
 from gateway.config import RemoteIdSettings
 from gateway.publisher import Bus
+from gateway.rate_limit import RateLimiter
 from gateway.remote_id import Frame, RemoteIdTracker
 from gateway.remote_id_auth import (
     AuthenticationError,
@@ -122,6 +123,11 @@ class RemoteIdIngest:
     links: LinkFreshness = field(default_factory=LinkFreshness)
     clock_s: Callable[[], float] = time.monotonic
     wall: Callable[[], datetime] = wall_clock
+    # S-07. A refused datagram is logged at most once per source per
+    # interval, with a count of those suppressed in between. The port is
+    # reachable by whatever can route to it, and a line per datagram is a
+    # way for a stranger to fill the disk.
+    refusals: RateLimiter = field(default_factory=RateLimiter)
     refused: int = field(default=0, init=False)
     published: int = field(default=0, init=False)
     # Broadcasts by our own aircraft while their telemetry was live: stored,
@@ -139,10 +145,16 @@ class RemoteIdIngest:
             observation = self.tracker.take(frame, now_s=self.clock_s())
         except (AuthenticationError, DatagramError, odid.DecodeError) as error:
             self.refused += 1
-            _log.warning(
-                "remote id datagram refused",
-                extra={"source": source, "error": str(error)},
-            )
+            suppressed = self.refusals.admit(source)
+            if suppressed is not None:
+                _log.warning(
+                    "remote id datagram refused",
+                    extra={
+                        "source": source,
+                        "error": str(error),
+                        "suppressed": suppressed,
+                    },
+                )
             return
         if observation is None:
             return

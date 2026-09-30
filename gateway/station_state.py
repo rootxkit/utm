@@ -48,6 +48,12 @@ from typing import Final
 
 from gateway.relay_messages import Gap, Status
 
+# S-07. How many losses a tracker keeps. A tracker lives as long as the
+# Gateway and a station dropping datagrams every second would otherwise grow
+# this list without bound, and republish all of it on every report. The
+# event log holds every loss; this is only what the console is shown.
+MAX_RETAINED_LOSSES: Final = 100
+
 
 class LinkState(StrEnum):
     """What the console renders. §9's table, one value per row."""
@@ -122,7 +128,12 @@ class StationLinkTracker:
 
     last_status_at_s: float | None = field(default=None, init=False)
     last_status: Status | None = field(default=None, init=False)
-    losses: list[LossEvent] = field(default_factory=list, init=False)
+    # Bounded, newest last; the oldest is dropped when full. Every loss is
+    # in `ingest_events` regardless - this is the console's view, not the
+    # record.
+    losses: deque[LossEvent] = field(
+        default_factory=lambda: deque(maxlen=MAX_RETAINED_LOSSES), init=False
+    )
     last_loss_at_s: float | None = field(default=None, init=False)
     ignored_message_count: int = field(default=0, init=False)
     # P1-14. `recv_utc_ns` of the newest record stored for this station, on
