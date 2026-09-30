@@ -23,7 +23,7 @@ function empty(): FeedState {
   return { aircraft: new Map(), stations: new Map(), alerts: new Map(), unclaimed: new Map() };
 }
 
-function apply(state: FeedState, message: FeedMessage): FeedState {
+export function apply(state: FeedState, message: FeedMessage): FeedState {
   const now = Date.now();
   switch (message.kind) {
     case "telemetry": {
@@ -61,7 +61,34 @@ function apply(state: FeedState, message: FeedMessage): FeedState {
       });
       return { ...state, unclaimed };
     }
+    default:
+      // A kind this console does not know (a newer server): ignore it.
+      return state;
   }
+}
+
+const BACKOFF_BASE_MS = 1000;
+const BACKOFF_CAP_MS = 30000;
+const BACKOFF_MIN_MS = 500;
+export const STABLE_AFTER_MS = 10000;
+
+// Delay before reconnect attempt number `attempt` (0 for the first retry):
+// exponential from 1 s, capped at 30 s, with "equal jitter" (half fixed, half
+// random) so a fleet of consoles does not reconnect in lockstep. Never below
+// 500 ms, so a 4401 close cannot spin. A first 4401 (the ticket simply ran
+// out) renews at the minimum; repeated ones back off like any failure.
+// `random` is in [0, 1).
+export function reconnectDelay(attempt: number, random: number, code?: number): number {
+  if (code === SIGN_IN_REQUIRED && attempt === 0) return BACKOFF_MIN_MS;
+  const ceiling = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, attempt));
+  return Math.max(BACKOFF_MIN_MS, Math.round(ceiling / 2 + (ceiling / 2) * random));
+}
+
+// The attempt counter after a connection ended having been up for `upMs`
+// (null: it never opened): a stable connection starts over at 1, since the
+// retry that follows it is the first, anything else keeps counting.
+export function nextAttempt(attempt: number, upMs: number | null): number {
+  return upMs !== null && upMs >= STABLE_AFTER_MS ? 1 : attempt + 1;
 }
 
 // The feed address may be relative ("/ws/telemetry", behind a same-origin
@@ -83,6 +110,16 @@ export function useFeed(feedUrl: string | null): { state: FeedState; status: Fee
     let stopped = false;
     let socket: WebSocket | null = null;
     let timer: number | undefined;
+    let attempt = 0;
+    let openedAt: number | null = null;
+    let warnedParse = false;
+
+    const retry = (code?: number, upMs: number | null = null) => {
+      const stable = upMs !== null && upMs >= STABLE_AFTER_MS;
+      const delay = reconnectDelay(stable ? 0 : attempt, Math.random(), code);
+      attempt = nextAttempt(attempt, upMs);
+      timer = window.setTimeout(connect, delay);
+    };
 
     const connect = async () => {
       if (stopped) return;
@@ -93,18 +130,34 @@ export function useFeed(feedUrl: string | null): { state: FeedState; status: Fee
       } catch {
         if (stopped) return;
         setStatus("down");
-        timer = window.setTimeout(connect, 5000);
+        retry();
         return;
       }
       if (stopped) return;
       socket = new WebSocket(feedAddress(feedUrl, location.href));
-      socket.onopen = () => setStatus("live");
-      socket.onmessage = (event) => dispatch(JSON.parse(String(event.data)) as FeedMessage);
+      socket.onopen = () => {
+        openedAt = Date.now();
+        setStatus("live");
+      };
+      socket.onmessage = (event) => {
+        let message: FeedMessage;
+        try {
+          message = JSON.parse(String(event.data)) as FeedMessage;
+        } catch {
+          if (!warnedParse) {
+            warnedParse = true;
+            console.warn("feed: ignoring a message that is not JSON");
+          }
+          return;
+        }
+        dispatch(message);
+      };
       socket.onclose = (event) => {
         if (stopped) return;
         setStatus(event.code === SIGN_IN_REQUIRED ? "connecting" : "down");
-        // A ticket that ran out is renewed at once; anything else waits.
-        timer = window.setTimeout(connect, event.code === SIGN_IN_REQUIRED ? 0 : 2000);
+        const upMs = openedAt === null ? null : Date.now() - openedAt;
+        openedAt = null;
+        retry(event.code, upMs);
       };
     };
     void connect();
