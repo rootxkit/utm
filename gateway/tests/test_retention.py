@@ -120,6 +120,19 @@ async def live_segments(engine: AsyncEngine, station: str) -> int:
         )
 
 
+async def backdate(engine: AsyncEngine, station: str, when: datetime) -> None:
+    """Make a station's segments look as if they were stored at `when`.
+
+    Age is keyed on `stored_at`, the Gateway's clock, which the store sets to
+    now; a test that wants a segment past retention has to move it.
+    """
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text("UPDATE archive_segments SET stored_at = :w WHERE station_id = :s"),
+            {"w": when, "s": station},
+        )
+
+
 async def events_of(engine: AsyncEngine, station: str) -> list[str]:
     async with engine.connect() as connection:
         rows = await connection.execute(
@@ -143,6 +156,7 @@ async def test_a_segment_past_retention_is_deleted(
 ) -> None:
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
     assert await live_segments(engine, station) == 1
 
     result = await retention.sweep(now=NOW, only_station=station)
@@ -188,6 +202,7 @@ async def test_deleting_a_segment_records_an_event(
     """
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
 
     await retention.sweep(now=NOW, only_station=station)
 
@@ -203,6 +218,7 @@ async def test_the_index_row_survives_and_says_what_was_there(
     """ "3600 records were here and were deleted" is not "nothing was here"."""
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
 
     await retention.sweep(now=NOW, only_station=station)
 
@@ -318,6 +334,7 @@ async def test_a_hold_exempts_an_epoch_from_age(
 ) -> None:
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
     await retention.place_hold(
         station,
         EPOCH,
@@ -347,6 +364,7 @@ async def test_an_expired_hold_stops_exempting(
     """
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
     await retention.place_hold(
         station,
         EPOCH,
@@ -428,6 +446,7 @@ async def test_a_released_hold_stops_exempting_immediately(
 ) -> None:
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
     await retention.place_hold(
         station,
         EPOCH,
@@ -450,6 +469,7 @@ async def test_a_hold_exempts_only_its_own_epoch(
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
     await store.store_records(station, OTHER_EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
     await retention.place_hold(
         station,
         EPOCH,
@@ -567,6 +587,7 @@ async def test_a_segment_whose_file_is_gone_is_counted_and_reported(
     """
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
 
     # The file vanishes behind the index's back.
     for segment in archive.root.rglob("*.zst"):
@@ -592,6 +613,7 @@ async def test_an_ordinary_sweep_reports_nothing_missing(
     """
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
 
     result = await retention.sweep(now=NOW, only_station=station)
 
@@ -612,6 +634,7 @@ async def test_re_running_a_sweep_is_still_safe(
     """
     old = NOW - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
 
     first = await retention.sweep(now=NOW, only_station=station)
     second = await retention.sweep(now=NOW, only_station=station)
@@ -639,6 +662,7 @@ async def test_the_scheduled_pass_deletes_a_segment_past_retention(
 
     old = datetime.now(tz=UTC) - timedelta(days=RETENTION_DAYS + 1)
     await store.store_records(station, EPOCH, records_at(old, 0, 10))
+    await backdate(store.engine, station, old)
     assert await live_segments(engine, station) == 1
 
     schedule = RetentionSchedule(
@@ -659,3 +683,60 @@ async def test_the_scheduled_pass_deletes_a_segment_past_retention(
     assert await live_segments(engine, station) == 0
     assert not list(archive.root.rglob("*.zst"))
     assert "retention.deleted.age" in await events_of(engine, station)
+
+
+# --- age is the Gateway's clock, not the station's (S-07) -------------------
+
+
+async def test_a_segment_stored_recently_survives_an_ancient_station_clock(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    station: str,
+) -> None:
+    """relay-v1 §9: `recv_utc_ns` may be wrong. A ground PC whose clock is
+    years behind must not have freshly acknowledged telemetry deleted at the
+    next sweep. Stored now, filed under 1999: kept."""
+    ancient = datetime(1999, 1, 1, tzinfo=UTC)
+    await store.store_records(station, EPOCH, records_at(ancient, 0, 10))
+
+    result = await retention.sweep(now=datetime.now(tz=UTC), only_station=station)
+
+    assert result.deleted_total == 0
+    assert await live_segments(engine, station) == 1
+
+
+async def test_a_segment_stored_long_ago_is_deleted_whatever_its_hour_says(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    station: str,
+) -> None:
+    """The presence half: an hour that claims to be today, stored long ago."""
+    await store.store_records(station, EPOCH, records_at(NOW, 0, 10))
+    await backdate(store.engine, station, NOW - timedelta(days=RETENTION_DAYS + 1))
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_by_age == 1
+    assert await live_segments(engine, station) == 0
+
+
+async def test_a_file_with_a_recently_stored_row_is_kept_whole(
+    store: TimescaleIngestStore,
+    retention: ArchiveRetention,
+    engine: AsyncEngine,
+    station: str,
+) -> None:
+    """Whole files only. Two index rows share one hour file; if one of them
+    was stored inside the window, deleting the file would take its bytes
+    with it, unmarked. Neither row is touched."""
+    await store.store_records(station, EPOCH, records_at(NOW, 0, 10))
+    await backdate(store.engine, station, NOW - timedelta(days=RETENTION_DAYS + 1))
+    await store.store_records(station, EPOCH, records_at(NOW, 10, 10))
+    assert await live_segments(engine, station) == 2
+
+    result = await retention.sweep(now=NOW, only_station=station)
+
+    assert result.deleted_total == 0
+    assert await live_segments(engine, station) == 2

@@ -2,10 +2,17 @@
 
 Two rules, in this order:
 
-1. **Age.** Segments older than `telemetry_retention_days` are deleted. That
-   setting is shared with P1-04's `drone_state` retention and must stay shared:
-   the archive must not outlive the telemetry it explains, nor the telemetry
-   the archive. Half a record is worse than none, because it reads as complete.
+1. **Age.** Segments stored longer ago than `telemetry_retention_days` are
+   deleted. That setting is shared with P1-04's `drone_state` retention and
+   must stay shared: the archive must not outlive the telemetry it explains,
+   nor the telemetry the archive. Half a record is worse than none, because
+   it reads as complete.
+
+   Age is measured on `stored_at`, the Gateway's clock, never on the hour
+   the records claim to belong to. `hour_start` comes from `recv_utc_ns`,
+   the ground PC's wall clock, which relay-v1 §9 says may be wrong; keyed on
+   that, a station whose clock was years behind had freshly acknowledged
+   telemetry unlinked at the next sweep.
 
 2. **Size ceiling, per station.** If a station is over its ceiling after the
    age sweep, the oldest whole segments go first, oldest epoch first, until it
@@ -86,6 +93,8 @@ _segments = sa.table(
     sa.column("hour_start", sa.DateTime(timezone=True)),
     sa.column("record_count", sa.Integer),
     sa.column("compressed_bytes", sa.BigInteger),
+    # Server time, set by the database when the row was indexed.
+    sa.column("stored_at", sa.DateTime(timezone=True)),
     sa.column("deleted_at", sa.DateTime(timezone=True)),
     sa.column("deleted_reason", sa.Text),
 )
@@ -423,10 +432,23 @@ class ArchiveRetention:
                 _segments.c.compressed_bytes,
             )
             .where(_segments.c.deleted_at.is_(None))
-            .order_by(_segments.c.hour_start, _segments.c.epoch, _segments.c.id)
+            # Oldest by the Gateway's clock first, so the ceiling too takes
+            # what was stored longest ago rather than what a station's clock
+            # claims is oldest.
+            .order_by(_segments.c.stored_at, _segments.c.id)
         )
         if older_than is not None:
-            query = query.where(_segments.c.hour_start < older_than)
+            # Age on the Gateway's clock, and only whole files: a path with
+            # any live row stored inside the window stays, because deleting
+            # the file would take that row's bytes with it, unmarked.
+            recently_stored = sa.select(_segments.c.relative_path).where(
+                _segments.c.deleted_at.is_(None),
+                _segments.c.stored_at >= older_than,
+            )
+            query = query.where(
+                _segments.c.stored_at < older_than,
+                _segments.c.relative_path.not_in(recently_stored),
+            )
         if station_id is not None:
             query = query.where(_segments.c.station_id == station_id)
 
