@@ -301,7 +301,8 @@ async def test_a_spacing_beyond_the_batch_span_is_clamped_and_counted() -> None:
     )
 
     assert publisher.captured_at == [received - timedelta(seconds=120), received]
-    assert pipeline.span_clamped == 1
+    # Every message is placed, for its binding: the heartbeat too.
+    assert pipeline.span_clamped == 2
 
 
 async def test_every_record_is_backlog_while_the_session_is_draining() -> None:
@@ -342,20 +343,53 @@ async def test_an_unbound_source_produces_no_row() -> None:
     assert writer.written == []
 
 
-async def test_an_unbound_source_is_announced_once_not_once_per_datagram() -> None:
+async def test_an_unbound_source_is_announced_once_per_interval_with_a_count() -> None:
     """An unbound aircraft at 84 Hz would otherwise emit 84 events a second.
 
     That is how a genuinely useful signal becomes something operators filter
-    out, so it is announced per address.
+    out, so it is announced per address and per interval. Not once for ever
+    (S-11): a station whose clock made every record unclaimed read as
+    healthy after its first announcement.
     """
     pipeline, resolver, _, publisher = build(resolver=FakeResolver(drone_id=None))
+    clock = [0.0]
+    pipeline.monotonic = lambda: clock[0]
+    pipeline.unclaimed_interval_s = 60.0
 
     for seq in range(20):
         await pipeline.process(EPOCH, [record(seq, position())])
-
     assert len(publisher.unclaimed) == 1
     assert len(resolver.unclaimed) == 1
     assert publisher.unclaimed[0] == SourceId(sysid=1, compid=1)
+
+    clock[0] = 61.0
+    await pipeline.process(EPOCH, [record(20, position())])
+    assert len(publisher.unclaimed) == 2
+    assert resolver.suppressed == [0, 19]
+
+
+async def test_a_station_clock_an_hour_slow_still_binds_its_records() -> None:
+    """S-11. The binding is resolved at the Gateway-placed time, not the
+    station's `ts`: a SYSID reassigned half an hour ago must resolve to its
+    new drone even though the station stamps its records an hour in the
+    past, where the old binding was still in force."""
+    received = datetime(2026, 9, 24, 13, 0, tzinfo=UTC)
+    rebound_to = UUID("11111111-2222-3333-4444-555555555555")
+    resolver = FakeResolver(
+        rebound_at=received - timedelta(minutes=30), rebound_to=rebound_to
+    )
+    pipeline, _, _, publisher = build(resolver=resolver)
+    pipeline.wall = lambda: received
+
+    # The records' `ts` read noon: an hour slow.
+    rows = await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position())]
+    )
+
+    assert [row.drone_id for row in rows] == [rebound_to]
+    assert publisher.unclaimed == []
+    assert rows[0].ts == datetime(2026, 9, 24, 12, 0, tzinfo=UTC), "the row keeps ts"
+    assert publisher.captured_at == [received]
 
 
 async def test_two_unbound_addresses_are_announced_separately() -> None:
@@ -607,6 +641,10 @@ async def test_a_batch_crossing_a_rebinding_splits_between_two_drones() -> None:
     batch = [record(0, heartbeat())] + [
         record(n, position(), offset_ns=n * 500_000_000) for n in range(1, 9)
     ]
+    # A station with a correct clock, delivered at once: the Gateway receives
+    # the batch as its newest record is captured, so each record's placed
+    # time (which the binding is resolved at) equals its capture time.
+    pipeline.wall = lambda: datetime(2026, 9, 24, 12, 0, 4, tzinfo=UTC)
 
     rows = await pipeline.process(EPOCH, batch)
 
@@ -707,9 +745,9 @@ async def test_a_continuing_rejection_is_reported_again_with_its_count() -> None
     assert resolver.suppressed == [0, 19]
 
 
-async def test_an_unclaimed_source_is_still_announced_only_once() -> None:
+async def test_an_unclaimed_source_is_still_announced_only_once_per_interval() -> None:
     """The rejection path must not change the unclaimed one: an aircraft being
-    set up is announced once, as before."""
+    set up is announced once within the interval, as before."""
     pipeline, resolver, _, _ = build(resolver=FakeResolver(drone_id=None))
 
     for _ in range(3):

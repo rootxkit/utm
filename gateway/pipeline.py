@@ -23,6 +23,7 @@ was captured, which is the whole reason bindings have validity.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -43,7 +44,7 @@ from gateway.link_quality import LinkQualityTracker
 from gateway.live_state import LiveState
 from gateway.parsing import ParsedMessage, SourceId, parse_datagram
 from gateway.publisher import TelemetryPublisher
-from gateway.rate_limit import RateLimiter
+from gateway.rate_limit import DEFAULT_INTERVAL_S, RateLimiter
 from gateway.relay_records import Record
 from gateway.stage_timing import StageTimings, shared_timings
 from gateway.state_buffer import RowWriter
@@ -107,11 +108,19 @@ class IngestPipeline:
     # at the clamp instead (S-11). Logged per batch; counted for tests.
     span_clamped: int = field(default=0, init=False)
 
-    # Unclaimed sources are announced once per address, not once per datagram.
-    # An aircraft transmitting at 84 Hz with no binding would otherwise emit
-    # 84 identical events a second, which is how a genuinely useful signal
-    # becomes something operators filter out.
-    _announced_unclaimed: set[SourceId] = field(default_factory=set, init=False)
+    # Unclaimed sources are announced once per address per interval, not once
+    # per datagram and not once for ever. An aircraft transmitting at 84 Hz
+    # with no binding would otherwise emit 84 identical events a second,
+    # which is how a genuinely useful signal becomes something operators
+    # filter out; announced only once, a station whose clock made every
+    # record unclaimed (S-11) read as healthy after its first minute. Each
+    # repeat carries the count suppressed since the last one.
+    unclaimed_interval_s: float = DEFAULT_INTERVAL_S
+    monotonic: Callable[[], float] = time.monotonic
+    _unclaimed_announced_at: dict[SourceId, float] = field(
+        default_factory=dict, init=False
+    )
+    _unclaimed_suppressed: dict[SourceId, int] = field(default_factory=dict, init=False)
     _bad_frames: int = field(default=0, init=False)
     # P1-09, per source like the accumulator: this station's view of the link.
     _links: dict[SourceId, LinkQualityTracker] = field(default_factory=dict, init=False)
@@ -147,9 +156,12 @@ class IngestPipeline:
         about 3.3 ms, which capped the Gateway at about 300 records/s at any
         fleet size and was 96% of the time spent storing a batch (ADR-002).
 
-        Nothing about *which* binding applies changes. Each message is still
-        resolved against its own record's capture time, with the source as it
-        was classified at that message - `Source` is a frozen snapshot, so
+        Nothing about *which* binding applies changes. Each message is
+        resolved against its own placed time (`captured_at`, on the Gateway's
+        clock), with the source as it was classified at that message. Not
+        the station's `ts`: relay-v1 §9 allows that clock to be wrong, and a
+        station an hour slow resolved every record against the bindings of
+        an hour ago, silently, as unclaimed. `Source` is a frozen snapshot, so
         classifying the whole batch first cannot leak a later HEARTBEAT back
         into an earlier message's resolution.
         """
@@ -158,12 +170,16 @@ class IngestPipeline:
         if not observed:
             return []
         newest_ts = max(item.ts for item in observed)
+        placed = [self._placed(rx_ts, newest_ts, item) for item in observed]
 
         try:
             with self.timings.measure("process.resolve"):
                 resolutions = await self.resolver.resolve_batch(
                     self.station_id,
-                    [(item.source, item.ts) for item in observed],
+                    [
+                        (item.source, at)
+                        for item, at in zip(observed, placed, strict=True)
+                    ],
                 )
         except Exception as error:
             # The flight record is already durable (obligation 9); what is lost
@@ -189,7 +205,7 @@ class IngestPipeline:
         captured_at: list[datetime] = []
         # Which address each drone was seen on in this batch, for its link.
         sources_by_drone: dict[UUID, SourceId] = {}
-        for item, resolution in zip(observed, resolutions, strict=True):
+        for item, resolution, at in zip(observed, resolutions, placed, strict=True):
             if resolution.drone_id is not None:
                 sources_by_drone[resolution.drone_id] = item.source.source_id
             try:
@@ -208,7 +224,7 @@ class IngestPipeline:
             if row is not None:
                 rows.append(row)
                 backlog.append(item.backlog)
-                captured_at.append(self._placed(rx_ts, newest_ts, item))
+                captured_at.append(at)
 
         if rows:
             labels: dict[UUID, str] = {}
@@ -415,9 +431,15 @@ class IngestPipeline:
             return
         source_id = source.source_id
 
-        if source_id in self._announced_unclaimed:
+        now = self.monotonic()
+        announced_at = self._unclaimed_announced_at.get(source_id)
+        if announced_at is not None and now - announced_at < self.unclaimed_interval_s:
+            self._unclaimed_suppressed[source_id] = (
+                self._unclaimed_suppressed.get(source_id, 0) + 1
+            )
             return
-        self._announced_unclaimed.add(source_id)
+        self._unclaimed_announced_at[source_id] = now
+        suppressed = self._unclaimed_suppressed.pop(source_id, 0)
 
         _log.warning(
             "unclaimed source",
@@ -426,9 +448,12 @@ class IngestPipeline:
                 "sysid": source_id.sysid,
                 "compid": source_id.compid,
                 "reason": resolution.unclaimed_reason,
+                "suppressed": suppressed,
             },
         )
-        await self.resolver.record_unclaimed(self.station_id, epoch, resolution)
+        await self.resolver.record_unclaimed(
+            self.station_id, epoch, resolution, suppressed=suppressed
+        )
         await self.publisher.publish_unclaimed(self.station_id, resolution, source_id)
 
     async def _report_rejected(self, epoch: str, resolution: Resolution) -> None:
@@ -465,7 +490,8 @@ class IngestPipeline:
         operator is told again rather than the silence being mistaken for
         everything being fine.
         """
-        self._announced_unclaimed.discard(source_id)
+        self._unclaimed_announced_at.pop(source_id, None)
+        self._unclaimed_suppressed.pop(source_id, None)
 
 
 @dataclass
