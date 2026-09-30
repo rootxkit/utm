@@ -25,6 +25,7 @@ from gateway.remote_id import RemoteIdTracker
 from gateway.remote_id_auth import ReceiverAuthenticator
 from gateway.remote_id_ingest import RemoteIdIngest, listen
 from gateway.tests.rid_frames import FlatGeoid
+from tests.ports import free_udp_port
 from tools import sitl_remote_id as bridge
 
 pytestmark = pytest.mark.nats
@@ -38,13 +39,6 @@ def nats_url() -> str:
     if not url:
         pytest.skip("NATS_URL is not set; `make up` starts the broker")
     return url
-
-
-def free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        port: int = probe.getsockname()[1]
-        return port
 
 
 def sitl_frames(serial_lat_e7: int) -> list[bytes]:
