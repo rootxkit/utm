@@ -114,6 +114,20 @@ sim: ## Launch N SITL vehicles (make sim N=10)
 sim-stop: ## Stop every SITL vehicle
 	./sim/stop_sitl.sh
 
+# U-16: the SITL vehicles of `make sim` as Remote ID broadcasts, heard by one
+# simulated receiver and sent to the Remote ID ingest. The geoid must be the
+# ingest's (GEOID_PATH), or the heights are wrong by the difference. Set
+# RID_KEY_FILE= (empty) for an ingest that runs without receiver keys.
+RID_RECEIVER ?= sitl-rx-1
+RID_KEY_FILE ?= local/remote-id-receivers.keys
+RID_SERIAL ?= SITLRID{sysid:04d}
+RID_OPERATOR ?= GEO-OP-SITL
+GEOID_PATH ?= local/geoid/egm2008-2_5.pgm
+RID_OPTS ?=
+
+sitl-rid: venv ## Broadcast N SITL vehicles as Remote ID (make sitl-rid N=3)
+	$(VENV_BIN)/python -m tools.sitl_remote_id --count $(N) 		--serial '$(RID_SERIAL)' --operator-id '$(RID_OPERATOR)' 		--receiver-id '$(RID_RECEIVER)' $(if $(RID_KEY_FILE),--key-file '$(RID_KEY_FILE)') 		--geoid '$(GEOID_PATH)' $(RID_OPTS)
+
 probe: ## Inventory what QGC forwarding delivers (PROBE_SECONDS=30, PROBE_JSON=path)
 	$(PROBE) listen $(PROBE_OPTS) --seconds $(PROBE_SECONDS) $(if $(PROBE_JSON),--json $(PROBE_JSON))
 
