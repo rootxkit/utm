@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import socket
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -32,7 +33,10 @@ DATAGRAM_BYTES = 3000
 
 
 def make_relay(
-    tmp_path: Path, *, intake_queue_size: int = 10000
+    tmp_path: Path,
+    *,
+    intake_queue_size: int = 10000,
+    writer_stall_timeout_s: float = 5.0,
 ) -> tuple[Relay, DurableQueue, RelayConfig]:
     config = RelayConfig(
         station_id="writer-test",
@@ -41,6 +45,7 @@ def make_relay(
         queue_path=tmp_path / "relay-queue.sqlite3",
         bind_port=free_udp_port(),
         intake_queue_size=intake_queue_size,
+        writer_stall_timeout_s=writer_stall_timeout_s,
     )
     durable_queue = DurableQueue(config.queue_path, max_bytes=config.queue_max_bytes)
     return Relay(config, durable_queue, "token"), durable_queue, config
@@ -90,14 +95,38 @@ def running(relay: Relay) -> Any:
         udp.close()
 
 
+def count_appends(
+    durable_queue: DurableQueue, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, int]:
+    attempts = {"n": 0}
+    real_append = durable_queue.append
+
+    def counting_append(datagrams: Any) -> Any:
+        attempts["n"] += 1
+        return real_append(datagrams)
+
+    monkeypatch.setattr(durable_queue, "append", counting_append)
+    return attempts
+
+
 def test_a_healthy_writer_says_storage_is_ok(tmp_path: Path) -> None:
     """The branch that says nothing is wrong: make it run and read it."""
-    relay, durable_queue, config = make_relay(tmp_path)
+    stall_timeout_s = 0.3
+    relay, durable_queue, config = make_relay(
+        tmp_path, writer_stall_timeout_s=stall_timeout_s
+    )
     with running(relay):
         send(config, 20)
         wait_until(lambda: durable_queue.next_seq == 20)
+        # Idle for well past the stall limit: an idle writer is not a stalled
+        # one, because it still completes a pass every batch interval.
+        idle_from = time.monotonic()
+        wait_until(
+            lambda: relay._writer_heartbeat_monotonic > idle_from + 2 * stall_timeout_s
+        )
         status = relay._status_message()
         assert relay.writer_alive
+        assert not relay.writer_stalled
     durable_queue.close()
 
     assert status["storage_ok"] is True
@@ -106,9 +135,10 @@ def test_a_healthy_writer_says_storage_is_ok(tmp_path: Path) -> None:
 
 
 def test_a_failing_disk_is_reported_and_the_held_batch_survives_it(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     relay, durable_queue, config = make_relay(tmp_path)
+    attempts = count_appends(durable_queue, monkeypatch)
     with running(relay):
         send(config, 3)
         wait_until(lambda: durable_queue.next_seq == 3)
@@ -118,7 +148,8 @@ def test_a_failing_disk_is_reported_and_the_held_batch_survives_it(
         wait_until(lambda: not relay.storage_ok)
         degraded = relay._status_message()
         # Several retries, not one: the thread is alive and still trying.
-        time.sleep(0.5)
+        failed_from = attempts["n"]
+        wait_until(lambda: attempts["n"] >= failed_from + 3)
         assert relay.writer_alive
         assert durable_queue.next_seq == 3
 
@@ -137,6 +168,112 @@ def test_a_failing_disk_is_reported_and_the_held_batch_survives_it(
     assert [r.seq for r in stored] == list(range(8))
     assert [int.from_bytes(r.datagram[:4], "big") for r in stored] == list(range(8))
     assert recovered["dropped_intake_total"] == 0
+
+
+def test_a_hung_write_is_reported_and_the_drops_it_causes_are_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that neither fails nor finishes must not look healthy.
+
+    The fake holds the queue's lock the way a commit stuck in fsync does, so
+    everything that waits on that lock waits here too.
+    """
+    relay, durable_queue, config = make_relay(
+        tmp_path, intake_queue_size=10, writer_stall_timeout_s=0.3
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    real_append = durable_queue.append
+
+    def hanging_append(datagrams: Any) -> Any:
+        with durable_queue._lock:
+            entered.set()
+            release.wait(30.0)
+        return real_append(datagrams)
+
+    monkeypatch.setattr(durable_queue, "append", hanging_append)
+
+    # Every status the Gateway could have received, across the whole outage
+    # and recovery. The count must never fall: a fall and a rise would be
+    # reported as a second loss.
+    reported: list[int] = []
+    sampling = threading.Event()
+
+    def sample() -> None:
+        while not sampling.is_set():
+            reported.append(relay._status_message()["dropped_intake_total"])
+            time.sleep(0.005)
+
+    sampler = threading.Thread(target=sample, daemon=True)
+    with running(relay):
+        sampler.start()
+        try:
+            try:
+                send(config, 1)
+                assert entered.wait(5.0)
+                send(config, 500, first=1)
+                wait_until(lambda: relay._status_message()["dropped_intake_total"] > 0)
+                wait_until(lambda: not relay.storage_ok)
+
+                started = time.monotonic()
+                during = relay._status_message()
+                status_s = time.monotonic() - started
+                assert relay.writer_alive
+                assert relay.writer_stalled
+            finally:
+                release.set()
+
+            wait_until(lambda: relay.storage_ok)
+            wait_until(lambda: durable_queue.next_seq >= 1)
+            after = relay._status_message()
+        finally:
+            # Stopped however the test ends, or a failure above leaves it
+            # running and the process never exits.
+            sampling.set()
+            sampler.join()
+    durable_queue.close()
+
+    with DurableQueue(config.queue_path) as reopened:
+        persisted = reopened.dropped_intake_total
+
+    assert during["storage_ok"] is False
+    assert during["dropped_intake_total"] > 0
+    assert status_s < 0.1, f"status waited {status_s:.2f} s behind the hung write"
+    assert after["storage_ok"] is True
+    assert after["dropped_intake_total"] >= during["dropped_intake_total"]
+    assert reported == sorted(reported), "dropped_intake_total went backwards"
+    assert persisted == after["dropped_intake_total"]
+
+
+def test_a_pass_with_nothing_to_write_does_not_declare_storage_healthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a write that succeeds may clear `storage_ok: false`."""
+    relay, durable_queue, config = make_relay(tmp_path)
+
+    def refusing_persist() -> None:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(durable_queue, "persist_intake_drops", refusing_persist)
+    # A drop waiting to be written, and nothing else: the writer's first pass
+    # fails on the counter alone, and every pass after it has nothing to do.
+    relay._pending_intake_drops = 1
+
+    with running(relay):
+        wait_until(lambda: not relay.storage_ok)
+        failed_at = time.monotonic()
+        wait_until(lambda: relay._writer_heartbeat_monotonic > failed_at + 0.5)
+        idle = relay._status_message()
+
+        send(config, 1)
+        wait_until(lambda: durable_queue.next_seq == 1)
+        wait_until(lambda: relay.storage_ok)
+        written = relay._status_message()
+    durable_queue.close()
+
+    assert idle["storage_ok"] is False
+    assert idle["dropped_intake_total"] == 1
+    assert written["storage_ok"] is True
 
 
 def test_a_disk_that_stays_full_shows_as_intake_drops_in_status(

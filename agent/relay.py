@@ -19,6 +19,7 @@ import asyncio
 import json
 import queue as queue_module
 import random
+import sqlite3
 import ssl
 import threading
 import time
@@ -137,6 +138,7 @@ class Relay:
         self._last_datagram_monotonic: float | None = None
         self._pending_intake_drops = 0
         self._storage_ok = True
+        self._writer_heartbeat_monotonic = time.monotonic()
         self._counters_lock = threading.Lock()
 
     # --- intake -----------------------------------------------------------
@@ -185,25 +187,32 @@ class Relay:
         held: list[tuple[int, bytes]] = []
         backoff_s = WRITER_BACKOFF_INITIAL_S
         while not self._stop.is_set() or not self._intake.empty() or held:
+            self._beat()
             if not held:
                 held = self._collect_batch()
 
-            failure: Exception | None = None
+            # Only these two: anything else is a bug, and retrying a bug
+            # forever as if it were a disk outage would hide it. It ends the
+            # thread instead, and the watchdog stops the relay.
+            failure: sqlite3.Error | OSError | None = None
+            wrote = False
             if held:
                 try:
                     self._queue.append(held)
                     held = []
-                except Exception as error:
+                    wrote = True
+                except (sqlite3.Error, OSError) as error:
                     failure = error
 
             # Counted even when the batch above failed: the in-memory total
             # moves regardless of whether the disk accepts it, so the loss is
             # visible in `status` while storage is down.
-            drops = self._take_pending_drops()
+            drops = self._transfer_pending_drops()
             if drops:
                 try:
-                    self._queue.record_intake_drops(drops)
-                except Exception as error:
+                    self._queue.persist_intake_drops()
+                    wrote = True
+                except (sqlite3.Error, OSError) as error:
                     failure = failure or error
                 self._log.warning(
                     "intake queue full, datagrams dropped",
@@ -211,7 +220,9 @@ class Relay:
                 )
 
             if failure is None:
-                if self._set_storage_ok(True):
+                # Only a write that succeeded is evidence the disk is back; a
+                # pass with nothing to write proves nothing.
+                if wrote and self._set_storage_ok(True):
                     self._log.info("durable queue writable again")
                 backoff_s = WRITER_BACKOFF_INITIAL_S
                 continue
@@ -265,7 +276,30 @@ class Relay:
             if remaining_s <= 0:
                 break
             self._stop.wait(min(remaining_s, WRITER_DROP_FLUSH_INTERVAL_S))
-            self._queue.count_intake_drops(self._take_pending_drops())
+            self._beat()
+            self._transfer_pending_drops()
+
+    def _beat(self) -> None:
+        """Mark the writer as making progress. See `writer_stalled`."""
+        with self._counters_lock:
+            self._writer_heartbeat_monotonic = time.monotonic()
+
+    @property
+    def writer_stalled(self) -> bool:
+        """True when a running writer has not completed a pass for too long.
+
+        A write hung in fsync neither fails nor finishes: the thread is alive,
+        no error is raised, and without this the relay would report healthy
+        storage while dropping everything. A pass normally takes one batch
+        interval plus one commit, and a backoff beats every
+        WRITER_DROP_FLUSH_INTERVAL_S, so only a blocked call can exceed the
+        limit.
+        """
+        if not self._threads or self._stop.is_set() or not self.writer_alive:
+            return False
+        with self._counters_lock:
+            beat = self._writer_heartbeat_monotonic
+        return time.monotonic() - beat > self._config.writer_stall_timeout_s
 
     def _run_writer(self) -> None:
         try:
@@ -288,8 +322,8 @@ class Relay:
 
     @property
     def storage_ok(self) -> bool:
-        """False while the durable queue is refusing writes."""
-        if self._queue.poisoned:
+        """False while the durable queue refuses writes or a write hangs."""
+        if self._queue.poisoned or self.writer_stalled:
             return False
         with self._counters_lock:
             return self._storage_ok
@@ -302,10 +336,19 @@ class Relay:
             for thread in self._threads
         )
 
-    def _take_pending_drops(self) -> int:
+    def _transfer_pending_drops(self) -> int:
+        """Move intake drops into the queue's counter. Returns how many.
+
+        Under `_counters_lock`, which `status` also takes to read both
+        figures, so no status can see the drops in neither place or in both:
+        either would make the Gateway see the counter fall and rise again and
+        report the same loss twice. The queue's side is memory only and never
+        waits for a write.
+        """
         with self._counters_lock:
             drops = self._pending_intake_drops
             self._pending_intake_drops = 0
+            self._queue.count_intake_drops(drops)
         return drops
 
     def start_intake(self) -> ReceiveOnlyUDPSocket:
@@ -345,12 +388,19 @@ class Relay:
         fsync is a status the Gateway may count as missed (S-03).
         """
         monotonic_ns, utc_ns = _now_pair()
-        stats = self._queue.stats()
+        with self._counters_lock:
+            # Read together with the drops the writer has not yet collected:
+            # a hung writer never collects them, and they are the Gateway's
+            # evidence that data is being lost.
+            stats = self._queue.stats()
+            dropped_intake_total = (
+                stats.dropped_intake_total + self._pending_intake_drops
+            )
         return {
             "type": "status",
             "queue_depth": stats.depth,
             "queue_bytes": stats.total_bytes,
-            "dropped_intake_total": stats.dropped_intake_total,
+            "dropped_intake_total": dropped_intake_total,
             "dropped_cap_total": stats.dropped_cap_total,
             "last_datagram_age_ms": self._last_datagram_age_ms(),
             "storage_ok": self.storage_ok,
@@ -389,10 +439,34 @@ class Relay:
             raise WriterDiedError("the durable queue writer thread has stopped")
 
     async def _watch_writer(self) -> None:
+        """Stop the relay if the writer dies; report it if the writer hangs.
+
+        A hang is reported, not treated as death. Exiting would discard the
+        batch the writer holds and everything waiting in intake, and the
+        restarted relay would block on the same disk when it opens the queue.
+        A stalled fsync can also clear by itself (a sleeping USB disk, an
+        antivirus scan). Meanwhile nothing is hidden: `status` keeps flowing
+        with `storage_ok: false`, and the drops intake is making still count
+        in `dropped_intake_total`, which the Gateway already treats as loss.
+        """
         if not self._threads:
             return
+        stalled = False
         while not self._stop.is_set():
             self._check_writer()
+            now_stalled = self.writer_stalled
+            if now_stalled != stalled:
+                stalled = now_stalled
+                if stalled:
+                    self._log.error(
+                        "durable queue writer has stalled; reporting storage not ok",
+                        extra={
+                            "stall_timeout_s": self._config.writer_stall_timeout_s,
+                            "intake_backlog": self._intake.qsize(),
+                        },
+                    )
+                else:
+                    self._log.info("durable queue writer is making progress again")
             await asyncio.sleep(WRITER_WATCH_INTERVAL_S)
 
     async def run_uplink(self) -> None:

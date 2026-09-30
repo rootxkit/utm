@@ -102,3 +102,10 @@ uplink_close_timeout_s = 5.0
 # Bounded so that a stalled disk drops datagrams instead of exhausting memory.
 # Drops here are counted as dropped_intake_total and reported every second.
 intake_queue_size = 10000
+
+# Seconds the disk writer may spend on one pass - normally a batch and one
+# fsync - before status reports storage_ok = false. A write that hangs neither
+# fails nor finishes, so a timer is the only way to see it. Raise it on a disk
+# with long but harmless pauses; the relay keeps running either way.
+writer_stall_timeout_s = 5.0
+

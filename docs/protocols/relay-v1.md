@@ -241,7 +241,7 @@ in the flight record, which is the exact failure this design exists to prevent.
 | `dropped_intake_total` | Datagrams dropped before a `seq` was assigned, because the in-memory intake queue was full. Persisted across restarts; see §11 for a disk that refuses the write |
 | `dropped_cap_total` | Records discarded from disk because the queue hit its size cap. Persisted across restarts |
 | `last_datagram_age_ms` | Milliseconds since a datagram last arrived on the UDP socket, or `null` if none ever has |
-| `storage_ok` | **Optional.** `false` while the relay's durable queue is refusing writes (disk full, I/O error), `true` otherwise. A relay that omits it is to be read as `true`. Informational: it says loss is likely, not that it has happened — see §11 |
+| `storage_ok` | **Optional.** `false` while the relay's durable queue is refusing writes (disk full, I/O error) or a write has hung for longer than the relay's `writer_stall_timeout_s`, `true` otherwise. A relay that omits it is to be read as `true`. Informational: it says loss is likely, not that it has happened — see §11 |
 | `uptime_s` | Seconds since the relay started |
 
 The two drop counters are separate because they are different failures with
@@ -528,6 +528,14 @@ and then the restart is itself visible as loss #4. **The Gateway needs nothing
 
 new to see this loss**: its existing `dropped_intake_total` delta already
 reports it. `storage_ok` only says why, and says it before the loss begins.
+
+A write can also hang - an fsync that neither fails nor returns. The relay
+cannot see an error, so it times the writer instead: once a pass has taken
+longer than `writer_stall_timeout_s` (default 5 s), `status` reports
+`storage_ok: false`. It keeps running and keeps sending `status`, because a
+hang can clear by itself and exiting would discard what it holds in memory,
+and its `dropped_intake_total` includes the drops the stuck writer has not
+collected, so the loss shows exactly as above.
 
 If the writer thread itself stops, the relay stops sending `status` and exits
 with a non-zero code rather than run on, bound to the socket and looking alive

@@ -18,6 +18,7 @@ surfaced as a `gap`.
 
 from __future__ import annotations
 
+import dataclasses
 import secrets
 import sqlite3
 import threading
@@ -118,7 +119,8 @@ class DurableQueue:
         # Held in memory and written through, rather than read back from the
         # database. A drop is counted the moment it is reported even when the
         # disk refuses the write, so a failing disk cannot hide the loss it is
-        # causing; the next commit that succeeds persists the total.
+        # causing; the next commit that succeeds persists the total. Guarded
+        # by `_stats_lock`, not `_lock`, so counting never waits for a write.
         self._dropped_intake: int = self._get_int(_DROPPED_INTAKE)
         self._dropped_cap: int = self._get_int(_DROPPED_CAP)
 
@@ -177,14 +179,17 @@ class DurableQueue:
 
     def _publish_stats(self) -> None:
         """Snapshot the working counters. Call with `_lock` held."""
-        snapshot = QueueStats(
-            depth=self._depth,
-            total_bytes=self._total_bytes,
-            dropped_intake_total=self._dropped_intake,
-            dropped_cap_total=self._dropped_cap,
-        )
         with self._stats_lock:
-            self._stats = snapshot
+            self._stats = QueueStats(
+                depth=self._depth,
+                total_bytes=self._total_bytes,
+                dropped_intake_total=self._dropped_intake,
+                dropped_cap_total=self._dropped_cap,
+            )
+
+    def _intake_drops_total(self) -> int:
+        with self._stats_lock:
+            return self._dropped_intake
 
     def stats(self) -> QueueStats:
         """The latest committed counters. Never waits for a database write."""
@@ -250,28 +255,35 @@ class DurableQueue:
         """
         if count <= 0:
             return
-        with self._lock:
-            self._dropped_intake += count
-            self._publish_stats()
-            self._check_usable_locked()
-            try:
-                self._set_int(_DROPPED_INTAKE, self._dropped_intake)
-                self._connection.commit()
-            except sqlite3.Error:
-                self._rollback_locked()
-                raise
+        self.count_intake_drops(count)
+        self.persist_intake_drops()
 
     def count_intake_drops(self, count: int) -> None:
         """Count intake drops in memory only, without touching the disk.
 
-        For use while the disk is refusing writes: the total is reported at
-        once and persisted by the next commit that succeeds.
+        Takes only the counters' own lock, never the lock a write holds, so it
+        cannot wait behind a hung fsync: the relay calls it while holding the
+        lock its intake thread needs. The total is reported at once and
+        persisted by the next commit that succeeds.
         """
         if count <= 0:
             return
-        with self._lock:
+        with self._stats_lock:
             self._dropped_intake += count
-            self._publish_stats()
+            self._stats = dataclasses.replace(
+                self._stats, dropped_intake_total=self._dropped_intake
+            )
+
+    def persist_intake_drops(self) -> None:
+        """Write the intake drop total. Raises if the disk refuses it."""
+        with self._lock:
+            self._check_usable_locked()
+            try:
+                self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
+                self._connection.commit()
+            except sqlite3.Error:
+                self._rollback_locked()
+                raise
 
     def append(self, datagrams: Sequence[tuple[int, bytes]]) -> list[Record]:
         """Assign sequence numbers to (recv_utc_ns, datagram) pairs and store them.
@@ -310,7 +322,7 @@ class DurableQueue:
                 )
                 self._set_int(_NEXT_SEQ, seq + len(records))
                 # Carries any intake drops whose own write failed.
-                self._set_int(_DROPPED_INTAKE, self._dropped_intake)
+                self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
                 self._depth += len(records)
                 self._total_bytes += sum(r.encoded_size for r in records)
                 self._enforce_cap_locked()
@@ -436,7 +448,7 @@ class DurableQueue:
                     )
                 # Carries any intake drops whose own write failed; on a link
                 # with no new telemetry, acks are the only commits there are.
-                self._set_int(_DROPPED_INTAKE, self._dropped_intake)
+                self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
                 self._connection.commit()
             except sqlite3.Error:
                 self._rollback_locked()
@@ -457,7 +469,7 @@ class DurableQueue:
         with self._lock:
             if not self.poisoned:
                 try:
-                    self._set_int(_DROPPED_INTAKE, self._dropped_intake)
+                    self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
                     self._connection.commit()
                 except sqlite3.Error:
                     self._rollback_locked()
