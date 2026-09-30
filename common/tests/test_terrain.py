@@ -133,6 +133,65 @@ def test_a_listed_tile_that_is_missing_is_an_error_not_a_guess(tmp_path: Path) -
         terrain.elevation(41.5, 44.5)
 
 
+TWO_CELLS = {"N41E044": "COP-DEM GLO-30", "N42E044": "COP-DEM GLO-30"}
+TWO_TILES = {"N41E044": tile_bytes(), "N42E044": tile_bytes(lat_first=43.0)}
+
+
+def test_the_cache_holds_at_most_max_tiles_least_recently_used_out(
+    tmp_path: Path,
+) -> None:
+    """S-13. With room for one tile, reading a second evicts the first, which
+    then has to come from disk again; with room for two it is still held."""
+    install(tmp_path, TWO_CELLS, TWO_TILES)
+    terrain = Terrain(tmp_path, max_tiles=1)
+    assert terrain.elevation(41.5, 44.5) is not None
+    (tmp_path / "N41E044.pgm").unlink()
+    assert terrain.elevation(41.5, 44.5) is not None, "served from the cache"
+    assert terrain.cached == ["N41E044"]
+
+    assert terrain.elevation(42.5, 44.5) is not None
+    assert terrain.cached == ["N42E044"]
+    with pytest.raises(TerrainFileError, match="N41E044"):
+        terrain.elevation(41.5, 44.5)
+
+
+def test_with_room_for_both_the_first_tile_is_still_held(tmp_path: Path) -> None:
+    install(tmp_path, TWO_CELLS, TWO_TILES)
+    terrain = Terrain(tmp_path, max_tiles=2)
+    assert terrain.elevation(41.5, 44.5) is not None
+    (tmp_path / "N41E044.pgm").unlink()
+    assert terrain.elevation(42.5, 44.5) is not None
+    assert terrain.cached == ["N41E044", "N42E044"]
+    assert terrain.elevation(41.5, 44.5) is not None
+    assert terrain.cached == ["N42E044", "N41E044"], "most recently used last"
+
+
+def test_a_cache_with_no_room_is_refused(tmp_path: Path) -> None:
+    install(tmp_path, {}, {})
+    with pytest.raises(ValueError, match="max_tiles"):
+        Terrain(tmp_path, max_tiles=0)
+
+
+def test_load_reads_the_tile_so_elevation_need_not(tmp_path: Path) -> None:
+    terrain = install(
+        tmp_path, {**TWO_CELLS, "N42E039": SEA}, {"N41E044": tile_bytes()}
+    )
+    # Unknown and sea cells need no tile: loaded already, and load is a no-op.
+    assert terrain.is_loaded(0.5, 0.5) and terrain.is_loaded(42.5, 39.5)
+    terrain.load(0.5, 0.5)
+    terrain.load(42.5, 39.5)
+    assert terrain.cached == []
+
+    assert not terrain.is_loaded(41.5, 44.5)
+    terrain.load(41.5, 44.5)
+    assert terrain.is_loaded(41.5, 44.5) and terrain.cached == ["N41E044"]
+    (tmp_path / "N41E044.pgm").unlink()
+    assert terrain.elevation(41.5, 44.5) is not None
+
+    with pytest.raises(TerrainFileError, match="index lists N42E044"):
+        terrain.load(42.5, 44.5)
+
+
 def test_a_non_finite_position_is_refused(tmp_path: Path) -> None:
     terrain = install(tmp_path, {}, {})
 

@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import json
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -128,13 +130,25 @@ class TerrainTile:
 
 @dataclass
 class Terrain:
-    """The tiles in one directory, read when first needed and then kept."""
+    """The tiles in one directory, read when first needed and kept, up to
+    `max_tiles` of them (least recently used out first; each is about 26 MB).
+
+    Reading a tile is synchronous. A service on an event loop calls `load`
+    through `asyncio.to_thread` before it asks `elevation` on the loop, and
+    `is_loaded` says whether it needs to; both are safe from any thread.
+    """
 
     directory: Path
+    max_tiles: int = 8
     index: dict[str, str] = field(init=False)
-    _tiles: dict[str, TerrainTile] = field(default_factory=dict, init=False)
+    _tiles: OrderedDict[str, TerrainTile] = field(
+        default_factory=OrderedDict, init=False
+    )
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def __post_init__(self) -> None:
+        if self.max_tiles < 1:
+            raise ValueError("max_tiles must be at least 1")
         path = self.directory / "index.json"
         try:
             index = json.loads(path.read_text(encoding="utf-8"))
@@ -164,13 +178,51 @@ class Terrain:
             elevation_m=value, dataset=tile.dataset, spacing_m=tile.spacing_m
         )
 
+    @property
+    def cached(self) -> list[str]:
+        """Cell names held in memory, least recently used first."""
+        with self._lock:
+            return list(self._tiles)
+
+    def _needs_tile(self, lat_deg: float, lon_deg: float) -> str | None:
+        """The cell's name if answering there means reading a tile; None for
+        a cell that is unknown or sea."""
+        name = cell_name(lat_deg, lon_deg)
+        dataset = self.index.get(name)
+        return None if dataset is None or dataset == SEA else name
+
+    def is_loaded(self, lat_deg: float, lon_deg: float) -> bool:
+        """Whether `elevation` here would answer without reading a file."""
+        name = self._needs_tile(lat_deg, lon_deg)
+        if name is None:
+            return True
+        with self._lock:
+            return name in self._tiles
+
+    def load(self, lat_deg: float, lon_deg: float) -> None:
+        """Read the tile under the position into the cache, if there is one.
+        Blocking: meant for a worker thread. Raises `TerrainFileError` as
+        `elevation` would."""
+        name = self._needs_tile(lat_deg, lon_deg)
+        if name is not None:
+            self._tile(name)
+
     def _tile(self, name: str) -> TerrainTile:
-        if name not in self._tiles:
+        # One lock around lookup and read: two threads asking for the same
+        # tile read it once, and the cache never exceeds `max_tiles`.
+        with self._lock:
+            tile = self._tiles.get(name)
+            if tile is not None:
+                self._tiles.move_to_end(name)
+                return tile
             path = self.directory / f"{name}.pgm"
             try:
-                self._tiles[name] = TerrainTile.parse(path.read_bytes())
+                tile = TerrainTile.parse(path.read_bytes())
             except OSError as error:
                 raise TerrainFileError(
                     f"index lists {name} but {path}: {error}"
                 ) from error
-        return self._tiles[name]
+            self._tiles[name] = tile
+            while len(self._tiles) > self.max_tiles:
+                self._tiles.popitem(last=False)
+            return tile

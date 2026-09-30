@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
@@ -14,6 +15,7 @@ import pytest
 from airspace.cpa import SeparationPolicy, local_offset_m
 from airspace.monitor import AirspaceMonitor, Alert, ClearReason
 from airspace.service import AirspaceService, run_ticker
+from common.terrain import TerrainFileError, cell_name
 
 A = UUID(int=1)
 B = UUID(int=2)
@@ -241,6 +243,62 @@ async def test_an_overflowing_audit_queue_is_counted_and_logged(
     await asyncio.wait_for(svc.flush_audit(), timeout=5.0)
     assert len(audit.rows) + svc.audit_overflow == 3
     await svc.close()
+
+
+class RecordingTiles:
+    """A tile cache that notes which thread each read ran on."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.loaded: set[str] = set()
+        self.load_threads: list[str] = []
+        self.fail = fail
+
+    def is_loaded(self, lat_deg: float, lon_deg: float) -> bool:
+        return cell_name(lat_deg, lon_deg) in self.loaded
+
+    def load(self, lat_deg: float, lon_deg: float) -> None:
+        self.load_threads.append(threading.current_thread().name)
+        if self.fail:
+            raise TerrainFileError("index lists N41E044 but N41E044.pgm: missing")
+        self.loaded.add(cell_name(lat_deg, lon_deg))
+
+
+async def test_the_terrain_tile_is_read_once_off_the_loop_before_observing() -> None:
+    """S-13. The first message over a cell reads its tile in a worker
+    thread; later ones over the same cell read nothing."""
+    tiles = RecordingTiles()
+    bus = RecordingBus()
+    svc, _ = service(bus)
+    svc.tiles = tiles
+
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    await svc.on_telemetry(payload(A, 10, 10, at_s=1.0))
+
+    assert len(tiles.load_threads) == 1
+    assert tiles.load_threads[0] != threading.main_thread().name
+    assert tiles.loaded == {cell_name(LAT0, LON0)}
+    assert len(bus.sent) == 1
+
+
+async def test_a_tile_that_cannot_be_read_is_logged_and_the_message_still_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tiles = RecordingTiles(fail=True)
+    bus = RecordingBus()
+    svc, _ = service(bus)
+    svc.tiles = tiles
+
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+
+    assert len(tiles.load_threads) == 2, "tried again: nothing was cached"
+    failures: list[Any] = [
+        r for r in caplog.records if r.getMessage() == "could not load the terrain tile"
+    ]
+    assert [r.drone_id for r in failures] == [str(A), str(B)]
+    assert all(r.exc_info for r in failures)
+    assert len(bus.sent) == 1
 
 
 async def test_close_writes_what_is_queued() -> None:

@@ -36,7 +36,11 @@ async def run(settings: AirspaceSettings) -> None:
     engine = create_async_engine(str(settings.database_url))
     policy = await load_policy(engine)
     max_height_agl_m = await load_height_limit(engine)
-    terrain = None if settings.terrain_dir is None else Terrain(settings.terrain_dir)
+    terrain = (
+        None
+        if settings.terrain_dir is None
+        else Terrain(settings.terrain_dir, max_tiles=settings.terrain_cache_tiles)
+    )
     if max_height_agl_m is not None and terrain is None:
         _log.warning(
             "a height limit is set but TERRAIN_DIR is not; the limit will not "
@@ -57,6 +61,7 @@ async def run(settings: AirspaceSettings) -> None:
         bus=bus,
         audit=EventsAuditLog(engine),
         audit_queue_size=settings.audit_queue_size,
+        tiles=terrain,
     )
     _log.info(
         "airspace monitor running",

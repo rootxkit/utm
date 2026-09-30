@@ -21,6 +21,13 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     # P5-19. The same tiles the API serves (P5-00). Unset: the height limit
     # in airspace_policy is not evaluated, and the service says so.
     terrain_dir: Path | None = Field(default=None, validation_alias="TERRAIN_DIR")
+    # S-13. Terrain tiles held in memory, least recently used out. A tile is
+    # a 1 x 1 degree cell of about 26 MB, so 8 is about 210 MB: an operating
+    # area and every cell around it, bounded below what a small container
+    # allows, where the old unbounded cache grew with every cell ever flown.
+    terrain_cache_tiles: int = Field(
+        default=8, ge=1, validation_alias="TERRAIN_CACHE_TILES"
+    )
     # S-11. A telemetry message whose capture time (`ts`) is further than
     # this from the monitor's clock is not live: a backlog replayed after an
     # outage, or a ground station with a wrong clock (relay-v1 §9). It is

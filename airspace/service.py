@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -41,6 +42,13 @@ ACTOR_TYPE = "airspace"
 
 class Bus(Protocol):
     async def publish(self, subject: str, payload: bytes) -> None: ...
+
+
+class TerrainTiles(Protocol):
+    """`common.terrain.Terrain`'s tile cache, as the service warms it."""
+
+    def is_loaded(self, lat_deg: float, lon_deg: float) -> bool: ...
+    def load(self, lat_deg: float, lon_deg: float) -> None: ...
 
 
 class AuditLog(Protocol):
@@ -112,6 +120,11 @@ class AirspaceService:
     # current. A full queue drops the row, counted and logged, never
     # silently. The default matches `airspace.config.AirspaceSettings`.
     audit_queue_size: int = 1000
+    # S-13. The monitor's terrain, so the tile under a message can be read
+    # in a worker thread before `observe` asks for it on the loop: a tile is
+    # about 26 MB, and the old synchronous read stalled every message behind
+    # it. Once cached, `observe` answers from memory.
+    tiles: TerrainTiles | None = None
     audit_overflow: int = field(default=0, init=False)
     _audit_queue: asyncio.Queue[AuditEntry] = field(init=False)
     _audit_writer: asyncio.Task[None] | None = field(default=None, init=False)
@@ -141,11 +154,34 @@ class AirspaceService:
     async def on_telemetry(self, payload: bytes) -> None:
         try:
             message: dict[str, Any] = json.loads(payload)
+            position = _position(message)
+            if position is not None and self.tiles is not None:
+                await self._load_tile(message, *position)
             change = self.monitor.observe(message, now_s=self.clock())
         except (ValueError, KeyError, TypeError) as error:
             _log.warning("unusable telemetry message", extra={"error": repr(error)})
             return
         await self._emit(change)
+
+    async def _load_tile(
+        self, message: dict[str, Any], lat_deg: float, lon_deg: float
+    ) -> None:
+        assert self.tiles is not None
+        if self.tiles.is_loaded(lat_deg, lon_deg):
+            return
+        try:
+            await asyncio.to_thread(self.tiles.load, lat_deg, lon_deg)
+        except Exception:
+            # The monitor's height check will meet the same error and log
+            # it (S-12); this says the read was attempted off the loop.
+            _log.exception(
+                "could not load the terrain tile",
+                extra={
+                    "drone_id": str(message.get("drone_id")),
+                    "lat_deg": lat_deg,
+                    "lon_deg": lon_deg,
+                },
+            )
 
     async def on_tick(self) -> None:
         await self._emit(self.monitor.tick(now_s=self.clock()))
@@ -219,6 +255,18 @@ class AirspaceService:
                 await _guard("audit", self.audit.record(alert, state, reason=reason))
             finally:
                 self._audit_queue.task_done()
+
+
+def _position(message: dict[str, Any]) -> tuple[float, float] | None:
+    """The message's position, or None when it has none or it is not finite
+    (the monitor refuses that one itself, S-12)."""
+    lat, lon = message.get("lat_deg"), message.get("lon_deg")
+    if lat is None or lon is None:
+        return None
+    lat_deg, lon_deg = float(lat), float(lon)
+    if not (math.isfinite(lat_deg) and math.isfinite(lon_deg)):
+        return None
+    return lat_deg, lon_deg
 
 
 async def run_ticker(
