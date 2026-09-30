@@ -412,3 +412,136 @@ def test_the_two_drop_counters_are_independent(queue_path: Path) -> None:
 
         assert queue.dropped_intake_total == 7
         assert queue.dropped_cap_total == 3
+
+
+# --- storage failures (S-02) ------------------------------------------------
+
+
+def fill_disk(queue: DurableQueue) -> None:
+    """Make SQLite refuse to grow, which it reports as a genuine SQLITE_FULL."""
+    pages = queue._connection.execute("PRAGMA page_count").fetchone()[0]
+    queue._connection.execute(f"PRAGMA max_page_count = {pages}")
+
+
+def free_disk(queue: DurableQueue) -> None:
+    queue._connection.execute("PRAGMA max_page_count = 1073741823")
+
+
+class _FailingCommits:
+    """A connection whose commit fails, as an fsync on a dying disk would."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.failing = True
+
+    def commit(self) -> None:
+        if self.failing:
+            raise sqlite3.OperationalError("disk I/O error")
+        self._connection.commit()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def test_a_failed_append_raises_and_leaves_the_accounting_untouched(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        depth, total_bytes, next_seq = queue.depth, queue.total_bytes, queue.next_seq
+        fill_disk(queue)
+
+        with pytest.raises(sqlite3.OperationalError, match="full"):
+            queue.append(datagrams(50, size=3000))
+
+        assert (queue.depth, queue.total_bytes, queue.next_seq) == (
+            depth,
+            total_bytes,
+            next_seq,
+        )
+        assert [r.seq for r in queue.read_from(0, max_bytes=1 << 20)] == list(range(5))
+
+
+def test_a_failed_append_can_be_retried_with_the_same_sequence_numbers(
+    queue_path: Path,
+) -> None:
+    """The writer holds a failed batch and offers it again (S-02)."""
+    batch = datagrams(50, size=3000)
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        fill_disk(queue)
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(batch)
+
+        free_disk(queue)
+        records = queue.append(batch)
+
+        assert [r.seq for r in records] == list(range(5, 55))
+        assert queue.depth == 55
+        assert queue.total_bytes == sum(
+            r.encoded_size for r in queue.read_from(0, max_bytes=1 << 30)
+        )
+
+
+def test_a_failed_acknowledge_keeps_the_records_and_their_accounting(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(10))
+        total_bytes = queue.total_bytes
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.acknowledge(4)
+
+        assert (queue.depth, queue.total_bytes) == (10, total_bytes)
+        failing.failing = False
+        assert queue.read_from(0, max_bytes=1 << 20)[0].seq == 0
+
+
+def test_intake_drops_are_counted_even_when_the_disk_refuses_them(
+    queue_path: Path,
+) -> None:
+    """A failing disk must not hide the loss it causes (S-02)."""
+    with DurableQueue(queue_path) as queue:
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.record_intake_drops(4)
+        queue.count_intake_drops(3)
+
+        assert queue.dropped_intake_total == 7
+
+        # The next commit that succeeds persists the total, once.
+        failing.failing = False
+        queue.append(datagrams(1))
+        assert queue.dropped_intake_total == 7
+
+    with DurableQueue(queue_path) as reopened:
+        assert reopened.dropped_intake_total == 7
+
+
+def test_an_append_whose_commit_fails_is_rolled_back_and_retryable(
+    queue_path: Path,
+) -> None:
+    """The insert succeeded, the fsync did not: nothing may count as stored."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        total_bytes = queue.total_bytes
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+
+        assert (queue.depth, queue.total_bytes) == (5, total_bytes)
+        failing.failing = False
+        assert [r.seq for r in queue.append(datagrams(3))] == [5, 6, 7]
+
+    with DurableQueue(queue_path) as reopened:
+        assert reopened.depth == 8
+        assert [r.seq for r in reopened.read_from(0, max_bytes=1 << 20)] == list(
+            range(8)
+        )

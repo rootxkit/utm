@@ -18,6 +18,7 @@ surfaced as a `gap`.
 
 from __future__ import annotations
 
+import contextlib
 import secrets
 import sqlite3
 import threading
@@ -95,6 +96,11 @@ class DurableQueue:
         ).fetchone()
         self._depth: int = row[0]
         self._total_bytes: int = row[1]
+        # Held in memory and written through, rather than read back from the
+        # database. A drop is counted the moment it is reported even when the
+        # disk refuses the write, so a failing disk cannot hide the loss it is
+        # causing; the next commit that succeeds persists the total.
+        self._dropped_intake: int = self._get_int(_DROPPED_INTAKE)
 
     # --- metadata ---------------------------------------------------------
 
@@ -178,8 +184,9 @@ class DurableQueue:
 
     @property
     def dropped_intake_total(self) -> int:
+        """Intake drops reported so far, including any not yet on disk."""
         with self._lock:
-            return self._get_int(_DROPPED_INTAKE)
+            return self._dropped_intake
 
     @property
     def dropped_cap_total(self) -> int:
@@ -193,12 +200,33 @@ class DurableQueue:
 
         These cannot appear as a `gap` — the sequence remains contiguous across
         them — so the count is all the Gateway gets (relay-v1 §11).
+
+        The count is taken in memory before the write is attempted, so
+        `dropped_intake_total` includes it even if this raises. What is written
+        is the absolute total, which makes a later retry, or any later commit,
+        idempotent rather than a second increment.
         """
         if count <= 0:
             return
         with self._lock:
-            self._set_int(_DROPPED_INTAKE, self._get_int(_DROPPED_INTAKE) + count)
-            self._connection.commit()
+            self._dropped_intake += count
+            try:
+                self._set_int(_DROPPED_INTAKE, self._dropped_intake)
+                self._connection.commit()
+            except sqlite3.Error:
+                self._rollback_locked()
+                raise
+
+    def count_intake_drops(self, count: int) -> None:
+        """Count intake drops in memory only, without touching the disk.
+
+        For use while the disk is refusing writes: the total is reported at
+        once and persisted by the next commit that succeeds.
+        """
+        if count <= 0:
+            return
+        with self._lock:
+            self._dropped_intake += count
 
     def append(self, datagrams: Sequence[tuple[int, bytes]]) -> list[Record]:
         """Assign sequence numbers to (recv_utc_ns, datagram) pairs and store them.
@@ -206,28 +234,50 @@ class DurableQueue:
         Returns the stored records. Enforces the size cap afterwards, dropping
         oldest first; intake is never blocked, because blocking would discard
         live telemetry to preserve old telemetry.
+
+        All or nothing: if the write fails the transaction is rolled back, the
+        in-memory accounting is restored and the error propagates, so the same
+        datagrams can be offered again and receive the same sequence numbers.
         """
         if not datagrams:
             return []
 
         with self._lock:
-            seq = self._get_int(_NEXT_SEQ)
-            records = [
-                Record(seq=seq + offset, recv_utc_ns=recv_utc_ns, datagram=datagram)
-                for offset, (recv_utc_ns, datagram) in enumerate(datagrams)
-            ]
-            self._connection.executemany(
-                "INSERT INTO records (seq, recv_utc_ns, datagram, nbytes) "
-                "VALUES (?, ?, ?, ?)",
-                [(r.seq, r.recv_utc_ns, r.datagram, r.encoded_size) for r in records],
-            )
-            self._set_int(_NEXT_SEQ, seq + len(records))
-            self._depth += len(records)
-            self._total_bytes += sum(r.encoded_size for r in records)
-            self._enforce_cap_locked()
-            self._connection.commit()
+            depth, total_bytes = self._depth, self._total_bytes
+            try:
+                seq = self._get_int(_NEXT_SEQ)
+                records = [
+                    Record(seq=seq + offset, recv_utc_ns=recv_utc_ns, datagram=datagram)
+                    for offset, (recv_utc_ns, datagram) in enumerate(datagrams)
+                ]
+                self._connection.executemany(
+                    "INSERT INTO records (seq, recv_utc_ns, datagram, nbytes) "
+                    "VALUES (?, ?, ?, ?)",
+                    [
+                        (r.seq, r.recv_utc_ns, r.datagram, r.encoded_size)
+                        for r in records
+                    ],
+                )
+                self._set_int(_NEXT_SEQ, seq + len(records))
+                # Carries any intake drops whose own write failed.
+                self._set_int(_DROPPED_INTAKE, self._dropped_intake)
+                self._depth += len(records)
+                self._total_bytes += sum(r.encoded_size for r in records)
+                self._enforce_cap_locked()
+                self._connection.commit()
+            except sqlite3.Error:
+                self._depth, self._total_bytes = depth, total_bytes
+                self._rollback_locked()
+                raise
 
         return records
+
+    def _rollback_locked(self) -> None:
+        # A failed commit can leave the transaction open, and the next
+        # statement would silently join it. If the rollback fails too there is
+        # nothing better to do than let the original error speak.
+        with contextlib.suppress(sqlite3.Error):
+            self._connection.rollback()
 
     def _enforce_cap_locked(self) -> None:
         if self._total_bytes <= self._max_bytes:
@@ -295,16 +345,25 @@ class DurableQueue:
         already passed is harmless and deletes nothing.
         """
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM records WHERE seq <= ?",
-                (seq,),
-            ).fetchone()
-            count, freed = int(rows[0]), int(rows[1])
-            if count:
-                self._connection.execute("DELETE FROM records WHERE seq <= ?", (seq,))
-                self._depth -= count
-                self._total_bytes -= freed
-            self._connection.commit()
+            try:
+                rows = self._connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM records "
+                    "WHERE seq <= ?",
+                    (seq,),
+                ).fetchone()
+                count, freed = int(rows[0]), int(rows[1])
+                if count:
+                    self._connection.execute(
+                        "DELETE FROM records WHERE seq <= ?", (seq,)
+                    )
+                self._connection.commit()
+            except sqlite3.Error:
+                self._rollback_locked()
+                raise
+            # Only once the delete is durable, or the cap would be enforced
+            # against records that are still on disk.
+            self._depth -= count
+            self._total_bytes -= freed
         return count
 
     def close(self) -> None:
