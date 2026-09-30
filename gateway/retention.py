@@ -503,18 +503,21 @@ class ArchiveRetention:
         The reverse leaves a file nothing points at, which nothing will ever
         clean up.
         """
-        existed = (self.archive.root / segment.relative_path).exists()
-        freed = self.archive.delete_segment(segment.relative_path)
+        # Under the station lock, so the unlink cannot race an append to
+        # the same hour file from a session of this station.
+        async with self.archive.station_lock(segment.station_id):
+            existed = (self.archive.root / segment.relative_path).exists()
+            freed = self.archive.delete_segment(segment.relative_path)
 
-        try:
-            async with self.engine.begin() as connection:
-                await connection.execute(
-                    sa.update(_segments)
-                    .where(_segments.c.id == segment.id)
-                    .values(deleted_at=sa.func.now(), deleted_reason=reason)
-                )
-        except SQLAlchemyError as error:
-            raise StoreError(f"could not mark segment deleted: {error}") from error
+            try:
+                async with self.engine.begin() as connection:
+                    await connection.execute(
+                        sa.update(_segments)
+                        .where(_segments.c.id == segment.id)
+                        .values(deleted_at=sa.func.now(), deleted_reason=reason)
+                    )
+            except SQLAlchemyError as error:
+                raise StoreError(f"could not mark segment deleted: {error}") from error
 
         await self._record_event(
             segment.station_id,

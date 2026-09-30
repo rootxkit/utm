@@ -13,8 +13,10 @@ epoch of the wrong shape. A fake would agree with whatever the code did.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -575,3 +577,49 @@ async def test_the_store_reports_only_the_new_records(
     assert resent.stored == []
     assert resent.watermark == 49
     assert [record.seq for record in overlapping.stored] == list(range(50, 70))
+
+
+# --- two sessions of one station cannot interleave a segment (S-05) --------
+
+
+class SlowArchive(RawArchive):
+    """Widens the window in which a second append could start."""
+
+    def append(
+        self, station_id: str, epoch: str, records: list[Record]
+    ) -> list[SegmentWrite]:
+        time.sleep(0.05)
+        return super().append(station_id, epoch, records)
+
+
+async def test_concurrent_stores_for_one_station_do_not_interleave_the_segment(
+    engine: AsyncEngine, archive_root: Path, station: str
+) -> None:
+    """relay-v1 §10: an old socket still draining buffered batches while the
+    relay has reconnected and is resending the same range. With the append
+    on a worker thread nothing serialised the two writes, so both read the
+    same watermark, both appended, and the hour file interleaved."""
+    store = TimescaleIngestStore(engine=engine, archive=SlowArchive(root=archive_root))
+
+    results = await asyncio.gather(
+        store.store_records(station, EPOCH, records(0, 50)),
+        store.store_records(station, EPOCH, records(0, 50)),
+        store.store_records(station, EPOCH, records(30, 30)),
+    )
+
+    # Every record readable exactly once, and the index agrees.
+    stored = store.archive.read_segment(_only_segment_path(store, station))
+    assert [record.seq for record in stored] == list(range(60))
+    assert await store.resume_from_seq(station, EPOCH) == 60
+    # The three calls between them stored each record once.
+    stored_seqs = sorted(record.seq for result in results for record in result.stored)
+    assert stored_seqs == list(range(60))
+    async with engine.connect() as connection:
+        total = await connection.scalar(
+            sa.text(
+                "SELECT sum(record_count) FROM archive_segments "
+                "WHERE station_id = :s AND epoch = :e"
+            ),
+            {"s": station, "e": EPOCH},
+        )
+    assert total == 60

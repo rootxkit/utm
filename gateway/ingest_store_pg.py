@@ -143,7 +143,18 @@ class TimescaleIngestStore:
         watermark commits. The reverse order would let a crash between the two
         leave the Gateway believing it holds records that are not there, and it
         would already have acknowledged them.
+
+        One station at a time, under the archive's station lock: two sessions
+        of one station may store concurrently (a half-open socket draining
+        while its replacement resends), and without the lock both read the
+        same watermark, both append, and the hour file interleaves.
         """
+        async with self.archive.station_lock(station_id):
+            return await self._store_records_locked(station_id, epoch, records)
+
+    async def _store_records_locked(
+        self, station_id: str, epoch: str, records: list[Record]
+    ) -> StoredBatch:
         await self._ensure_epoch(station_id, epoch)
         watermark = await self._watermark(station_id, epoch)
 
@@ -181,6 +192,10 @@ class TimescaleIngestStore:
 
     async def record_gap(self, station_id: str, epoch: str, gap: Gap) -> None:
         """protocol §11. Permanent, and it advances the resume point."""
+        async with self.archive.station_lock(station_id):
+            await self._record_gap_locked(station_id, epoch, gap)
+
+    async def _record_gap_locked(self, station_id: str, epoch: str, gap: Gap) -> None:
         await self._ensure_epoch(station_id, epoch)
         try:
             async with self.engine.begin() as connection:
