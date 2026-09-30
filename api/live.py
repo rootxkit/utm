@@ -16,7 +16,10 @@ from uuid import UUID
 
 import redis.asyncio
 
+from common import get_logger
 from gateway.live_state import read_live_state, state_key
+
+_log = get_logger(__name__)
 
 
 @dataclass
@@ -42,8 +45,28 @@ class RedisLiveState:
             held: list[bytes | None] = await pipe.execute()
         found: dict[UUID, dict[str, Any] | None] = {}
         for drone_id, state in zip(drone_ids, held, strict=True):
-            decoded: dict[str, Any] | None = (
-                None if state is None else json.loads(state)
-            )
-            found[drone_id] = decoded
+            found[drone_id] = _decode(drone_id, state)
         return found
+
+
+def _decode(drone_id: UUID, state: bytes | None) -> dict[str, Any] | None:
+    """One drone's state. A value that is not a JSON object makes that one
+    drone unknown - reported OFFLINE, as an unreadable state is elsewhere -
+    rather than failing the whole fleet's list."""
+    if state is None:
+        return None
+    try:
+        decoded = json.loads(state)
+    except ValueError as error:
+        _log.warning(
+            "unreadable live state",
+            extra={"drone_id": str(drone_id), "error": str(error)},
+        )
+        return None
+    if not isinstance(decoded, dict):
+        _log.warning(
+            "live state is not an object",
+            extra={"drone_id": str(drone_id), "type": type(decoded).__name__},
+        )
+        return None
+    return decoded

@@ -73,5 +73,21 @@ async def test_a_batch_reads_what_one_at_a_time_reads(
     assert batch[silent] is None
 
 
+@pytest.mark.parametrize("garbage", [b"{not json", b"[1, 2]", b"\xff\xfe"])
+async def test_one_unreadable_state_makes_only_that_drone_unknown(
+    client: Any, drones: list[UUID], garbage: bytes
+) -> None:
+    good, bad, _ = drones
+    writer = LiveState(redis=client, link_timeout_s=30.0, clock=time.time)
+    assert await writer.update([row(good, armed=True)]) == {good: 1}
+    await client.hset(state_key(bad), "state", garbage)
+
+    batch = await RedisLiveState(client).get_many(drones)
+
+    good_state = batch[good]
+    assert good_state is not None and good_state["armed"] is True
+    assert batch[bad] is None
+
+
 async def test_an_empty_fleet_asks_nothing(client: Any) -> None:
     assert await RedisLiveState(client).get_many([]) == {}
