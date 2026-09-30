@@ -47,6 +47,61 @@ python tools/remote_id_sim.py --start-lat <lat> --start-lon <lon> \
     --geoid local/geoid/egm2008-2_5.pgm
 ```
 
+## SITL aircraft as Remote ID (U-16)
+
+`tools/sitl_remote_id.py` makes the SITL vehicles of `make sim` broadcast
+Remote ID. For each vehicle it plays the aircraft's Remote ID module and a
+ground receiver: it reads the vehicle's MAVLink, never writing to it, and
+sends the Open Drone ID messages a module would broadcast. These are Basic
+ID with a serial, Location, System with the take-off point as the operator
+location, and Operator ID. They go to the ingest as signed receiver
+datagrams.
+
+```
+python -m tools.remote_id_keys new sitl-rx-1 --file local/remote-id-receivers.keys
+make sitl-rid N=3            # SYSID 1..3, serials SITLRID0001..0003
+```
+
+The ingest must have the same key file (`REMOTE_ID_RECEIVER_KEYS`) and the
+same geoid (`GEOID_PATH`) as the bridge. `make sitl-rid` runs:
+
+```
+python -m tools.sitl_remote_id --count 3 --serial 'SITLRID{sysid:04d}' \
+    --operator-id GEO-OP-SITL --receiver-id sitl-rx-1 \
+    --key-file local/remote-id-receivers.keys --geoid local/geoid/egm2008-2_5.pgm
+```
+
+- **One vehicle:** use `--sysid 3 --serial <its serial>` instead of
+  `--count`. For SITL to show as one of our aircraft (P1-15 matching),
+  register that serial.
+- **Ports:** MAVLink is read from UDP 14560+i (`udpin`), or with
+  `--link tcp` from TCP 5760+10i. That UDP port has one reader, so the
+  Gateway cannot read the same vehicle on it at the same time. For a vehicle
+  on both sources, the bridge can read another stream instead:
+  `--mavlink udpin:127.0.0.1:14550` reads QGC's fan-out, which carries every
+  vehicle, and each vehicle takes its own SYSID from it. Under `make sim`
+  the TCP port is already held by that instance's MAVProxy.
+- **Heights:** the broadcast is HAE: the vehicle's AMSL altitude plus the
+  `--geoid` undulation, which the ingest subtracts again. Pressure altitude
+  (standard atmosphere, from `SCALED_PRESSURE`) and height over take-off are
+  also sent. `--hae-source gps` uses the GPS's own `alt_ellipsoid` instead.
+  That is not for SITL: SITL reports `alt_ellipsoid` equal to `alt`, so the
+  ingest would put the aircraft 15 to 23 m low.
+- **Time:** the Location timestamp is the vehicle's own clock (its
+  `time_boot_ms`, put on UTC by `SYSTEM_TIME`), in tenths of a second after
+  the hour. Until the vehicle has sent `SYSTEM_TIME` the timestamp is sent
+  as unknown and no System message goes out. The ingest does not use the
+  timestamp yet (`ts` is arrival time).
+- **Rates:** Location every `--location-period-s` (1 s). Basic ID, System
+  and Operator ID every `--static-period-s` (3 s), sent as one message pack
+  (`--transport pack`) or one message per datagram, as Bluetooth 4 does
+  (`--transport single`). `--config file.toml` sets any flag by its name,
+  e.g. `static_period_s = 3.0`.
+- **Faults:** `--drop-rate 0.2` drops a fifth of the datagrams (`--seed`
+  for a repeatable run). `--delay-s 2` delivers each datagram two seconds
+  late, signed when it is sent. `--spoof-serial <serial>` broadcasts
+  someone else's serial number (U-02).
+
 ## Signed receivers
 
 A receiver outside this host must prove who it is. Make it a key:
@@ -139,6 +194,28 @@ they declared themselves airborne.
   - `authenticated: false`;
   - 700.0 m AMSL, through EGM2008;
   - battery, mode and armed all empty, never zero.
+
+## Verified 2026-10-01: SITL as Remote ID (U-16)
+
+Three SITL vehicles were running (SYSID 1 and 2 hovering 80 m above home,
+3 on the ground). The ingest ran with a receiver key, and the bridge sent
+signed datagrams. Every position was compared with the same vehicle's
+`GLOBAL_POSITION_INT`, read from QGC's fan-out.
+
+- **SYSID 3 alone, 60 s:** 60 observations on `telemetry.*`, none refused.
+  - Latitude and longitude identical (0.000 m apart).
+  - AMSL within 0.05 m.
+  - Height over take-off within 0.04 m.
+  - Speed within 0.02 m/s.
+- **The three at once (`make sitl-rid N=3`'s command), 40 s:** 40
+  observations each, with the same agreement.
+  - SYSID 1 and 2: airborne at 685.1 m AMSL and 80.0 m over take-off.
+  - SYSID 3: on the ground.
+- **Faults:** one message per datagram with 30% dropped. 24 datagrams were
+  sent, 17 were dropped, and 14 observations were stored.
+- **What this does not check:** the real geoid model. It is not installed on
+  the laptop, so both processes used a flat 15.9 m grid. The HAE to AMSL
+  round trip is checked; EGM2008 itself is not.
 
 ## Our own aircraft broadcasting
 
