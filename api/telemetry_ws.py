@@ -108,9 +108,17 @@ def normalise_origin(origin: str) -> str:
 
 
 def origin_allowed(
-    origin: str | None, host: str | None, allowed: frozenset[str]
+    origin: str | None,
+    host: str | None,
+    allowed: frozenset[str],
+    *,
+    feed_secure: bool = False,
 ) -> bool:
     """May a page from `origin` open the feed served as `host`? S-16.
+
+    `feed_secure` is whether the feed was reached over TLS (`wss`), as
+    uvicorn reports it: behind the TLS front that is the front's
+    `X-Forwarded-Proto`, honoured for a trusted proxy (`FORWARDED_ALLOW_IPS`).
 
     A browser always sends `Origin` on a WebSocket handshake, and a page on
     another site can open one to any address, carrying this site's cookies
@@ -123,16 +131,29 @@ def origin_allowed(
       compared: behind the TLS front the page and the feed share one origin,
       but in development the API serves its pages on one port and the feed
       listens on another, and cookies - the ticket included - are shared
-      across ports on a host anyway.
+      across ports on a host anyway. The scheme is compared: a feed served
+      over TLS refuses a page served without it (`http` on the same host
+      is anyone who can sit on the path), and a plain `ws` feed, as in
+      development, takes `http` pages. Any other scheme is refused.
+    - an origin that does not parse is refused, never an error.
     """
     if origin is None:
         return True
     normalised = normalise_origin(origin)
     if normalised in allowed:
         return True
-    page_host = urlsplit(normalised).hostname
-    feed_host = urlsplit(f"//{host}").hostname if host else None
-    return page_host is not None and page_host == feed_host
+    try:
+        page = urlsplit(normalised)
+        page_host = page.hostname
+        feed_host = urlsplit(f"//{host}").hostname if host else None
+    except ValueError:
+        # e.g. `https://[evil`: an unclosed IPv6 bracket.
+        return False
+    # A plain feed also takes an `https` page: that is a TLS front whose
+    # `X-Forwarded-Proto` is not trusted, and refusing it would take the
+    # console down over a setting rather than protect anything.
+    schemes = {"https"} if feed_secure else {"http", "https"}
+    return page.scheme in schemes and page_host is not None and page_host == feed_host
 
 
 @dataclass
@@ -294,7 +315,12 @@ def create_app(
     @app.websocket("/ws/telemetry")
     async def telemetry(websocket: WebSocket) -> None:
         origin = websocket.headers.get("origin")
-        if not origin_allowed(origin, websocket.headers.get("host"), allowed):
+        if not origin_allowed(
+            origin,
+            websocket.headers.get("host"),
+            allowed,
+            feed_secure=websocket.url.scheme == "wss",
+        ):
             # Refused at the handshake (HTTP 403): a page from another site
             # has no business reading a close code from this feed.
             _log.warning("console feed refused an origin", extra={"origin": origin})

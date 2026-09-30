@@ -171,6 +171,54 @@ def test_origin_allowed(
     assert origin_allowed(origin, host, frozenset(allowed)) is expected
 
 
+@pytest.mark.parametrize(
+    ("origin", "feed_secure", "expected"),
+    [
+        ("https://ops.example.ge", True, True),
+        ("http://ops.example.ge", True, False),
+        ("http://ops.example.ge", False, True),
+        ("https://ops.example.ge", False, True),
+        ("ftp://ops.example.ge", False, False),
+    ],
+)
+def test_a_tls_feed_refuses_a_page_served_without_tls(
+    origin: str, feed_secure: bool, expected: bool
+) -> None:
+    assert (
+        origin_allowed(origin, "ops.example.ge", frozenset(), feed_secure=feed_secure)
+        is expected
+    )
+
+
+@pytest.mark.parametrize("origin", ["https://[evil", "http://[::1", "http://a]b"])
+def test_an_origin_that_does_not_parse_is_refused_not_raised(origin: str) -> None:
+    assert origin_allowed(origin, "127.0.0.1:8000", frozenset()) is False
+
+
+async def test_behind_a_tls_front_an_http_page_is_refused_and_https_is_not() -> None:
+    """Over the socket: the front says TLS with `X-Forwarded-Proto`, which
+    uvicorn honours from 127.0.0.1 (its default trusted peer)."""
+    front = {**cookie(ticket(1000.0)), "X-Forwarded-Proto": "https"}
+    async with serving(Clock(1000.0)) as (app, url):
+        with pytest.raises(InvalidStatus) as refused:
+            async with connect(
+                url, origin=Origin("http://127.0.0.1"), additional_headers=front
+            ):
+                pass
+        assert refused.value.response.status_code == 403
+
+        async with connect(
+            url, origin=Origin("https://127.0.0.1"), additional_headers=front
+        ):
+            await wait_until_attached(app)
+
+
+async def test_an_unparsable_origin_is_403_over_the_socket() -> None:
+    async with serving(Clock(1000.0)) as (app, url):
+        assert await refused_status(url, "https://[evil") == 403
+        assert not app.state.hub.clients
+
+
 async def refused_status(url: str, origin: str) -> int:
     with pytest.raises(InvalidStatus) as refused:
         async with connect(
