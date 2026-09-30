@@ -877,46 +877,46 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
 
 ### S-A: `agent/` (relay)
 
-- [ ] **S-01** `read_from` reads up to the byte budget (`LIMIT` or an
+- [x] **S-01** *(PR #9)* `read_from` reads up to the byte budget (`LIMIT` or an
       iterator) instead of loading the whole backlog (`agent/queue.py:258`).
       *Done when:* a test with a backlog far larger than the budget shows
       memory bounded by the budget, and the records returned are the oldest,
       oldest first.
 
-- [ ] **S-02** An error in the writer thread is logged, retried with backoff,
+- [x] **S-02** *(PR #9)* An error in the writer thread is logged, retried with backoff,
       and raises a health flag carried in `status`, so the Gateway does not
       show the station as healthy (`agent/relay.py:152`). `__main__` checks
       that the thread is alive.
       *Done when:* a simulated disk error makes `status` report degradation
       (the presence test), and a writer that recovers clears it.
 
-- [ ] **S-03** SQLite calls leave the event loop and run in `to_thread`
+- [x] **S-03** *(PR #9)* SQLite calls leave the event loop and run in `to_thread`
       (`agent/relay.py:197-209`).
       *Done when:* no SQLite call runs on the event loop thread, checked by a
       test.
 
 ### S-B: `gateway/`
 
-- [ ] **S-04** Archive compression and fsync run in `to_thread`
+- [x] **S-04** *(PR #10)* Archive compression and fsync run in `to_thread`
       (`gateway/ingest_store_pg.py:301`).
       *Done when:* a slow disk no longer stalls other stations' sessions,
       shown by a test.
 
-- [ ] **S-05** Only new records enter the pipeline, never duplicates
+- [x] **S-05** *(PR #10)* Only new records enter the pipeline, never duplicates
       (`gateway/relay_server.py:381`). Drain no longer waits on the pipeline:
       it hands off through a bounded queue.
       *Done when:* a replayed batch publishes nothing twice, and a stalled
       pipeline does not stop acknowledgements until the queue is full.
 
-- [ ] **S-06** A `StoreError` in the reporter task does not kill a station's
+- [x] **S-06** *(PR #10)* A `StoreError` in the reporter task does not kill a station's
       reporting (`gateway/relay_server.py:455-476`).
       *Done when:* a test injects the error and the station keeps reporting.
 
-- [ ] **S-07** Bounds everywhere: `StationLinkTracker.losses`, eviction in
+- [x] **S-07** *(PR #10)* Bounds everywhere: `StationLinkTracker.losses`, eviction in
       `RateLimiter`, a semaphore on Remote ID tasks, and an O(1) `_forget`.
       *Done when:* each structure has a test that drives it past its bound.
 
-- [ ] **S-08** An empty or duplicated token in the token file is a startup
+- [x] **S-08** *(PR #10)* An empty or duplicated token in the token file is a startup
       error. One station has one session, and the disconnect of an old
       session does not disturb the new one.
       *Done when:* each case has a test, including a reconnect racing the old
@@ -929,26 +929,26 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       *Done when:* relay-v1 documents it, and a cap drop during a session
       appears at the Gateway as a recorded gap with the watermark past it.
 
-- [ ] **S-10** Remote ID spoofing: an unverified Remote ID broadcast is never
+- [!] **S-10** *(superseded by U-02)* Remote ID spoofing: an unverified Remote ID broadcast is never
       published on a registered aircraft's `telemetry.{id}` subject.
       *Done when:* a broadcast carrying a registered serial, without that
       aircraft's verification, is shown as a separate unverified track.
 
 ### S-C: `airspace/` and `common/terrain.py`
 
-- [ ] **S-11** `Track` carries a timestamp. CPA extrapolates the neighbour's
+- [x] **S-11** *(PR #11)* `Track` carries a timestamp. CPA extrapolates the neighbour's
       position to the current time, and a neighbour older than a
       configurable limit is left out.
       *Done when:* tests show a stale neighbour excluded and a slightly old
       one extrapolated, not taken as current.
 
-- [ ] **S-12** Checks are isolated from each other: an error in
+- [x] **S-12** *(PR #11)* Checks are isolated from each other: an error in
       `_check_height` must not lose the conflict and zone alerts
       (`airspace/monitor.py:188`). Non-finite coordinates are rejected.
       *Done when:* a test makes the height check raise and the other alerts
       still arrive, and a NaN position raises no alert and is logged.
 
-- [ ] **S-13** The policy is reloaded periodically, and the death of the
+- [x] **S-13** *(PR #11)* The policy is reloaded periodically, and the death of the
       ticker is logged. Audit and database writes leave the hot path through
       a bounded queue. Terrain reads run in `to_thread` behind an LRU cache.
       *Done when:* a policy change takes effect without a restart, and a slow
@@ -956,30 +956,30 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
 
 ### S-D: `api/`
 
-- [ ] **S-15** scrypt runs in `to_thread`. Login is rate-limited by IP and by
+- [x] **S-15** *(PR #12)* scrypt runs in `to_thread`. Login is rate-limited by IP and by
       username. The dummy hash uses `self.cost`. The hash is computed outside
       `FOR UPDATE`.
       *Done when:* tests cover the rate limit on both keys and the timing of
       a login for an unknown user matches a known one.
 
-- [ ] **S-16** `/events` takes `since` and `until` in UTC. HTTP error details
+- [x] **S-16** *(PR #12)* `/events` takes `since` and `until` in UTC. HTTP error details
       no longer expose `IntegrityError`. `retire_drone` runs its operations
       in the correct sequence. WebSocket connections check `Origin`.
       *Done when:* each has a test, including a refused foreign origin.
 
-- [ ] **S-17** `api/` joins the mypy strict list, with a coverage threshold.
+- [x] **S-17** *(PR #12)* `api/` joins the mypy strict list, with a coverage threshold.
       *Done when:* `pyproject.toml`, `CLAUDE.md` and `tests/test_layout.py`
       agree, and CI enforces the threshold.
 
 ### S-E: `web-pilot/`
 
-- [ ] **S-18** The feed reducer has a `default` branch, `JSON.parse` is
+- [x] **S-18** *(PR #7)* The feed reducer has a `default` branch, `JSON.parse` is
       guarded, and reconnect uses exponential backoff with jitter, with no
       tight loop on close code 4401.
       *Done when:* a malformed message and a 4401 close are both handled
       without a crash or a reconnect storm.
 
-- [ ] **S-19** vitest, with tests for the feed reducer and reconnect. CI runs
+- [x] **S-19** *(PR #7)* vitest, with tests for the feed reducer and reconnect. CI runs
       `npm test`.
       *Done when:* the tests run in CI and fail on a broken reducer.
 
@@ -1007,6 +1007,45 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       count.
       *Done when:* a restore from the offsite copy into a scratch environment
       succeeds, and an empty restore makes `restore_check` fail.
+
+- [ ] **S-24** A relay whose process stalls reads OS-buffered datagrams late
+      and stamps them with the read time, so old positions go out as live
+      (SITL, 2026-10-01: one false conflict from 30 s-old positions). Place
+      records by the vehicle's own monotonic clock (`time_boot_ms`), anchored
+      to the previous sample, and detect reboots.
+      *Done when:* a `kill -STOP` of the relay for 30 s raises no alert from
+      buffered positions in SITL.
+
+- [ ] **S-25** Alert transitions carry their own numbers: a clear reports the
+      separation that cleared it, not the last active one, and a disarmed
+      aircraft clears with reason `landed` rather than `stale`.
+      *Done when:* both are visible on the bus and in `events` in SITL.
+
+- [ ] **S-26** `common/tests/test_startup.py` leaves the configured log level
+      in place, so `gateway/tests/test_relay_server.py::test_repeated_bad_tokens_are_logged_once_per_interval`
+      fails when run straight after it. Restore logging state in the test.
+      *Done when:* `pytest airspace common gateway` passes in any order.
+
+- [ ] **S-27** Remote ID capture time from the ODID Location
+      `seconds_after_hour` instead of the Gateway's receive time.
+      *Done when:* a simulated broadcast with receiver latency is placed at
+      its broadcast time.
+
+- [ ] **S-28** `docs/runbooks/p5-airspace-monitor.md` covers the settings added
+      in S-11..S-13 (`LIVE_MAX_AGE_S`, `NEIGHBOUR_MAX_AGE_S`, audit queue,
+      terrain cache and retry), the clear `reason`, the Gateway's `rx_ts`,
+      `captured_at` and `backlog`, and the status line.
+
+- [ ] **S-29** A reconciler for `projection_incomplete` (S-16): a periodic
+      sweep re-applies the telemetry projection of retired drones.
+
+- [ ] **S-30** The Gateway's drain constants (`DRAIN_FRAME_BYTES`,
+      `DRAIN_CLEAR_S`, `DRAIN_START_FACTOR`) and the RID ingest's limits come
+      from configuration, not code defaults.
+
+- [ ] **S-31** No 502 during a deploy: the new containers are healthy before
+      the old ones stop.
+      *Done when:* a deploy of main shows no non-2xx/3xx on a 1 s probe.
 
 - [ ] **S-14** *(optional, last)* Rename the `courier_*` databases, users,
       volumes and environment names, with a migration runbook. Until then
