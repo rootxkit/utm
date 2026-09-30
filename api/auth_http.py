@@ -216,6 +216,8 @@ def auth_router(
     async def login(
         body: LoginIn, request: Request, response: Response
     ) -> dict[str, Any]:
+        # The peer as uvicorn reports it, which honours X-Forwarded-For only
+        # from a trusted proxy (`api.config.ProxySettings`). Never the header.
         remote_addr = request.client.host if request.client else None
         # Before the store, so a refused attempt costs no hash and no row.
         wait_s = limiter.attempt(address=remote_addr, username=body.username)

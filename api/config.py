@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from pydantic import Field, SecretStr, model_validator
 
@@ -42,7 +42,32 @@ class FeedTicketSettings(ServiceSettings):
         return self
 
 
+class ProxySettings(ServiceSettings):
+    """S-15. Which peers may say who the client is.
+
+    uvicorn replaces the client address with the one in `X-Forwarded-For`
+    only when the connection comes from one of these, so the sign-in limit
+    per address counts real clients behind the TLS front (P0-09) and a
+    client that reaches the service directly cannot pick its own address.
+    Comma-separated IPs or networks, or `*`. The default is uvicorn's own.
+    """
+
+    forwarded_allow_ips: str = Field(
+        default="127.0.0.1", min_length=1, validation_alias="FORWARDED_ALLOW_IPS"
+    )
+
+    def uvicorn_proxy_options(self) -> dict[str, Any]:
+        """What `uvicorn.run` / `uvicorn.Config` is given, and nothing else
+        decides it: uvicorn also reads FORWARDED_ALLOW_IPS from the
+        environment itself, and passing the value keeps one source."""
+        return {
+            "proxy_headers": True,
+            "forwarded_allow_ips": self.forwarded_allow_ips,
+        }
+
+
 class ApiSettings(
+    ProxySettings,
     FeedTicketSettings,
     PostgresSettings,
     TelemetryDatabaseSettings,
@@ -139,7 +164,7 @@ class ApiSettings(
     )
 
 
-class ConsoleSettings(FeedTicketSettings, NatsSettings):
+class ConsoleSettings(ProxySettings, FeedTicketSettings, NatsSettings):
     """The P1-08 console feed.
 
     Only the bus, deliberately. The console is a NATS subscriber and must not

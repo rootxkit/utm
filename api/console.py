@@ -30,6 +30,8 @@ def main() -> None:
         ),
         host=settings.console_host,
         port=settings.console_port,
+        # No sign-in here, but its logs should name the real client too.
+        **settings.uvicorn_proxy_options(),
     )
 
 

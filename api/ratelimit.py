@@ -13,9 +13,12 @@ In memory, per process. A restart forgets the counts, and several API
 processes each keep their own; the lockout in the database is the durable
 protection, this is the cheap one in front of it.
 
-The address is what the ASGI server reports. Behind the TLS front (P0-09)
-that is the front's address unless uvicorn is told to trust its forwarding
-headers, in which case every client would share one per-address budget.
+The address is `request.client.host`, what the ASGI server reports, and
+never a header read here. Behind the TLS front (P0-09) uvicorn rewrites it
+from `X-Forwarded-For` only when the peer is in `FORWARDED_ALLOW_IPS`
+(`api.config.ProxySettings`): without that every client would share the
+front's budget, and trusting the header from anyone would let a client
+choose a fresh address per attempt.
 """
 
 from __future__ import annotations

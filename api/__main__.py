@@ -85,7 +85,12 @@ def build_app(settings: ApiSettings) -> FastAPI:
 def main() -> None:
     settings = load_settings(ApiSettings)
     configure_logging(service=settings.service_name, level=settings.log_level.value)
-    uvicorn.run(build_app(settings), host=settings.api_host, port=settings.api_port)
+    uvicorn.run(
+        build_app(settings),
+        host=settings.api_host,
+        port=settings.api_port,
+        **settings.uvicorn_proxy_options(),
+    )
 
 
 if __name__ == "__main__":
