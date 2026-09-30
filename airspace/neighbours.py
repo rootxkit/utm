@@ -71,6 +71,10 @@ class NeighbourIndex:
     def track(self, drone_id: UUID) -> Track | None:
         return self._tracks.get(drone_id)
 
+    def tracks(self) -> list[Track]:
+        """Every tracked aircraft, for rebuilding the index at a new radius."""
+        return list(self._tracks.values())
+
     def neighbours(self, drone_id: UUID) -> list[Track]:
         """Every other tracked aircraft within `radius_m` of this one."""
         me = self._tracks.get(drone_id)
@@ -83,8 +87,12 @@ class NeighbourIndex:
             # Neighbouring bands have their own column widths, so the query
             # position is re-bucketed in each band rather than offset.
             _, column = self._cell_in_band(band, me.lon_deg)
+            columns = self._columns_in_band(band)
             for d_column in (-1, 0, 1):
-                for other_id in self._cells.get((band, column + d_column), ()):
+                # Wrapped: the column west of the first is the last, so a pair
+                # straddling the antimeridian is found (S-12).
+                cell = (band, (column + d_column) % columns)
+                for other_id in self._cells.get(cell, ()):
                     if other_id == drone_id:
                         continue
                     other = self._tracks[other_id]
@@ -96,13 +104,20 @@ class NeighbourIndex:
         band = math.floor(lat_deg / self._dlat_deg)
         return self._cell_in_band(band, lon_deg)
 
-    def _cell_in_band(self, band: int, lon_deg: float) -> Cell:
-        # The poleward edge of the band is where a degree of longitude is
-        # shortest.
+    def _columns_in_band(self, band: int) -> int:
+        """How many columns go round the band: as many as fit at the poleward
+        edge, where a degree of longitude is shortest, so every column is at
+        least `radius_m` wide and they divide 360 degrees exactly. An uneven
+        last column could be narrower than the radius, and a neighbour two
+        columns west across the antimeridian would then be missed."""
         edge_deg = min(
             max(abs(band * self._dlat_deg), abs((band + 1) * self._dlat_deg)),
             _MAX_LAT_DEG,
         )
         m_per_deg_lon = _M_PER_DEG_LON_EQUATOR * math.cos(math.radians(edge_deg))
-        dlon_deg = min(self.radius_m / m_per_deg_lon, 360.0)
-        return band, math.floor((lon_deg + 180.0) / dlon_deg)
+        return max(1, math.floor(360.0 * m_per_deg_lon / self.radius_m))
+
+    def _cell_in_band(self, band: int, lon_deg: float) -> Cell:
+        columns = self._columns_in_band(band)
+        # Longitude normalised into [0, 360) so 180 and -180 are one column.
+        return band, math.floor((lon_deg + 180.0) % 360.0 / 360.0 * columns) % columns

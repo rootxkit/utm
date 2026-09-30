@@ -12,7 +12,7 @@ tests - but the pipeline's obligations to the transport above it:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -118,6 +118,9 @@ class FakePublisher:
         self.links: dict[UUID, dict[str, Any]] = {}
         self.firmware: dict[UUID, dict[str, Any]] = {}
         self.unclaimed: list[SourceId] = []
+        self.rx_ts: list[datetime | None] = []
+        self.backlog: list[bool] = []
+        self.captured_at: list[datetime | None] = []
 
     async def publish_rows(
         self,
@@ -125,11 +128,20 @@ class FakePublisher:
         labels: dict[UUID, str] | None = None,
         links: dict[UUID, dict[str, Any]] | None = None,
         firmware: dict[UUID, dict[str, Any]] | None = None,
+        *,
+        rx_ts: datetime | None = None,
+        backlog: list[bool] | None = None,
+        captured_at: list[datetime] | None = None,
     ) -> None:
         self.rows.extend(rows)
         self.labels = labels or {}
         self.links = links or {}
         self.firmware = firmware or {}
+        self.rx_ts.extend([rx_ts] * len(rows))
+        self.backlog.extend(backlog if backlog is not None else [False] * len(rows))
+        self.captured_at.extend(
+            captured_at if captured_at is not None else [None] * len(rows)
+        )
 
     async def publish_unclaimed(
         self, station_id: str, resolution: Resolution, source_id: SourceId
@@ -217,6 +229,95 @@ async def test_the_row_timestamp_is_the_records_capture_time() -> None:
     assert rows[0].ts == datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
 
 
+async def test_rows_are_published_with_the_gateways_receive_time() -> None:
+    """S-11. `rx_ts` is the Gateway's clock at the batch, not the relay's
+    capture time, and without a session every record is live."""
+    pipeline, _, _, publisher = build()
+    received = datetime(2026, 9, 24, 12, 0, 5, tzinfo=UTC)
+    pipeline.wall = lambda: received
+
+    rows = await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position(), offset_ns=300_000_000)]
+    )
+
+    assert len(rows) == 1
+    assert publisher.rx_ts == [received]
+    assert publisher.backlog == [False]
+
+
+async def test_records_up_to_newest_seq_held_are_backlog_and_the_rest_live() -> None:
+    """S-11. The session's `hello` declared `newest_seq_held` = 3: seq 0-3
+    were on the relay's disk before the connection; seq 4 onward were
+    captured while it was up. One batch straddles the boundary."""
+    pipeline, _, _, publisher = build()
+
+    rows = await pipeline.process(
+        EPOCH,
+        [record(0, heartbeat())] + [record(seq, position()) for seq in range(1, 7)],
+        newest_seq_held=3,
+    )
+
+    assert len(rows) == 6
+    assert publisher.backlog == [True, True, True, False, False, False]
+
+
+async def test_rows_in_one_batch_are_placed_by_their_spacing_ending_at_rx_ts() -> None:
+    """S-11. Two positions 5 s apart on the relay's clock, in one frame: the
+    newer lands at `rx_ts`, the older 5 s before it, whatever the relay's
+    clock read (it read noon; the Gateway's read 12:00:30)."""
+    pipeline, _, _, publisher = build()
+    received = datetime(2026, 9, 24, 12, 0, 30, tzinfo=UTC)
+    pipeline.wall = lambda: received
+
+    rows = await pipeline.process(
+        EPOCH,
+        [
+            record(0, heartbeat()),
+            record(1, position()),
+            record(2, position(), offset_ns=5_000_000_000),
+        ],
+    )
+
+    assert len(rows) == 2
+    assert publisher.captured_at == [received - timedelta(seconds=5), received]
+    assert publisher.rx_ts == [received, received]
+    assert pipeline.span_clamped == 0
+
+
+async def test_a_spacing_beyond_the_batch_span_is_clamped_and_counted() -> None:
+    """A station clock that stepped 10 minutes inside one batch would place
+    a row 10 minutes back; it is placed at the 120 s clamp instead."""
+    pipeline, _, _, publisher = build()
+    received = datetime(2026, 9, 24, 12, 0, 30, tzinfo=UTC)
+    pipeline.wall = lambda: received
+
+    await pipeline.process(
+        EPOCH,
+        [
+            record(0, heartbeat()),
+            record(1, position()),
+            record(2, position(), offset_ns=600_000_000_000),
+        ],
+    )
+
+    assert publisher.captured_at == [received - timedelta(seconds=120), received]
+    # Every message is placed, for its binding: the heartbeat too.
+    assert pipeline.span_clamped == 2
+
+
+async def test_every_record_is_backlog_while_the_session_is_draining() -> None:
+    """S-11. Captured during the session (seq past `newest_seq_held`), but
+    the relay is still working off its queue: stale on arrival, so backlog.
+    The same batch with the drain over is live."""
+    pipeline, _, _, publisher = build()
+    batch = [record(0, heartbeat())] + [record(seq, position()) for seq in (5, 6)]
+
+    await pipeline.process(EPOCH, batch, newest_seq_held=3, draining=True)
+    await pipeline.process(EPOCH, batch, newest_seq_held=3, draining=False)
+
+    assert publisher.backlog == [True, True, False, False]
+
+
 async def test_messages_that_are_not_on_the_hot_path_emit_no_row() -> None:
     """A row is emitted on position and nothing else."""
     pipeline, _, writer, _ = build()
@@ -242,20 +343,53 @@ async def test_an_unbound_source_produces_no_row() -> None:
     assert writer.written == []
 
 
-async def test_an_unbound_source_is_announced_once_not_once_per_datagram() -> None:
+async def test_an_unbound_source_is_announced_once_per_interval_with_a_count() -> None:
     """An unbound aircraft at 84 Hz would otherwise emit 84 events a second.
 
     That is how a genuinely useful signal becomes something operators filter
-    out, so it is announced per address.
+    out, so it is announced per address and per interval. Not once for ever
+    (S-11): a station whose clock made every record unclaimed read as
+    healthy after its first announcement.
     """
     pipeline, resolver, _, publisher = build(resolver=FakeResolver(drone_id=None))
+    clock = [0.0]
+    pipeline.monotonic = lambda: clock[0]
+    pipeline.unclaimed_interval_s = 60.0
 
     for seq in range(20):
         await pipeline.process(EPOCH, [record(seq, position())])
-
     assert len(publisher.unclaimed) == 1
     assert len(resolver.unclaimed) == 1
     assert publisher.unclaimed[0] == SourceId(sysid=1, compid=1)
+
+    clock[0] = 61.0
+    await pipeline.process(EPOCH, [record(20, position())])
+    assert len(publisher.unclaimed) == 2
+    assert resolver.suppressed == [0, 19]
+
+
+async def test_a_station_clock_an_hour_slow_still_binds_its_records() -> None:
+    """S-11. The binding is resolved at the Gateway-placed time, not the
+    station's `ts`: a SYSID reassigned half an hour ago must resolve to its
+    new drone even though the station stamps its records an hour in the
+    past, where the old binding was still in force."""
+    received = datetime(2026, 9, 24, 13, 0, tzinfo=UTC)
+    rebound_to = UUID("11111111-2222-3333-4444-555555555555")
+    resolver = FakeResolver(
+        rebound_at=received - timedelta(minutes=30), rebound_to=rebound_to
+    )
+    pipeline, _, _, publisher = build(resolver=resolver)
+    pipeline.wall = lambda: received
+
+    # The records' `ts` read noon: an hour slow.
+    rows = await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position())]
+    )
+
+    assert [row.drone_id for row in rows] == [rebound_to]
+    assert publisher.unclaimed == []
+    assert rows[0].ts == datetime(2026, 9, 24, 12, 0, tzinfo=UTC), "the row keeps ts"
+    assert publisher.captured_at == [received]
 
 
 async def test_two_unbound_addresses_are_announced_separately() -> None:
@@ -507,6 +641,10 @@ async def test_a_batch_crossing_a_rebinding_splits_between_two_drones() -> None:
     batch = [record(0, heartbeat())] + [
         record(n, position(), offset_ns=n * 500_000_000) for n in range(1, 9)
     ]
+    # A station with a correct clock, delivered at once: the Gateway receives
+    # the batch as its newest record is captured, so each record's placed
+    # time (which the binding is resolved at) equals its capture time.
+    pipeline.wall = lambda: datetime(2026, 9, 24, 12, 0, 4, tzinfo=UTC)
 
     rows = await pipeline.process(EPOCH, batch)
 
@@ -607,9 +745,9 @@ async def test_a_continuing_rejection_is_reported_again_with_its_count() -> None
     assert resolver.suppressed == [0, 19]
 
 
-async def test_an_unclaimed_source_is_still_announced_only_once() -> None:
+async def test_an_unclaimed_source_is_still_announced_only_once_per_interval() -> None:
     """The rejection path must not change the unclaimed one: an aircraft being
-    set up is announced once, as before."""
+    set up is announced once within the interval, as before."""
     pipeline, resolver, _, _ = build(resolver=FakeResolver(drone_id=None))
 
     for _ in range(3):

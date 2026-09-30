@@ -106,6 +106,42 @@ def test_the_payload_carries_both_altitudes_and_no_agl() -> None:
     assert "alt_agl_m" not in payload
 
 
+def test_the_payload_says_when_the_gateway_received_it_and_whether_it_is_backlog() -> (
+    None
+):
+    """S-11. `rx_ts` is the Gateway's clock; `backlog` is the relay session's
+    verdict. A row published without either (the Redis snapshot) says so."""
+    received = NOON.replace(second=7)
+
+    live = encode_row(row(), rx_ts=received, backlog=False)
+    replayed = encode_row(row(), rx_ts=received, backlog=True)
+    snapshot = encode_row(row())
+
+    assert (live["rx_ts"], live["backlog"]) == (received.isoformat(), False)
+    assert (replayed["rx_ts"], replayed["backlog"]) == (received.isoformat(), True)
+    assert (snapshot["rx_ts"], snapshot["backlog"]) == (None, False)
+    assert live["ts"] == NOON.isoformat(), "the capture time is untouched"
+    # Placed at `rx_ts` unless the pipeline placed it finer; null without.
+    assert live["captured_at"] == received.isoformat()
+    assert snapshot["captured_at"] is None
+    placed = encode_row(row(), rx_ts=received, captured_at=received.replace(second=2))
+    assert placed["captured_at"] == received.replace(second=2).isoformat()
+
+
+async def test_a_batch_carries_one_backlog_flag_per_row() -> None:
+    bus = RecordingBus()
+    rows = [row(), row()]
+
+    await TelemetryPublisher(bus=bus).publish_rows(
+        rows, rx_ts=NOON, backlog=[True, False]
+    )
+    with pytest.raises(ValueError, match="one per row"):
+        await TelemetryPublisher(bus=bus).publish_rows(rows, backlog=[True])
+
+    assert [payload["backlog"] for _, payload in bus.published] == [True, False]
+    assert {payload["rx_ts"] for _, payload in bus.published} == {NOON.isoformat()}
+
+
 def test_an_unknown_value_is_published_as_null_not_zero() -> None:
     """A console showing 0% for a battery nobody measured is worse than one
     showing nothing: the first is a number a pilot will act on."""

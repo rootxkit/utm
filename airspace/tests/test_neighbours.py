@@ -16,17 +16,20 @@ LAT0 = 41.7151
 LON0 = 44.8271
 
 
-def scattered(count: int, *, spread_deg: float, seed: int) -> list[Track]:
+def scattered(
+    count: int, *, spread_deg: float, seed: int, lon0_deg: float = LON0
+) -> list[Track]:
     rng = random.Random(seed)
     return [
         Track(
             drone_id=UUID(int=n + 1),
             lat_deg=LAT0 + rng.uniform(-spread_deg, spread_deg),
-            lon_deg=LON0 + rng.uniform(-spread_deg, spread_deg),
+            lon_deg=lon0_deg + rng.uniform(-spread_deg, spread_deg),
             alt_amsl_m=550.0,
             vn_ms=0.0,
             ve_ms=0.0,
             vd_ms=0.0,
+            captured_at_s=0.0,
         )
         for n in range(count)
     ]
@@ -53,13 +56,43 @@ def test_it_finds_exactly_what_brute_force_finds(seed: int) -> None:
 def test_a_moved_aircraft_is_found_where_it_is_now() -> None:
     index = NeighbourIndex(radius_m=800)
     a, b = scattered(2, spread_deg=0.0, seed=1)
-    far = Track(b.drone_id, LAT0 + 0.1, LON0, 550.0, 0.0, 0.0, 0.0)
+    far = Track(b.drone_id, LAT0 + 0.1, LON0, 550.0, 0.0, 0.0, 0.0, 0.0)
     index.upsert(a)
     index.upsert(far)
     assert index.neighbours(a.drone_id) == []
 
     index.upsert(b)
     assert [t.drone_id for t in index.neighbours(a.drone_id)] == [b.drone_id]
+
+
+def test_a_pair_straddling_the_antimeridian_are_neighbours() -> None:
+    """S-12. 0.002 degrees apart across 180 E: about 166 m at this latitude,
+    and 40,000 km apart in unwrapped longitude."""
+    index = NeighbourIndex(radius_m=800)
+    east = Track(UUID(int=1), LAT0, 179.999, 550.0, 0.0, 0.0, 0.0, 0.0)
+    west = Track(UUID(int=2), LAT0, -179.999, 550.0, 0.0, 0.0, 0.0, 0.0)
+    index.upsert(east)
+    index.upsert(west)
+    assert [t.drone_id for t in index.neighbours(east.drone_id)] == [west.drone_id]
+    assert [t.drone_id for t in index.neighbours(west.drone_id)] == [east.drone_id]
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+def test_across_the_antimeridian_it_still_matches_brute_force(seed: int) -> None:
+    tracks = scattered(200, spread_deg=0.03, seed=seed, lon0_deg=180.0)
+    index = NeighbourIndex(radius_m=800)
+    for track in tracks:
+        index.upsert(track)
+
+    for me in tracks:
+        expected = {
+            other.drone_id
+            for other in tracks
+            if other.drone_id != me.drone_id and horizontal_distance_m(me, other) <= 800
+        }
+        found = {other.drone_id for other in index.neighbours(me.drone_id)}
+        assert found == expected
+    assert any(t.lon_deg > 180.0 for t in tracks)
 
 
 def test_a_removed_aircraft_is_nobodys_neighbour() -> None:

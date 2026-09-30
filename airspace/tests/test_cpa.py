@@ -12,6 +12,7 @@ import pytest
 from airspace.cpa import (
     SeparationPolicy,
     Track,
+    advance,
     closest_approach,
     horizontal_distance_m,
     local_offset_m,
@@ -36,6 +37,7 @@ def at(
     ve: float = 0.0,
     vd: float = 0.0,
     alt_amsl_m: float = 550.0,
+    at_s: float = 0.0,
 ) -> Track:
     """A track at a metric offset from the origin, so tests speak in metres."""
     # Invert the local projection numerically (it is linear at this scale).
@@ -49,6 +51,7 @@ def at(
         vn_ms=vn,
         ve_ms=ve,
         vd_ms=vd,
+        captured_at_s=at_s,
     )
 
 
@@ -168,3 +171,54 @@ def test_the_result_does_not_depend_on_the_order_of_the_pair() -> None:
 def test_horizontal_distance_agrees_with_the_approach_now() -> None:
     a, b = at(A, 0, 0), at(B, 300, 400)
     assert horizontal_distance_m(a, b) == pytest.approx(500.0, rel=1e-3)
+
+
+def test_a_pair_hovering_inside_the_minimum_is_a_conflict_whatever_t_cpa_says() -> None:
+    """Found in SITL: 30 m apart, hovering, 1 cm/s of velocity noise. The
+    closest approach is 3000 s away and outside the window, but they are
+    inside the minimum now. 80 m apart, the same noise is not a conflict."""
+    near = closest_approach(at(A, 0, 0), at(B, 30, 0, vn=-0.01))
+    assert near.t_cpa_s == pytest.approx(3000.0, rel=1e-2)
+    assert not near.t_cpa_s < POLICY.t_cpa_max_s, "the window alone would clear it"
+    assert POLICY.is_conflict(near)
+
+    far = closest_approach(at(A, 0, 0), at(B, 80, 0, vn=-0.01))
+    assert not POLICY.is_conflict(far)
+
+
+def test_a_diverging_pair_stays_a_conflict_until_it_is_past_the_minimum() -> None:
+    """Opening at 10 m/s from 40 m: still inside at 50 m, clear at 60 m."""
+    assert POLICY.is_conflict(closest_approach(at(A, 0, 0), at(B, 40, 0, vn=10)))
+    assert POLICY.is_conflict(closest_approach(at(A, 0, 0), at(B, 50, 0, vn=10)))
+    assert not POLICY.is_conflict(closest_approach(at(A, 0, 0), at(B, 60, 0, vn=10)))
+
+
+def test_inside_horizontally_but_separated_vertically_is_not_a_conflict() -> None:
+    """The vertical minimum applies to the pair as it is now, as §6.1 wants."""
+    stacked = closest_approach(
+        at(A, 0, 0, alt_amsl_m=500), at(B, 30, 0, alt_amsl_m=530)
+    )
+    assert not POLICY.is_conflict(stacked)
+
+
+def test_advance_carries_a_track_along_its_velocity() -> None:
+    """10 s at 10 m/s north, 5 m/s east and 1 m/s up (vd = -1)."""
+    moved = advance(at(A, 0, 0, vn=10, ve=5, vd=-1.0, at_s=0.0), 10.0)
+    north_m, east_m = local_offset_m(LAT0, LON0, moved.lat_deg, moved.lon_deg)
+    assert north_m == pytest.approx(100.0, rel=1e-3)
+    assert east_m == pytest.approx(50.0, rel=1e-3)
+    assert moved.alt_amsl_m == pytest.approx(560.0)
+    assert moved.captured_at_s == 10.0
+    assert (moved.vn_ms, moved.ve_ms, moved.vd_ms) == (10, 5, -1.0)
+
+
+def test_the_older_sample_is_advanced_to_the_newer_before_the_cpa() -> None:
+    """Head-on: fresh samples meet in 50 s. With A's sample 5 s old, taken
+    50 m back down its track, the answer is the same 50 s, not 52.5 s."""
+    fresh = closest_approach(at(A, 0, 0, vn=10, at_s=5), at(B, 1000, 0, vn=-10, at_s=5))
+    stale_a = at(A, -50, 0, vn=10, at_s=0)
+    b = at(B, 1000, 0, vn=-10, at_s=5)
+    for one, other in ((stale_a, b), (b, stale_a)):
+        approach = closest_approach(one, other)
+        assert approach.t_cpa_s == pytest.approx(fresh.t_cpa_s, rel=1e-3)
+        assert approach.d_horizontal_now_m == pytest.approx(1000.0, rel=1e-3)

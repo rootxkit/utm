@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -31,7 +32,7 @@ from gateway.ingest_store import InMemoryIngestStore, StoredBatch, StoreError
 from gateway.rate_limit import RateLimiter
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
-from gateway.relay_server import RelayServer
+from gateway.relay_server import RelayServer, _Session
 from gateway.station_state import LinkState
 
 EPOCH = "9f2c1b7d4e6a58039ab1c2d3e4f50617"
@@ -935,9 +936,293 @@ class RecordingProcessor:
     """Notes every record handed to the pipeline, batch by batch."""
 
     batches: list[list[int]] = field(default_factory=list)
+    # What each batch's session declared in `hello`, so the pipeline can
+    # tell backlog from live (S-11).
+    newest_seq_held: list[int] = field(default_factory=list)
+    draining: list[bool] = field(default_factory=list)
 
-    async def process(self, station_id: str, epoch: str, records: list[Record]) -> None:
+    async def process(
+        self,
+        station_id: str,
+        epoch: str,
+        records: list[Record],
+        *,
+        newest_seq_held: int = -1,
+        draining: bool = False,
+    ) -> None:
         self.batches.append([record.seq for record in records])
+        self.newest_seq_held.append(newest_seq_held)
+        self.draining.append(draining)
+
+
+RATE_BASE_NS = 1_758_412_800_000_000_000
+
+
+def timed_batch(
+    first_seq: int, count: int, *, rate_hz: float, datagram_bytes: int
+) -> bytes:
+    """A frame of `count` records captured at `rate_hz` on the relay's clock
+    (`recv_utc_ns` follows `seq`, so consecutive frames are continuous),
+    each `datagram_bytes` long. 1 KiB datagrams make a frame at the size
+    bound from 32 records, as a draining relay sends them (relay-v1 §6);
+    a live 100 ms frame of MAVLink is a few hundred bytes per aircraft."""
+    return encode_records(
+        [
+            RelayRecord(
+                seq=first_seq + n,
+                recv_utc_ns=RATE_BASE_NS + int((first_seq + n) * 1e9 / rate_hz),
+                datagram=bytes([n % 256]) * datagram_bytes,
+            )
+            for n in range(count)
+        ]
+    )
+
+
+async def drain_and_settle(connection: Any, last_seq: int) -> None:
+    ack = await read_until(connection, "ack")
+    while ack["seq"] < last_seq:
+        ack = await read_until(connection, "ack")
+
+
+async def live_session(aircraft: int, *, frames: int = 8) -> list[bool]:
+    """A healthy station: `aircraft` at 84 Hz each, 100 ms frames of ~60 B
+    MAVLink datagrams, and the queue depth just before each 1 s ack (about
+    one second of records) reported every few frames. Returns what the
+    processor was told about draining, frame by frame."""
+    rate_hz = 84.0 * aircraft
+    per_frame = int(rate_hz / 10)
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+        for n in range(frames):
+            await connection.send(
+                timed_batch(
+                    n * per_frame, per_frame, rate_hz=rate_hz, datagram_bytes=60
+                )
+            )
+            if n % 3 == 2:
+                await connection.send(status(queue_depth=int(rate_hz * 1.1)))
+        await drain_and_settle(connection, frames * per_frame - 1)
+    assert [b[0] for b in processor.batches] == [n * per_frame for n in range(frames)]
+    return processor.draining
+
+
+async def test_a_twelve_aircraft_live_station_is_never_flagged_as_draining() -> None:
+    """The reviewer's case, and the presence pair of the drain tests. About
+    1000 records/s, so the queue reads about 1100 just before each ack: a
+    fixed depth threshold of 1000 flagged this station for ever. Frames of
+    a hundred 60 B datagrams are far under the size bound."""
+    assert await live_session(12) == [False] * 8
+
+
+async def test_a_twenty_aircraft_live_station_is_never_flagged_either() -> None:
+    assert await live_session(20) == [False] * 8
+
+
+async def test_records_are_backlog_while_the_relay_drains_and_live_after() -> None:
+    """S-11. Frames at the size bound mean the relay has more than 100 ms
+    of records waiting (§6): the session is draining, and the records are
+    stale on arrival. It ends on the first small frame after a `status`
+    puts the queue within three seconds of this session's own rate: at
+    1000 records/s that is 3000, so a depth of 5000 keeps it draining and
+    one of 2500 ends it."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+
+        def big(first_seq: int, count: int) -> bytes:  # 60 KiB frames
+            return timed_batch(first_seq, count, rate_hz=1000.0, datagram_bytes=1024)
+
+        def small(first_seq: int, count: int) -> bytes:
+            return timed_batch(first_seq, count, rate_hz=1000.0, datagram_bytes=60)
+
+        await connection.send(big(0, 60))
+        await connection.send(big(60, 60))
+        await connection.send(status(queue_depth=5000))
+        await connection.send(small(120, 5))  # small, but still deep
+        await connection.send(status(queue_depth=2500))
+        await connection.send(small(125, 5))  # within 3 s of the rate: live
+        await connection.send(small(130, 5))
+        await drain_and_settle(connection, 134)
+
+    assert [b[0] for b in processor.batches] == [0, 60, 120, 125, 130]
+    assert processor.draining == [True, True, True, False, False]
+
+
+async def test_a_depth_with_no_rate_known_starts_nothing() -> None:
+    """Before any record has been stored the session's rate is unknown, so
+    a reported depth, however large, cannot start a drain; a big frame
+    still does, and the depth then keeps it draining."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+        await connection.send(status(queue_depth=1_000_000))
+        await connection.send(timed_batch(0, 5, rate_hz=50.0, datagram_bytes=60))
+        await connection.send(timed_batch(5, 40, rate_hz=50.0, datagram_bytes=1024))
+        await connection.send(timed_batch(45, 5, rate_hz=50.0, datagram_bytes=60))
+        await drain_and_settle(connection, 49)
+
+    assert processor.draining == [False, True, True]
+
+
+async def test_a_slow_gateway_session_with_small_frames_is_flagged_by_depth() -> None:
+    """The reviewer's stuck-false case: the relay's send loop returns once
+    the socket buffer takes a frame, so with a Gateway slow to process
+    (ADR-002) small 100 ms frames arrive old while the relay's queue grows.
+    At 1000 records/s the clearing bound is 3000 and the start bound 6000:
+    a depth of 5000 is still live, 7000 flags, and the flag holds on small
+    frames until a depth of 2500 (under 3000) lets a small frame clear it."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+
+        def small(first_seq: int) -> bytes:
+            return timed_batch(first_seq, 100, rate_hz=1000.0, datagram_bytes=60)
+
+        await connection.send(small(0))
+        await connection.send(small(100))
+        await connection.send(status(queue_depth=5000))  # under 6 s of rate
+        await connection.send(small(200))
+        await connection.send(status(queue_depth=7000))  # over 6 s of rate
+        await connection.send(small(300))
+        await connection.send(status(queue_depth=4000))  # over 3 s: still
+        await connection.send(small(400))
+        await connection.send(status(queue_depth=2500))  # under 3 s: clears
+        await connection.send(small(500))
+        await connection.send(small(600))
+        await drain_and_settle(connection, 699)
+
+    assert [b[0] for b in processor.batches] == [0, 100, 200, 300, 400, 500, 600]
+    assert processor.draining == [False, False, False, True, True, False, False]
+
+
+async def test_with_no_status_ever_a_small_frame_ends_the_drain() -> None:
+    """A relay that never sent a `status`: with nothing known about its
+    queue, the first small frame is taken as live."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+        await connection.send(timed_batch(0, 40, rate_hz=50.0, datagram_bytes=1024))
+        await connection.send(timed_batch(40, 5, rate_hz=50.0, datagram_bytes=60))
+        await drain_and_settle(connection, 44)
+
+    assert processor.draining == [True, False]
+
+
+def bare_session() -> Any:
+    session = _Session.__new__(_Session)
+    session._recent_batches = deque()
+    session.clock_steps_back = 0
+    session.draining = False
+    session._last_queue_depth = None
+    session.log = cast(Any, logging.getLogger("gateway.tests.bare_session"))
+    session.server = cast(
+        Any, type("S", (), {"drain_clear_s": 3.0, "drain_start_factor": 2.0})()
+    )
+    return session
+
+
+def test_the_clearing_bound_follows_the_sessions_rate_with_a_floor() -> None:
+    session = bare_session()
+    assert session.drain_clear_bound() is None
+
+    # 1000 records over one second of capture: 3000 at 3 s.
+    session._recent_batches.append((0, 1_000_000_000, 1000))
+    assert session.drain_clear_bound() == 3000
+    # Ten records over one second: the floor.
+    session._recent_batches.clear()
+    session._recent_batches.append((0, 1_000_000_000, 10))
+    assert session.drain_clear_bound() == 100
+
+
+def test_the_start_trigger_is_a_multiple_of_the_clearing_bound() -> None:
+    session = bare_session()
+    session._note_queue_depth(1_000_000)
+    assert session.draining is False, "no rate known: depth starts nothing"
+
+    session._recent_batches.append((0, 1_000_000_000, 1000))  # bound 3000
+    session._note_queue_depth(6000)
+    assert session.draining is False, "at the start bound, not over it"
+    session._note_queue_depth(6001)
+    assert session.draining is True
+
+
+def records_between(start_s: float, end_s: float, count: int) -> list[Record]:
+    return [
+        Record(
+            seq=n,
+            recv_utc_ns=int((start_s + (end_s - start_s) * n / (count - 1)) * 1e9),
+            datagram=b"x",
+        )
+        for n in range(count)
+    ]
+
+
+def test_a_backward_clock_step_resets_the_rate_window_and_is_counted() -> None:
+    """A batch captured before the previous one ended would never age out
+    of the window (nothing is older than it by more than the window), so
+    the deque would grow for the length of the step. It starts over."""
+    session = bare_session()
+    session._note_records(records_between(0.0, 1.0, 100))
+    session._note_records(records_between(1.0, 2.0, 100))
+    assert len(session._recent_batches) == 2
+    assert session.record_rate_hz() == pytest.approx(100.0)
+
+    # The station clock steps back 90 s: the next batch is captured at -88.
+    session._note_records(records_between(-88.0, -87.0, 500))
+    assert len(session._recent_batches) == 1
+    assert session.clock_steps_back == 1
+    assert session.record_rate_hz() == pytest.approx(500.0)
+
+    # Later batches on the stepped clock age the window out as normal.
+    for start_s in range(-87, -80):
+        session._note_records(records_between(start_s, start_s + 1.0, 500))
+    assert len(session._recent_batches) <= 7
+    assert session.clock_steps_back == 1
+
+
+async def test_each_batch_is_processed_with_its_sessions_newest_seq_held() -> None:
+    """S-11. The relay connects holding seq 0-9 on disk and drains them,
+    then sends what it captures live. It reconnects later holding up to 24:
+    the new session's `hello` value is what its batches are judged by, so
+    the pipeline can flag 0-9 and 15-24 as backlog and 10-14 as live."""
+    processor = RecordingProcessor()
+    async with running(processor=processor, ack_interval_s=0.05) as server:
+        async with connect(url(server), additional_headers=auth()) as connection:
+            await handshake(connection, hello(newest_seq_held=9))
+            await connection.send(batch(0, 10))
+            await connection.send(batch(10, 5))
+            ack = await read_until(connection, "ack")
+            while ack["seq"] < 14:
+                ack = await read_until(connection, "ack")
+        async with connect(url(server), additional_headers=auth()) as connection:
+            await handshake(connection, hello(newest_seq_held=24))
+            await connection.send(batch(15, 10))
+            ack = await read_until(connection, "ack")
+            while ack["seq"] < 24:
+                ack = await read_until(connection, "ack")
+
+    assert processor.batches == [
+        list(range(10)),
+        list(range(10, 15)),
+        list(range(15, 25)),
+    ]
+    assert processor.newest_seq_held == [9, 9, 24]
 
 
 async def test_a_retransmitted_batch_is_not_processed_again() -> None:

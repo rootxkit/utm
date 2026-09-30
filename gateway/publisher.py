@@ -35,7 +35,9 @@ it something discovered later.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -79,6 +81,10 @@ def encode_row(
     label: str | None = None,
     link: dict[str, Any] | None = None,
     firmware: dict[str, Any] | None = None,
+    *,
+    rx_ts: datetime | None = None,
+    backlog: bool = False,
+    captured_at: datetime | None = None,
 ) -> dict[str, Any]:
     """A drone_state row as the console reads it.
 
@@ -104,6 +110,23 @@ def encode_row(
         # never reported one, which the console shows as unknown.
         "firmware": firmware,
         "ts": row.ts.isoformat(),
+        # S-11. `rx_ts` is when the Gateway received the batch, on its own
+        # clock: one clock for every station, where `ts` is each relay's.
+        # `backlog` says the record was queued on the relay before the
+        # session that delivered it (relay-v1 §5, `newest_seq_held`): the
+        # airspace monitor does not raise live alerts from it. Both are null
+        # or false where the row did not come through a relay session.
+        "rx_ts": None if rx_ts is None else rx_ts.isoformat(),
+        # Where the row sits in time on the Gateway's clock: `rx_ts` less how
+        # far behind its batch's newest record it was captured, so rows from
+        # one large frame are not all "now". Null with `rx_ts`; equal to it
+        # when the pipeline gave no finer placement.
+        "captured_at": (
+            None
+            if rx_ts is None
+            else (rx_ts if captured_at is None else captured_at).isoformat()
+        ),
+        "backlog": backlog,
         "station_id": row.station_id,
         "lat_deg": row.lat_deg,
         "lon_deg": row.lon_deg,
@@ -191,9 +214,22 @@ class TelemetryPublisher:
         label: str | None = None,
         link: dict[str, Any] | None = None,
         firmware: dict[str, Any] | None = None,
+        *,
+        rx_ts: datetime | None = None,
+        backlog: bool = False,
+        captured_at: datetime | None = None,
     ) -> None:
         await self._send(
-            telemetry_subject(row.drone_id), encode_row(row, label, link, firmware)
+            telemetry_subject(row.drone_id),
+            encode_row(
+                row,
+                label,
+                link,
+                firmware,
+                rx_ts=rx_ts,
+                backlog=backlog,
+                captured_at=captured_at,
+            ),
         )
 
     async def publish_rows(
@@ -202,16 +238,28 @@ class TelemetryPublisher:
         labels: dict[UUID, str] | None = None,
         links: dict[UUID, dict[str, Any]] | None = None,
         firmware: dict[UUID, dict[str, Any]] | None = None,
+        *,
+        rx_ts: datetime | None = None,
+        backlog: Sequence[bool] | None = None,
+        captured_at: Sequence[datetime] | None = None,
     ) -> None:
+        """`backlog` and `captured_at`, when given, are parallel to `rows`."""
         labels = labels or {}
         links = links or {}
         firmware = firmware or {}
-        for row in rows:
+        if backlog is not None and len(backlog) != len(rows):
+            raise ValueError("backlog flags must be one per row")
+        if captured_at is not None and len(captured_at) != len(rows):
+            raise ValueError("captured_at must be one per row")
+        for n, row in enumerate(rows):
             await self.publish_row(
                 row,
                 labels.get(row.drone_id),
                 links.get(row.drone_id),
                 firmware.get(row.drone_id),
+                rx_ts=rx_ts,
+                backlog=False if backlog is None else backlog[n],
+                captured_at=None if captured_at is None else captured_at[n],
             )
 
     async def publish_station(

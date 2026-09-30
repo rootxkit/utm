@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -131,6 +133,135 @@ def test_a_listed_tile_that_is_missing_is_an_error_not_a_guess(tmp_path: Path) -
 
     with pytest.raises(TerrainFileError, match="index lists N41E044"):
         terrain.elevation(41.5, 44.5)
+
+
+TWO_CELLS = {"N41E044": "COP-DEM GLO-30", "N42E044": "COP-DEM GLO-30"}
+TWO_TILES = {"N41E044": tile_bytes(), "N42E044": tile_bytes(lat_first=43.0)}
+
+
+def test_the_cache_holds_at_most_max_tiles_least_recently_used_out(
+    tmp_path: Path,
+) -> None:
+    """S-13. With room for one tile, reading a second evicts the first, which
+    then has to come from disk again; with room for two it is still held."""
+    install(tmp_path, TWO_CELLS, TWO_TILES)
+    terrain = Terrain(tmp_path, max_tiles=1)
+    assert terrain.elevation(41.5, 44.5) is not None
+    (tmp_path / "N41E044.pgm").unlink()
+    assert terrain.elevation(41.5, 44.5) is not None, "served from the cache"
+    assert terrain.cached == ["N41E044"]
+
+    assert terrain.elevation(42.5, 44.5) is not None
+    assert terrain.cached == ["N42E044"]
+    with pytest.raises(TerrainFileError, match="N41E044"):
+        terrain.elevation(41.5, 44.5)
+
+
+def test_with_room_for_both_the_first_tile_is_still_held(tmp_path: Path) -> None:
+    install(tmp_path, TWO_CELLS, TWO_TILES)
+    terrain = Terrain(tmp_path, max_tiles=2)
+    assert terrain.elevation(41.5, 44.5) is not None
+    (tmp_path / "N41E044.pgm").unlink()
+    assert terrain.elevation(42.5, 44.5) is not None
+    assert terrain.cached == ["N41E044", "N42E044"]
+    assert terrain.elevation(41.5, 44.5) is not None
+    assert terrain.cached == ["N42E044", "N41E044"], "most recently used last"
+
+
+def test_a_cached_lookup_does_not_wait_for_another_tiles_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should-fix 6. A worker is parsing N42E044 (held here on an event);
+    a lookup of the cached N41E044 must answer meanwhile, not queue behind
+    the read. The worker's tile still lands in the cache afterwards."""
+    install(tmp_path, TWO_CELLS, TWO_TILES)
+    terrain = Terrain(tmp_path, max_tiles=2)
+    assert terrain.elevation(41.5, 44.5) is not None
+
+    parsing = threading.Event()
+    release = threading.Event()
+    real_parse = TerrainTile.parse
+
+    def slow_parse(data: bytes) -> TerrainTile:
+        parsing.set()
+        assert release.wait(timeout=5.0), "the test never released the read"
+        return real_parse(data)
+
+    monkeypatch.setattr(TerrainTile, "parse", staticmethod(slow_parse))
+    worker = threading.Thread(target=terrain.load, args=(42.5, 44.5))
+    worker.start()
+    try:
+        assert parsing.wait(timeout=5.0)
+        started = time.perf_counter()
+        assert terrain.elevation(41.5, 44.5) is not None
+        assert terrain.is_loaded(41.5, 44.5)
+        assert time.perf_counter() - started < 1.0, "blocked behind the read"
+        assert not terrain.is_loaded(42.5, 44.5)
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+    assert terrain.cached == ["N41E044", "N42E044"]
+
+
+def test_a_missing_tile_is_remembered_and_the_disk_left_alone_for_a_while(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found in SITL: a listed tile that is not there was opened again on
+    every telemetry message. It is opened once per `retry_missing_s`; once
+    it appears, the next retry loads it."""
+    install(tmp_path, {"N41E044": "COP-DEM GLO-30"}, {})
+    clock = [0.0]
+    terrain = Terrain(tmp_path, retry_missing_s=60.0, clock=lambda: clock[0])
+    opens = [0]
+    real_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(path: Path) -> bytes:
+        opens[0] += 1
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+
+    for _ in range(50):
+        with pytest.raises(TerrainFileError, match="index lists N41E044"):
+            terrain.elevation(41.5, 44.5)
+    assert opens[0] == 1, "one failed open, then the answer is remembered"
+    assert not terrain.is_loaded(41.5, 44.5)
+
+    clock[0] = 59.0
+    with pytest.raises(TerrainFileError):
+        terrain.load(41.5, 44.5)
+    assert opens[0] == 1
+
+    (tmp_path / "N41E044.pgm").write_bytes(tile_bytes())
+    clock[0] = 60.0
+    assert terrain.elevation(41.5, 44.5) is not None
+    assert opens[0] == 2 and terrain.cached == ["N41E044"]
+
+
+def test_a_cache_with_no_room_is_refused(tmp_path: Path) -> None:
+    install(tmp_path, {}, {})
+    with pytest.raises(ValueError, match="max_tiles"):
+        Terrain(tmp_path, max_tiles=0)
+
+
+def test_load_reads_the_tile_so_elevation_need_not(tmp_path: Path) -> None:
+    terrain = install(
+        tmp_path, {**TWO_CELLS, "N42E039": SEA}, {"N41E044": tile_bytes()}
+    )
+    # Unknown and sea cells need no tile: loaded already, and load is a no-op.
+    assert terrain.is_loaded(0.5, 0.5) and terrain.is_loaded(42.5, 39.5)
+    terrain.load(0.5, 0.5)
+    terrain.load(42.5, 39.5)
+    assert terrain.cached == []
+
+    assert not terrain.is_loaded(41.5, 44.5)
+    terrain.load(41.5, 44.5)
+    assert terrain.is_loaded(41.5, 44.5) and terrain.cached == ["N41E044"]
+    (tmp_path / "N41E044.pgm").unlink()
+    assert terrain.elevation(41.5, 44.5) is not None
+
+    with pytest.raises(TerrainFileError, match="index lists N42E044"):
+        terrain.load(42.5, 44.5)
 
 
 def test_a_non_finite_position_is_refused(tmp_path: Path) -> None:

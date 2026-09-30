@@ -23,8 +23,10 @@ was captured, which is the whole reason bindings have validity.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from common import get_logger
@@ -42,7 +44,7 @@ from gateway.link_quality import LinkQualityTracker
 from gateway.live_state import LiveState
 from gateway.parsing import ParsedMessage, SourceId, parse_datagram
 from gateway.publisher import TelemetryPublisher
-from gateway.rate_limit import RateLimiter
+from gateway.rate_limit import DEFAULT_INTERVAL_S, RateLimiter
 from gateway.relay_records import Record
 from gateway.stage_timing import StageTimings, shared_timings
 from gateway.state_buffer import RowWriter
@@ -59,6 +61,20 @@ class _Observed:
     ts: datetime
     message: ParsedMessage
     source: Source
+    # Queued on the relay before the session that delivered it (S-11).
+    backlog: bool
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+# S-11. The longest capture span one batch is allowed to claim. A relay frame
+# is bounded at 64 KiB (relay-v1 §6), about 7.8 s of records at §10's
+# 8.4 KiB/s for three aircraft; a span past this is a station clock that
+# stepped inside the batch, not a real spread, and is clamped and counted so
+# no row is placed minutes before its batch.
+MAX_BATCH_SPAN_S = 120.0
 
 
 @dataclass
@@ -82,15 +98,29 @@ class IngestPipeline:
     live_state: LiveState | None = None
     # P1-11. Optional for the same reason as live state.
     firmware: FirmwareRegistry | None = None
+    # The Gateway's wall clock, stamped on each batch as `rx_ts` (S-11): one
+    # trusted clock for every station, unlike the relays' own.
+    wall: Callable[[], datetime] = _now_utc
 
     registry: SourceRegistry = field(init=False)
     assembler: StateAssembler = field(init=False)
+    # Rows whose in-batch span exceeded `MAX_BATCH_SPAN_S` and were placed
+    # at the clamp instead (S-11). Logged per batch; counted for tests.
+    span_clamped: int = field(default=0, init=False)
 
-    # Unclaimed sources are announced once per address, not once per datagram.
-    # An aircraft transmitting at 84 Hz with no binding would otherwise emit
-    # 84 identical events a second, which is how a genuinely useful signal
-    # becomes something operators filter out.
-    _announced_unclaimed: set[SourceId] = field(default_factory=set, init=False)
+    # Unclaimed sources are announced once per address per interval, not once
+    # per datagram and not once for ever. An aircraft transmitting at 84 Hz
+    # with no binding would otherwise emit 84 identical events a second,
+    # which is how a genuinely useful signal becomes something operators
+    # filter out; announced only once, a station whose clock made every
+    # record unclaimed (S-11) read as healthy after its first minute. Each
+    # repeat carries the count suppressed since the last one.
+    unclaimed_interval_s: float = DEFAULT_INTERVAL_S
+    monotonic: Callable[[], float] = time.monotonic
+    _unclaimed_announced_at: dict[SourceId, float] = field(
+        default_factory=dict, init=False
+    )
+    _unclaimed_suppressed: dict[SourceId, int] = field(default_factory=dict, init=False)
     _bad_frames: int = field(default=0, init=False)
     # P1-09, per source like the accumulator: this station's view of the link.
     _links: dict[SourceId, LinkQualityTracker] = field(default_factory=dict, init=False)
@@ -99,29 +129,57 @@ class IngestPipeline:
         self.registry = SourceRegistry(station_id=self.station_id)
         self.assembler = StateAssembler(station_id=self.station_id)
 
-    async def process(self, epoch: str, records: list[Record]) -> list[DroneStateRow]:
+    async def process(
+        self,
+        epoch: str,
+        records: list[Record],
+        *,
+        newest_seq_held: int = -1,
+        draining: bool = False,
+    ) -> list[DroneStateRow]:
         """Convert a batch of stored records. Never raises into the transport.
+
+        `newest_seq_held` is the delivering session's `hello` value
+        (relay-v1 §5): a record with seq at or below it was queued before the
+        connection and is published with `backlog: true`, so the airspace
+        monitor does not raise live alerts from where an aircraft was during
+        an outage; so is every record while the session is `draining`. Every
+        published message also carries `rx_ts`, this batch's receive time on
+        the Gateway's clock, and `captured_at`, the row placed in time as
+        `rx_ts - (newest ts in the batch - its ts)`: a draining relay's
+        frame holds seconds of capture under one `rx_ts`, and a sample from
+        its start is not simultaneous with one from its end. The station's
+        clock skew cancels within the batch.
 
         Three passes, so bindings are read once per batch rather than once per
         message (P1-13). Per message, the resolver cost one database query:
         about 3.3 ms, which capped the Gateway at about 300 records/s at any
         fleet size and was 96% of the time spent storing a batch (ADR-002).
 
-        Nothing about *which* binding applies changes. Each message is still
-        resolved against its own record's capture time, with the source as it
-        was classified at that message - `Source` is a frozen snapshot, so
+        Nothing about *which* binding applies changes. Each message is
+        resolved against its own placed time (`captured_at`, on the Gateway's
+        clock), with the source as it was classified at that message. Not
+        the station's `ts`: relay-v1 §9 allows that clock to be wrong, and a
+        station an hour slow resolved every record against the bindings of
+        an hour ago, silently, as unclaimed. `Source` is a frozen snapshot, so
         classifying the whole batch first cannot leak a later HEARTBEAT back
         into an earlier message's resolution.
         """
-        observed = self._observe(epoch, records)
+        rx_ts = self.wall()
+        observed = self._observe(epoch, records, newest_seq_held, draining)
         if not observed:
             return []
+        newest_ts = max(item.ts for item in observed)
+        placed = [self._placed(rx_ts, newest_ts, item) for item in observed]
 
         try:
             with self.timings.measure("process.resolve"):
                 resolutions = await self.resolver.resolve_batch(
                     self.station_id,
-                    [(item.source, item.ts) for item in observed],
+                    [
+                        (item.source, at)
+                        for item, at in zip(observed, placed, strict=True)
+                    ],
                 )
         except Exception as error:
             # The flight record is already durable (obligation 9); what is lost
@@ -140,9 +198,14 @@ class IngestPipeline:
             return []
 
         rows: list[DroneStateRow] = []
+        # Parallel to `rows`: whether each came from a backlog record (a
+        # batch can straddle the `hello` boundary, so it is per row), and
+        # where each is placed in time.
+        backlog: list[bool] = []
+        captured_at: list[datetime] = []
         # Which address each drone was seen on in this batch, for its link.
         sources_by_drone: dict[UUID, SourceId] = {}
-        for item, resolution in zip(observed, resolutions, strict=True):
+        for item, resolution, at in zip(observed, resolutions, placed, strict=True):
             if resolution.drone_id is not None:
                 sources_by_drone[resolution.drone_id] = item.source.source_id
             try:
@@ -160,6 +223,8 @@ class IngestPipeline:
                 continue
             if row is not None:
                 rows.append(row)
+                backlog.append(item.backlog)
+                captured_at.append(at)
 
         if rows:
             labels: dict[UUID, str] = {}
@@ -174,7 +239,15 @@ class IngestPipeline:
                         for drone_id, source_id in sources_by_drone.items()
                     }
                     firmware = await self._firmware_summaries(rows)
-                    await self.publisher.publish_rows(rows, labels, links, firmware)
+                    await self.publisher.publish_rows(
+                        rows,
+                        labels,
+                        links,
+                        firmware,
+                        rx_ts=rx_ts,
+                        backlog=backlog,
+                        captured_at=captured_at,
+                    )
             except Exception as error:
                 _log.error(
                     "could not write drone_state",
@@ -219,10 +292,38 @@ class IngestPipeline:
             tracker = self._links[source_id] = LinkQualityTracker()
         return tracker
 
-    def _observe(self, epoch: str, records: list[Record]) -> list[_Observed]:
+    def _placed(
+        self, rx_ts: datetime, newest_ts: datetime, item: _Observed
+    ) -> datetime:
+        """Where the row sits in time on the Gateway's clock: `rx_ts` less
+        how far behind the batch's newest record it was captured."""
+        behind_s = (newest_ts - item.ts).total_seconds()
+        if behind_s < 0.0 or behind_s > MAX_BATCH_SPAN_S:
+            self.span_clamped += 1
+            _log.warning(
+                "a record's capture time is out of its batch's span; clamped",
+                extra={
+                    "station_id": self.station_id,
+                    "seq": item.seq,
+                    "behind_s": round(behind_s, 1),
+                    "max_batch_span_s": MAX_BATCH_SPAN_S,
+                    "span_clamped": self.span_clamped,
+                },
+            )
+            behind_s = min(max(behind_s, 0.0), MAX_BATCH_SPAN_S)
+        return rx_ts - timedelta(seconds=behind_s)
+
+    def _observe(
+        self,
+        epoch: str,
+        records: list[Record],
+        newest_seq_held: int,
+        draining: bool,
+    ) -> list[_Observed]:
         """Parse and classify every message, in order, with its capture time."""
         observed: list[_Observed] = []
         for record in records:
+            backlog = draining or record.seq <= newest_seq_held
             try:
                 with self.timings.measure("process.parse"):
                     parsed = parse_datagram(record.datagram)
@@ -235,7 +336,7 @@ class IngestPipeline:
                 for message in parsed.messages:
                     source = self.registry.observe(message)
                     self._link(source.source_id).observe(message, ts)
-                    observed.append(_Observed(record.seq, ts, message, source))
+                    observed.append(_Observed(record.seq, ts, message, source, backlog))
             except Exception as error:
                 _log.error(
                     "could not convert a record",
@@ -330,9 +431,15 @@ class IngestPipeline:
             return
         source_id = source.source_id
 
-        if source_id in self._announced_unclaimed:
+        now = self.monotonic()
+        announced_at = self._unclaimed_announced_at.get(source_id)
+        if announced_at is not None and now - announced_at < self.unclaimed_interval_s:
+            self._unclaimed_suppressed[source_id] = (
+                self._unclaimed_suppressed.get(source_id, 0) + 1
+            )
             return
-        self._announced_unclaimed.add(source_id)
+        self._unclaimed_announced_at[source_id] = now
+        suppressed = self._unclaimed_suppressed.pop(source_id, 0)
 
         _log.warning(
             "unclaimed source",
@@ -341,9 +448,12 @@ class IngestPipeline:
                 "sysid": source_id.sysid,
                 "compid": source_id.compid,
                 "reason": resolution.unclaimed_reason,
+                "suppressed": suppressed,
             },
         )
-        await self.resolver.record_unclaimed(self.station_id, epoch, resolution)
+        await self.resolver.record_unclaimed(
+            self.station_id, epoch, resolution, suppressed=suppressed
+        )
         await self.publisher.publish_unclaimed(self.station_id, resolution, source_id)
 
     async def _report_rejected(self, epoch: str, resolution: Resolution) -> None:
@@ -380,7 +490,8 @@ class IngestPipeline:
         operator is told again rather than the silence being mistaken for
         everything being fine.
         """
-        self._announced_unclaimed.discard(source_id)
+        self._unclaimed_announced_at.pop(source_id, None)
+        self._unclaimed_suppressed.pop(source_id, None)
 
 
 @dataclass
@@ -415,5 +526,15 @@ class StationPipelines:
             self.pipelines[station_id] = pipeline
         return pipeline
 
-    async def process(self, station_id: str, epoch: str, records: list[Record]) -> None:
-        await self.for_station(station_id).process(epoch, records)
+    async def process(
+        self,
+        station_id: str,
+        epoch: str,
+        records: list[Record],
+        *,
+        newest_seq_held: int = -1,
+        draining: bool = False,
+    ) -> None:
+        await self.for_station(station_id).process(
+            epoch, records, newest_seq_held=newest_seq_held, draining=draining
+        )
