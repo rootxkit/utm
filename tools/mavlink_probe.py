@@ -775,7 +775,7 @@ def cmd_roundtrip(args: argparse.Namespace) -> int:
         print("window, which is not evidence of a reply. Re-run if this is high.")
         print()
     print("This is the expected outcome and the one the plan assumes.")
-    print("Missions stay in QGC until mavlink-router replaces forwarding (P3B-01).")
+    print("The system only observes; missions and commands stay in QGC.")
     return 0
 
 

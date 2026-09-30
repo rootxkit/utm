@@ -795,6 +795,27 @@ never commands an aircraft.
 
 ---
 
+## Phase 7 — Link failure behaviour, monitoring side (1 week)
+
+Goal: every way a data source can fail is visible to the supervisor, and none
+of them is mistaken for a quiet sky. The flight controller's own failsafes are
+the operator's responsibility and are not tested here.
+
+- [ ] **P7-01** Relay or server link loss >30 s: the station shows
+      `unreachable`, the affected aircraft are marked stale rather than
+      dropped, the backlog replays on reconnect, and the gap is recorded with
+      its wall-clock window.
+      *Done when:* a SITL run with the relay's uplink cut for 60 s shows all
+      four in the console and in replay.
+- [ ] **P7-11** Ground PC or QGC crash mid-flight: the station and its
+      aircraft go stale with the cause visible, and a relay restart is
+      detected even when the Gateway was unreachable for longer than the old
+      uptime.
+      *Done when:* killing QGC and then the relay in SITL shows both
+      transitions, and restarting them resumes the same tracks.
+
+---
+
 ## Phase 10 — Operations (1.5 weeks)
 
 - [ ] **P10-01** Prometheus metrics: tracked aircraft by source, ingest rates,
@@ -831,6 +852,20 @@ never commands an aircraft.
       authority publishes zones and the register, and who operates the system.
       **Do this before wave M is built** — the answer shapes M-03 and M-04.
 - [ ] **P11-02** Remote ID requirements and hardware selection.
+
+---
+
+## Wave 0 — Remove the delivery scope
+
+- [x] **P-01** Delete `dispatch/` and `app-customer/` and every build, CI and
+      test reference to them.
+- [x] **P-02** Rewrite this file for flight monitoring: delivery tasks
+      removed, waves S, M and D added.
+- [x] **P-03** README, `CLAUDE.md`, `docs/ARCHITECTURE.md` and module docs
+      describe a monitor that never commands an aircraft.
+- [x] **P-04** No code comment cites a removed task.
+      *Done when:* a grep for the delivery scope finds only `courier_*`
+      identifiers, which S-14 renames.
 
 ---
 
