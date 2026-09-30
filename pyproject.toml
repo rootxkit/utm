@@ -39,6 +39,10 @@ dependencies = [
     # truth for the TypeScript clients in Phase 6.
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    # The Gateway parses MAVLink with it (gateway/classify.py). It was listed
+    # as a development extra, which every developer machine installs, so its
+    # absence showed only when the first production image started (P0-09).
+    "pymavlink>=2.4.40",
 ]
 
 [project.optional-dependencies]
@@ -51,17 +55,12 @@ dev = [
     # Drives the FastAPI app in-process for the console feed tests, so they
     # need no free port and no running server.
     "httpx>=0.27",
-    # The probe's roundtrip mode packs a PARAM_REQUEST_READ with it, and the
-    # probe's unit tests build synthetic frames with it rather than opening a
-    # socket. Listen mode stays standard-library only so it runs on a bare
-    # ground-station Python with no venv.
-    "pymavlink>=2.4.40",
 ]
 sitl = [
     # Reading MAVLink from simulated vehicles in the integration job. Message
     # and field names are taken from the dialect definitions shipped here.
-    # Also in `dev`; declared here so the integration job's dependency is
-    # visible at the place that needs it.
+    # Also a runtime dependency; declared here so the integration job's
+    # dependency is visible at the place that needs it.
     "pymavlink>=2.4.40",
 ]
 
