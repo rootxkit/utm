@@ -57,7 +57,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from common import get_logger
-from gateway.archive import ArchiveError, RawArchive, SegmentWrite
+from gateway.archive import (
+    ArchiveError,
+    RawArchive,
+    SegmentWrite,
+    group_by_hour,
+    segment_relative_path,
+)
 from gateway.ingest_store import StoreError
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
@@ -165,16 +171,11 @@ class TimescaleIngestStore:
                     "missing_count": fresh[0].seq - (watermark + 1),
                 },
             )
-            await self._archive_and_index(station_id, epoch, fresh)
+            await self._archive_and_index(station_id, epoch, fresh, advance_to=None)
             return watermark
 
-        try:
-            writes = await self._archive_and_index(station_id, epoch, fresh)
-        except ArchiveError as error:
-            raise StoreError(f"archive write failed: {error}") from error
-
-        advanced = writes[-1].last_seq
-        await self._set_watermark(station_id, epoch, advanced)
+        advanced = fresh[-1].seq
+        await self._archive_and_index(station_id, epoch, fresh, advance_to=advanced)
         return await self._extend_through_gaps(station_id, epoch, advanced)
 
     async def record_gap(self, station_id: str, epoch: str, gap: Gap) -> None:
@@ -293,43 +294,136 @@ class TimescaleIngestStore:
     # --- internals ---------------------------------------------------------
 
     async def _archive_and_index(
-        self, station_id: str, epoch: str, records: list[Record]
-    ) -> list[SegmentWrite]:
-        # Files first, fsync included, then the index. A crash between them
-        # leaves an unindexed segment, which is recoverable by rescanning the
-        # tree. The opposite order leaves an index entry for bytes that do not
-        # exist, which is not.
-        # On a worker thread: compression and `fsync` are blocking, and run on
-        # the event loop they were time in which no other station was served,
-        # so one station's fsync stalled every other station's acks (S-04).
-        with self.timings.measure("store.archive"):
-            writes = await asyncio.to_thread(
-                self.archive.append, station_id, epoch, records
+        self,
+        station_id: str,
+        epoch: str,
+        records: list[Record],
+        *,
+        advance_to: int | None,
+    ) -> None:
+        """Append to the archive, then index and advance in one transaction.
+
+        Idempotent, because at-least-once delivery (§10) means the same batch
+        arrives again after any failure between the file and the ack, and the
+        relay keeps resending it until it is acknowledged. Three defences, in
+        the order they apply:
+
+        1. Hour groups whose exact index row `(path, first_seq, last_seq)`
+           already exists are not appended again. This is the recovery path
+           for a station left with the index written and the watermark not:
+           before S-05 those were two transactions, and a crash between them
+           left the next resend raising on `archive_segments_unique` on every
+           attempt, for ever, appending the same bytes to the segment each
+           time. The rows are there, so only the watermark is missing.
+        2. The index insert is `ON CONFLICT DO NOTHING` on that constraint, so
+           a row that exists anyway - a resend re-batched across an hour
+           boundary, say - is not an error.
+        3. The index rows and the watermark commit together. A crash can now
+           only leave an unindexed frame at the end of a segment, which the
+           next resend appends once more; `read_segment` reads across that
+           duplicate (contiguity is not required), and the index says which
+           bytes it vouches for.
+
+        Files first, fsync included, then the index. A crash between them
+        leaves an unindexed frame, which is recoverable. The opposite order
+        leaves an index entry for bytes that do not exist, which is not.
+        """
+        already = await self._indexed_ranges(
+            station_id, epoch, records[0].seq, records[-1].seq
+        )
+        pending: list[Record] = []
+        skipped = 0
+        for hour, group in group_by_hour(records):
+            key = (
+                segment_relative_path(station_id, epoch, hour),
+                group[0].seq,
+                group[-1].seq,
             )
+            if key in already:
+                skipped += len(group)
+            else:
+                pending.extend(group)
+        if skipped:
+            _log.info(
+                "segments already indexed; advancing the watermark only",
+                extra={
+                    "station_id": station_id,
+                    "epoch": epoch,
+                    "records_skipped": skipped,
+                    "advance_to": advance_to,
+                },
+            )
+
+        writes: list[SegmentWrite] = []
+        if pending:
+            # On a worker thread: compression and `fsync` are blocking, and
+            # run on the event loop they were time in which no other station
+            # was served, so one station's fsync stalled every other
+            # station's acks (S-04).
+            try:
+                with self.timings.measure("store.archive"):
+                    writes = await asyncio.to_thread(
+                        self.archive.append, station_id, epoch, pending
+                    )
+            except ArchiveError as error:
+                raise StoreError(f"archive write failed: {error}") from error
+
         try:
             async with self.engine.begin() as connection:
-                await connection.execute(
-                    sa.insert(_segments),
-                    [
-                        {
-                            "station_id": station_id,
-                            "epoch": epoch,
-                            "relative_path": write.relative_path,
-                            "hour_start": write.hour_start,
-                            "first_seq": write.first_seq,
-                            "last_seq": write.last_seq,
-                            "first_recv_utc_ns": write.first_recv_utc_ns,
-                            "last_recv_utc_ns": write.last_recv_utc_ns,
-                            "record_count": write.record_count,
-                            "compressed_bytes": write.compressed_bytes,
-                            "uncompressed_bytes": write.uncompressed_bytes,
-                        }
-                        for write in writes
-                    ],
-                )
+                if writes:
+                    await connection.execute(
+                        pg_insert(_segments).on_conflict_do_nothing(
+                            constraint="archive_segments_unique"
+                        ),
+                        [
+                            {
+                                "station_id": station_id,
+                                "epoch": epoch,
+                                "relative_path": write.relative_path,
+                                "hour_start": write.hour_start,
+                                "first_seq": write.first_seq,
+                                "last_seq": write.last_seq,
+                                "first_recv_utc_ns": write.first_recv_utc_ns,
+                                "last_recv_utc_ns": write.last_recv_utc_ns,
+                                "record_count": write.record_count,
+                                "compressed_bytes": write.compressed_bytes,
+                                "uncompressed_bytes": write.uncompressed_bytes,
+                            }
+                            for write in writes
+                        ],
+                    )
+                if advance_to is not None:
+                    await connection.execute(
+                        _advance_watermark(station_id, epoch, advance_to)
+                    )
         except SQLAlchemyError as error:
             raise StoreError(f"could not index archive segments: {error}") from error
-        return writes
+
+    async def _indexed_ranges(
+        self, station_id: str, epoch: str, first_seq: int, last_seq: int
+    ) -> set[tuple[str, int, int]]:
+        """Index rows already covering part of `[first_seq, last_seq]`."""
+        try:
+            async with self.engine.connect() as connection:
+                rows = (
+                    await connection.execute(
+                        sa.select(
+                            _segments.c.relative_path,
+                            _segments.c.first_seq,
+                            _segments.c.last_seq,
+                        ).where(
+                            _segments.c.station_id == station_id,
+                            _segments.c.epoch == epoch,
+                            _segments.c.first_seq >= first_seq,
+                            _segments.c.last_seq <= last_seq,
+                        )
+                    )
+                ).all()
+        except SQLAlchemyError as error:
+            raise StoreError(f"could not read the archive index: {error}") from error
+        return {
+            (row.relative_path, int(row.first_seq), int(row.last_seq)) for row in rows
+        }
 
     async def _watermark(self, station_id: str, epoch: str) -> int:
         try:
@@ -347,18 +441,7 @@ class TimescaleIngestStore:
     async def _set_watermark(self, station_id: str, epoch: str, seq: int) -> None:
         try:
             async with self.engine.begin() as connection:
-                await connection.execute(
-                    sa.update(_epochs)
-                    .where(
-                        _epochs.c.station_id == station_id,
-                        _epochs.c.epoch == epoch,
-                        # Never move backwards. Two connections from one
-                        # station - a reconnect racing a half-closed session -
-                        # must not let a stale value undo progress.
-                        _epochs.c.highest_contiguous_seq < seq,
-                    )
-                    .values(highest_contiguous_seq=seq, last_seen_at=_now())
-                )
+                await connection.execute(_advance_watermark(station_id, epoch, seq))
         except SQLAlchemyError as error:
             raise StoreError(f"could not advance the watermark: {error}") from error
 
@@ -451,6 +534,21 @@ class TimescaleIngestStore:
                 )
         except SQLAlchemyError as error:
             raise StoreError(f"could not record {event_type}: {error}") from error
+
+
+def _advance_watermark(station_id: str, epoch: str, seq: int) -> sa.Update:
+    return (
+        sa.update(_epochs)
+        .where(
+            _epochs.c.station_id == station_id,
+            _epochs.c.epoch == epoch,
+            # Never move backwards. Two connections from one station - a
+            # reconnect racing a half-closed session - must not let a stale
+            # value undo progress.
+            _epochs.c.highest_contiguous_seq < seq,
+        )
+        .values(highest_contiguous_seq=seq, last_seen_at=_now())
+    )
 
 
 def _now() -> datetime:

@@ -128,7 +128,7 @@ class RawArchive:
             return []
 
         writes: list[SegmentWrite] = []
-        for hour, group in _group_by_hour(records):
+        for hour, group in group_by_hour(records):
             writes.append(self._append_to_segment(station_id, epoch, hour, group))
         return writes
 
@@ -247,7 +247,8 @@ class RawArchive:
         )
 
 
-def _group_by_hour(records: list[Record]) -> list[tuple[datetime, list[Record]]]:
+def group_by_hour(records: list[Record]) -> list[tuple[datetime, list[Record]]]:
+    """Split records into the hour segments `append` would write them to."""
     groups: list[tuple[datetime, list[Record]]] = []
     for record in records:
         hour = segment_hour(record.recv_utc_ns)
