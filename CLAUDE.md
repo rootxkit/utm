@@ -30,7 +30,12 @@ the commit message.
    All of these live in config or the database.
 4. **Do not invent MAVLink message fields.** Check `pymavlink` message
    definitions before using a field name.
-5. If a task is ambiguous, stop and ask. Do not guess on anything touching
+5. **An alert path is not done without a SITL or scenario test.** Conflict,
+   zone, height and link-loss alerts are the safety-relevant output of this
+   system. Each one must be raised, and cleared, by aircraft flying in SITL
+   (or a scenario in `sim/scenarios/`) before it is considered done; a unit
+   test alone does not count.
+6. If a task is ambiguous, stop and ask. Do not guess on anything touching
    flight behaviour.
 
 ## Language

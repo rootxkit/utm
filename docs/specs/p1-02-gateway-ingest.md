@@ -194,12 +194,12 @@ Per ADR-001. These produce `drone_state` rows:
 | `HEARTBEAT` | liveness, flight mode, armed state |
 | `GLOBAL_POSITION_INT` | position, altitude AGL and AMSL, heading, velocity |
 | `SYS_STATUS` | battery percent, voltage |
-| `BATTERY_STATUS` | energy accounting for the P4-03 budget |
+| `BATTERY_STATUS` | energy accounting (the P4-03 budget was removed with the delivery scope) |
 | `GPS_RAW_INT` | fix type, satellite count |
 | `VFR_HUD` | ground speed, climb rate |
-| `EKF_STATUS_REPORT` | health alerting (P7-10) |
-| `MISSION_CURRENT` | progress inference (P3-06) |
-| `MISSION_ITEM_REACHED` | waypoint completion (P3-06) |
+| `EKF_STATUS_REPORT` | health alerting (P7-10 was removed with the delivery scope) |
+| `MISSION_CURRENT` | progress inference (P3-06, removed with the delivery scope) |
+| `MISSION_ITEM_REACHED` | waypoint completion (P3-06, removed with the delivery scope) |
 | `STATUSTEXT` | FC messages and failsafe reasons |
 
 **Everything else is archived, not discarded.** ADR-001 measured 31 message
