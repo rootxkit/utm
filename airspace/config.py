@@ -21,3 +21,19 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     # P5-19. The same tiles the API serves (P5-00). Unset: the height limit
     # in airspace_policy is not evaluated, and the service says so.
     terrain_dir: Path | None = Field(default=None, validation_alias="TERRAIN_DIR")
+    # S-11. A telemetry message whose capture time (`ts`) is further than
+    # this from the monitor's clock is not live: a backlog replayed after an
+    # outage, or a ground station with a wrong clock (relay-v1 §9). It is
+    # counted and logged, never evaluated as "now". Live delivery is under
+    # 2 s end to end, and this is kept below the 15 s after which an aircraft
+    # is dropped as stale, so an accepted message is evaluated before it is
+    # already stale.
+    live_max_age_s: float = Field(default=10.0, gt=0, validation_alias="LIVE_MAX_AGE_S")
+    # S-11. A neighbour's latest sample older than this, relative to the
+    # subject's capture time, is left out of the CPA check. Younger ones are
+    # advanced along their velocity to the subject's capture time. The
+    # advance is a straight line; over 10 s a multirotor can have turned
+    # through any angle, so beyond that the line says nothing.
+    neighbour_max_age_s: float = Field(
+        default=10.0, gt=0, validation_alias="NEIGHBOUR_MAX_AGE_S"
+    )

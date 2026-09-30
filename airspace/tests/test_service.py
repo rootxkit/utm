@@ -4,6 +4,7 @@ going when either fails."""
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -20,12 +21,15 @@ POLICY = SeparationPolicy(
 )
 
 
-def payload(drone_id: UUID, north_m: float, vn: float, armed: bool = True) -> bytes:
+def payload(
+    drone_id: UUID, north_m: float, vn: float, armed: bool = True, at_s: float = 0.0
+) -> bytes:
     n1, _ = local_offset_m(LAT0, LON0, LAT0 + 0.001, LON0)
     return json.dumps(
         {
             "drone_id": str(drone_id),
             "label": f"D{drone_id.int}",
+            "ts": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
             "lat_deg": LAT0 + 0.001 * north_m / n1,
             "lon_deg": LON0,
             "alt_amsl_m": 550.0,

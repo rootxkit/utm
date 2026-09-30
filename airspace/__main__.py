@@ -47,6 +47,8 @@ async def run(settings: AirspaceSettings) -> None:
         zones=await load_zones(engine),
         terrain=terrain,
         max_height_agl_m=max_height_agl_m,
+        live_max_age_s=settings.live_max_age_s,
+        neighbour_max_age_s=settings.neighbour_max_age_s,
     )
     bus = await nats.connect(str(settings.nats_url))
     service = AirspaceService(monitor=monitor, bus=bus, audit=EventsAuditLog(engine))

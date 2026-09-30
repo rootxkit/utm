@@ -19,6 +19,19 @@ An aircraft whose telemetry has not been heard for `stale_after_s` is dropped
 and its alerts cleared: it is not known to be anywhere any more, and the link
 state already says why (P1-05).
 
+## Time is the capture time, not the arrival time (S-11)
+
+Every message carries `ts`, the relay's capture clock. A track is placed at
+that instant, and a pair's CPA is computed at the later of the two capture
+times with the older track advanced along its velocity (`cpa.advance`): a
+neighbour's 5 s old sample, used as if current, is 75 m wrong at 15 m/s
+against a 60 m threshold. A neighbour older than `neighbour_max_age_s` is
+left out altogether. A message captured further than `live_max_age_s` from
+the monitor's clock, either way, is not live (a replayed backlog, or a wrong
+ground-station clock) and is counted and not evaluated: it must not raise an
+alert about where an aircraft was minutes ago. A message older than the
+sample already held for its aircraft is ignored for the same reason.
+
 ## Raise once, clear with hysteresis
 
 An alert is raised once per condition, not once per tick, and cleared only
@@ -55,6 +68,7 @@ and P5-09, not built here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
@@ -62,7 +76,10 @@ from uuid import UUID
 from airspace.cpa import Approach, SeparationPolicy, Track, closest_approach
 from airspace.neighbours import NeighbourIndex
 from airspace.zones import Zone, ZoneType
+from common import get_logger
 from common.terrain import Elevation
+
+_log = get_logger(__name__)
 
 
 class Severity(StrEnum):
@@ -108,8 +125,27 @@ class Change:
     cleared: list[Alert]
 
 
+def captured_at_s(message: dict[str, Any]) -> float:
+    """The message's capture time as epoch seconds, from its ISO 8601 `ts`.
+
+    Raises ValueError when there is none: a position with no time cannot be
+    compared with anything, and guessing "now" is what S-11 removed.
+    """
+    ts = message.get("ts")
+    if not isinstance(ts, str):
+        raise ValueError("telemetry has no ts")
+    moment = datetime.fromisoformat(ts)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.timestamp()
+
+
 def track_from_telemetry(message: dict[str, Any]) -> Track | None:
-    """A Track, or None if the message cannot place the aircraft in 3-D."""
+    """A Track, or None if the message cannot place the aircraft in 3-D.
+
+    Raises ValueError for a message that has the fields but cannot be used:
+    no capture time.
+    """
     needed = ("lat_deg", "lon_deg", "alt_amsl_m", "vx_ms", "vy_ms", "vz_ms")
     if any(message.get(name) is None for name in needed):
         return None
@@ -121,6 +157,7 @@ def track_from_telemetry(message: dict[str, Any]) -> Track | None:
         vn_ms=float(message["vx_ms"]),
         ve_ms=float(message["vy_ms"]),
         vd_ms=float(message["vz_ms"]),
+        captured_at_s=captured_at_s(message),
     )
 
 
@@ -155,8 +192,16 @@ class AirspaceMonitor:
     max_height_agl_m: float | None = None
     stale_after_s: float = 15.0
     clear_after_s: float = 3.0
+    # S-11; the defaults match `airspace.config.AirspaceSettings`.
+    live_max_age_s: float = 10.0
+    neighbour_max_age_s: float = 10.0
 
     index: NeighbourIndex = field(init=False)
+    # Messages not evaluated because they were not live, or older than the
+    # sample already held. Counted so a replayed backlog, or a wrong
+    # ground-station clock, shows in the log rather than in the silence.
+    rejected: int = field(default=0, init=False)
+    _rejected_logged: set[UUID] = field(default_factory=set, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     _active: dict[str, Alert] = field(default_factory=dict, init=False)
@@ -173,7 +218,12 @@ class AirspaceMonitor:
         return list(self._active.values())
 
     def observe(self, message: dict[str, Any], *, now_s: float) -> Change:
-        """Take one telemetry message; return the alerts it raised or cleared."""
+        """Take one telemetry message; return the alerts it raised or cleared.
+
+        `now_s` is the monitor's wall clock, on the same epoch as the
+        message's `ts`. The message is evaluated at its capture time; `now_s`
+        only decides whether it is live at all, and what has gone stale.
+        """
         drone_id = UUID(str(message["drone_id"]))
         self._labels[drone_id] = message.get("label")
         track = track_from_telemetry(message) if _flying(message) else None
@@ -182,20 +232,50 @@ class AirspaceMonitor:
         if track is None:
             self.index.remove(drone_id)
             self._last_seen_s.pop(drone_id, None)
-        else:
+        elif not self._rejects(track, now_s):
+            at_s = track.captured_at_s
             self.index.upsert(track)
-            self._last_seen_s[drone_id] = now_s
-            raised.extend(self._check_conflicts(track, now_s))
-            raised.extend(self._check_zones(track, now_s))
-            raised.extend(self._check_height(track, now_s))
+            self._last_seen_s[drone_id] = at_s
+            raised.extend(self._check_conflicts(track, at_s))
+            raised.extend(self._check_zones(track, at_s))
+            raised.extend(self._check_height(track, at_s))
             # Every active alert this aircraft is part of was just evaluated.
             # The ones not refreshed are false as of this message.
             for key, alert in self._active.items():
-                if drone_id in alert.drone_ids and self._last_true_s[key] != now_s:
-                    self._last_false_s[key] = now_s
+                if drone_id in alert.drone_ids and self._last_true_s[key] != at_s:
+                    self._last_false_s[key] = at_s
 
         cleared = self._expire(now_s)
         return Change(raised=raised, cleared=cleared)
+
+    def _rejects(self, track: Track, now_s: float) -> bool:
+        """Whether the sample must not be evaluated: not live, or older than
+        the one already held. Counted, and logged once per aircraft per run
+        of rejections, so a backlog of thousands is one line, not thousands.
+        """
+        age_s = now_s - track.captured_at_s
+        held = self.index.track(track.drone_id)
+        if abs(age_s) > self.live_max_age_s:
+            reason = "not live"
+        elif held is not None and track.captured_at_s < held.captured_at_s:
+            reason = "older than the sample held"
+        else:
+            self._rejected_logged.discard(track.drone_id)
+            return False
+        self.rejected += 1
+        if track.drone_id not in self._rejected_logged:
+            self._rejected_logged.add(track.drone_id)
+            _log.warning(
+                "telemetry not evaluated",
+                extra={
+                    "drone_id": str(track.drone_id),
+                    "reason": reason,
+                    "age_s": round(age_s, 1),
+                    "live_max_age_s": self.live_max_age_s,
+                    "rejected": self.rejected,
+                },
+            )
+        return True
 
     def tick(self, *, now_s: float) -> Change:
         """Drop stale aircraft and clear what has resolved, with no message.
@@ -211,6 +291,12 @@ class AirspaceMonitor:
     def _check_conflicts(self, track: Track, now_s: float) -> list[Alert]:
         raised: list[Alert] = []
         for other in self.index.neighbours(track.drone_id):
+            if (
+                abs(track.captured_at_s - other.captured_at_s)
+                > self.neighbour_max_age_s
+            ):
+                # Too old to advance along a straight line with any meaning.
+                continue
             approach = closest_approach(track, other)
             if not self.policy.is_conflict(approach):
                 continue

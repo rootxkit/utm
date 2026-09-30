@@ -71,7 +71,7 @@ def test_above_the_limit_raises_one_warning_with_the_numbers() -> None:
         "ground_elevation_m": 500.0,
         "dataset": "COP-DEM GLO-30",
     }
-    assert m.observe(message(A, 0, alt_amsl_m=655.0), now_s=1.0).raised == []
+    assert m.observe(message(A, 0, alt_amsl_m=655.0, at_s=1.0), now_s=1.0).raised == []
     assert m.active[0].detail["height_agl_m"] == 155.0
 
 
@@ -91,7 +91,8 @@ def test_over_falling_ground_the_alert_comes_where_the_ground_drops_away() -> No
     m = monitor(Slope(base_m=500.0, fall_per_m=0.1))
     first_alert_m = None
     for step, north_m in enumerate(range(0, 400, 10)):
-        change = m.observe(message(A, north_m, alt_amsl_m=599.5, vn=10), now_s=step)
+        sample = message(A, north_m, alt_amsl_m=599.5, vn=10, at_s=step)
+        change = m.observe(sample, now_s=step)
         if change.raised and first_alert_m is None:
             first_alert_m = north_m
 
@@ -102,9 +103,9 @@ def test_it_clears_once_below_the_limit_for_longer_than_the_hysteresis() -> None
     m = monitor()
     m.observe(message(A, 0, alt_amsl_m=650.0), now_s=0.0)
 
-    assert m.observe(message(A, 0, alt_amsl_m=600.0), now_s=1.0).cleared == []
-    assert m.observe(message(A, 0, alt_amsl_m=600.0), now_s=3.0).cleared == []
-    cleared = m.observe(message(A, 0, alt_amsl_m=600.0), now_s=4.5).cleared
+    assert m.observe(message(A, 0, alt_amsl_m=600.0, at_s=1.0), now_s=1.0).cleared == []
+    assert m.observe(message(A, 0, alt_amsl_m=600.0, at_s=3.0), now_s=3.0).cleared == []
+    cleared = m.observe(message(A, 0, alt_amsl_m=600.0, at_s=4.5), now_s=4.5).cleared
     assert [alert.key for alert in cleared] == [height_key(A)]
 
 
@@ -112,7 +113,7 @@ def test_unknown_ground_is_not_evaluated_rather_than_taken_as_zero() -> None:
     m = monitor(Slope(known_to_m=100.0))
 
     assert m.observe(message(A, 500, alt_amsl_m=5000.0), now_s=0.0).raised == []
-    raised = m.observe(message(A, 0, alt_amsl_m=5000.0), now_s=1.0).raised
+    raised = m.observe(message(A, 0, alt_amsl_m=5000.0, at_s=1.0), now_s=1.0).raised
     assert [alert.kind for alert in raised] == [AlertKind.HEIGHT]
 
 

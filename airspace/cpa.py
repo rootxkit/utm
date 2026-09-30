@@ -60,6 +60,51 @@ class Track:
     ve_ms: float
     # Positive down, as MAVLink sends it.
     vd_ms: float
+    # When the sample was taken (the message's `ts`, the relay's capture
+    # clock, as epoch seconds), never when it arrived. Two tracks are only
+    # comparable at one instant, so the older is advanced to the newer
+    # (`advance`) before the CPA is computed.
+    captured_at_s: float
+
+
+def _radii_m(lat_deg: float) -> tuple[float, float]:
+    """WGS84 meridional and prime-vertical radii of curvature at a latitude."""
+    sin_phi = math.sin(math.radians(lat_deg))
+    denominator = math.sqrt(1 - _WGS84_E2 * sin_phi * sin_phi)
+    prime_vertical_m = _WGS84_A_M / denominator
+    meridional_m = _WGS84_A_M * (1 - _WGS84_E2) / denominator**3
+    return meridional_m, prime_vertical_m
+
+
+def advance(track: Track, dt_s: float) -> Track:
+    """The track carried `dt_s` forward (or back, for a negative `dt_s`) along
+    its velocity, as a straight line.
+
+    Where a neighbour's latest sample is older than the subject's, this is
+    what the CPA is computed from: a 5 s old sample of an aircraft at 15 m/s
+    is 75 m from where the aircraft is, against a 60 m threshold. A straight
+    line is the same assumption the CPA itself makes.
+    """
+    if dt_s == 0.0:
+        return track
+    meridional_m, prime_vertical_m = _radii_m(track.lat_deg)
+    lat_deg = track.lat_deg + math.degrees(track.vn_ms * dt_s / meridional_m)
+    east_per_deg_m = prime_vertical_m * math.cos(math.radians(track.lat_deg))
+    lon_deg = track.lon_deg + math.degrees(track.ve_ms * dt_s / east_per_deg_m)
+    # Wrapped into [-180, 180) so a track advanced across the antimeridian is
+    # still a longitude.
+    lon_deg = (lon_deg + 180.0) % 360.0 - 180.0
+    return Track(
+        drone_id=track.drone_id,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        # Altitude up is AMSL; velocity down is positive, so it subtracts.
+        alt_amsl_m=track.alt_amsl_m - track.vd_ms * dt_s,
+        vn_ms=track.vn_ms,
+        ve_ms=track.ve_ms,
+        vd_ms=track.vd_ms,
+        captured_at_s=track.captured_at_s + dt_s,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,10 +131,7 @@ def local_offset_m(
     few kilometres.
     """
     phi = math.radians(lat0_deg)
-    sin_phi = math.sin(phi)
-    denominator = math.sqrt(1 - _WGS84_E2 * sin_phi * sin_phi)
-    prime_vertical_m = _WGS84_A_M / denominator
-    meridional_m = _WGS84_A_M * (1 - _WGS84_E2) / denominator**3
+    meridional_m, prime_vertical_m = _radii_m(lat0_deg)
     north_m = math.radians(lat_deg - lat0_deg) * meridional_m
     # Longitude difference wrapped into (-180, 180], so a pair straddling the
     # antimeridian is not 40,000 km apart.
@@ -107,7 +149,15 @@ def horizontal_distance_m(a: Track, b: Track) -> float:
 
 
 def closest_approach(a: Track, b: Track) -> Approach:
-    """The pair's closest approach from now, per §6.2."""
+    """The pair's closest approach from now, per §6.2.
+
+    "Now" is the later of the two capture times; the older sample is advanced
+    to it first (S-11). `t_cpa_s` counts from that instant.
+    """
+    if a.captured_at_s < b.captured_at_s:
+        a = advance(a, b.captured_at_s - a.captured_at_s)
+    elif b.captured_at_s < a.captured_at_s:
+        b = advance(b, a.captured_at_s - b.captured_at_s)
     # Origin at the midpoint latitude, so neither aircraft is favoured by the
     # projection.
     lat0 = (a.lat_deg + b.lat_deg) / 2

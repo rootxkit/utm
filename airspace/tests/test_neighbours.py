@@ -27,6 +27,7 @@ def scattered(count: int, *, spread_deg: float, seed: int) -> list[Track]:
             vn_ms=0.0,
             ve_ms=0.0,
             vd_ms=0.0,
+            captured_at_s=0.0,
         )
         for n in range(count)
     ]
@@ -53,7 +54,7 @@ def test_it_finds_exactly_what_brute_force_finds(seed: int) -> None:
 def test_a_moved_aircraft_is_found_where_it_is_now() -> None:
     index = NeighbourIndex(radius_m=800)
     a, b = scattered(2, spread_deg=0.0, seed=1)
-    far = Track(b.drone_id, LAT0 + 0.1, LON0, 550.0, 0.0, 0.0, 0.0)
+    far = Track(b.drone_id, LAT0 + 0.1, LON0, 550.0, 0.0, 0.0, 0.0, 0.0)
     index.upsert(a)
     index.upsert(far)
     assert index.neighbours(a.drone_id) == []

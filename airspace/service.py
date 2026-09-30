@@ -81,7 +81,9 @@ class AirspaceService:
     monitor: AirspaceMonitor
     bus: Bus
     audit: AuditLog | None = None
-    clock: Callable[[], float] = time.monotonic
+    # Wall clock, on the same epoch as telemetry's `ts` (S-11): the monitor
+    # compares the two to tell live telemetry from a replayed backlog.
+    clock: Callable[[], float] = time.time
 
     async def on_telemetry(self, payload: bytes) -> None:
         try:
