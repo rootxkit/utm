@@ -1,0 +1,169 @@
+# Staging on the owner's droplet (P0-09). Run from infra/deploy with the
+# server's own .env next to this file (see env.example):
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Only Caddy publishes ports: 80 and 443. Everything else is on the internal
+# network, including both databases, Redis and NATS. utm.<domain> is the
+# console and API over HTTPS; ingest.<domain> is the relay-v1 WSS endpoint
+# stations deliver to.
+
+name: utm
+
+x-app: &app
+  image: utm-app:latest
+  env_file: .env
+  restart: unless-stopped
+  networks: [internal]
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "--locale=C.UTF-8 --encoding=UTF8"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../initdb/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    restart: unless-stopped
+    networks: [internal]
+
+  timescale:
+    image: timescale/timescaledb-ha:pg16
+    environment:
+      POSTGRES_USER: ${TIMESCALE_USER}
+      POSTGRES_PASSWORD: ${TIMESCALE_PASSWORD}
+      POSTGRES_DB: ${TIMESCALE_DB}
+    volumes:
+      - ts_data:/home/postgres/pgdata
+      - ../initdb/timescale:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 36
+      start_period: 40s
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server --appendonly yes --save 60 1000
+      --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks: [internal]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -S -O - http://127.0.0.1:8222/healthz 2>&1 | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+    networks: [internal]
+
+  migrate:
+    image: utm-app:latest
+    build:
+      context: ../..
+      dockerfile: infra/deploy/Dockerfile
+    env_file: .env
+    command:
+      - sh
+      - -c
+      - >
+        alembic -c infra/migrations/telemetry/alembic.ini upgrade head &&
+        alembic -c infra/migrations/relational/alembic.ini upgrade head
+    depends_on:
+      postgres: {condition: service_healthy}
+      timescale: {condition: service_healthy}
+    restart: "no"
+    networks: [internal]
+
+  gateway:
+    <<: *app
+    command: ["python", "-m", "gateway", "--tokens", "/secrets/gateway.tokens", "--port", "8081"]
+    volumes:
+      - ./secrets/gateway.tokens:/secrets/gateway.tokens:ro
+      - archive:/data/archive
+
+  api:
+    <<: *app
+    command: ["python", "-m", "api"]
+    environment:
+      API_HOST: 0.0.0.0
+    volumes:
+      - ./data/terrain:/data/terrain:ro
+      - ./data/basemap:/data/basemap:ro
+
+  console:
+    <<: *app
+    command: ["python", "-m", "api.console"]
+    environment:
+      CONSOLE_HOST: 0.0.0.0
+    volumes:
+      - ./data/basemap:/data/basemap:ro
+
+  airspace:
+    <<: *app
+    command: ["python", "-m", "airspace"]
+    volumes:
+      - ./data/terrain:/data/terrain:ro
+
+  remote-id:
+    <<: *app
+    command: ["python", "-m", "gateway.remote_id_ingest"]
+    volumes:
+      - ./data/geoid:/data/geoid:ro
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      UTM_HOST: ${UTM_HOST}
+      INGEST_HOST: ${INGEST_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api, console, gateway]
+    restart: unless-stopped
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  pg_data:
+  ts_data:
+  redis_data:
+  nats_data:
+  archive:
+  caddy_data:
+  caddy_config:
