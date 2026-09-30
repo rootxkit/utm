@@ -113,11 +113,13 @@ Do not add a dependency without a one-line justification in the commit body.
 
 **Python**
 - `ruff` for lint and format, `mypy --strict` on `gateway/`, `airspace/`,
-  `common/`, `agent/` and `tools/`. Type errors there are build failures. The
-  first two are safety-relevant; `common/` because they import it, `agent/`
-  because the ground relay enforces the receive-only (Stage 0) guarantee and is
-  where telemetry is lost for good if it is lost at all, and `tools/` because
-  the diagnostics produce the evidence decisions rest on. The authoritative
+  `common/`, `agent/`, `tools/` and `api/`. Type errors there are build
+  failures. The first two are safety-relevant; `common/` because they import
+  it, `agent/` because the ground relay enforces the receive-only (Stage 0)
+  guarantee and is where telemetry is lost for good if it is lost at all,
+  `tools/` because the diagnostics produce the evidence decisions rest on, and
+  `api/` because it is the sign-in boundary and the only writer of the fleet
+  registry and its telemetry projection. The authoritative
   list is the strict override in `pyproject.toml`, and
   `tests/test_layout.py` fails if the two disagree.
   Note that mypy's `strict` flag is global: setting it inside a per-module
