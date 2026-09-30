@@ -23,6 +23,7 @@ choose a fresh address per attempt.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import time
 from collections import deque
@@ -63,7 +64,7 @@ class LoginRateLimiter:
         now_s = self.clock_s()
         keys = [(("username", username.strip().lower()), self.max_per_username)]
         if address is not None:
-            keys.append((("address", address), self.max_per_address))
+            keys.append((("address", address_key(address)), self.max_per_address))
 
         retry_after_s: float | None = None
         for key, limit in keys:
@@ -97,6 +98,23 @@ class LoginRateLimiter:
                 del self._windows[key]
         while len(self._windows) > self.max_keys:
             del self._windows[next(iter(self._windows))]
+
+
+def address_key(address: str) -> str:
+    """The budget an address draws on: an IPv4 address on its own (/32), an
+    IPv6 address by its /64. One IPv6 subscriber is routinely given a whole
+    /64, so counting single addresses would hand them 2^64 budgets. An
+    IPv4-mapped IPv6 address counts as the IPv4 address it carries. Anything
+    that is not an IP address (a test client's name) is its own key."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if isinstance(parsed, ipaddress.IPv6Address):
+        if parsed.ipv4_mapped is not None:
+            return str(parsed.ipv4_mapped)
+        return str(ipaddress.IPv6Network(f"{parsed}/64", strict=False))
+    return str(parsed)
 
 
 def retry_after_header(wait_s: float) -> str:

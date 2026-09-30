@@ -15,7 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from api.app import create_api_app
 from api.auth import AuthError, Login
-from api.ratelimit import LoginRateLimiter, retry_after_header
+from api.ratelimit import LoginRateLimiter, address_key, retry_after_header
 from api.registry import FleetRegistry
 from api.tests.auth_fakes import ADMIN, FakeAccounts, api_kwargs
 
@@ -108,6 +108,39 @@ def test_memory_is_bounded_under_a_spray_of_names() -> None:
     assert len(limit._windows) <= 50
     # The address that sprayed is the most recently used key and is kept.
     assert ("address", "10.0.0.1") in limit._windows
+
+
+def test_two_ipv6_addresses_in_one_64_share_one_budget() -> None:
+    limit = limiter(Clock(), max_per_address=2, max_per_username=100)
+    assert limit.attempt(address="2001:db8:1:2::1", username="a") is None
+    assert limit.attempt(address="2001:db8:1:2:ffff::9", username="b") is None
+
+    assert limit.attempt(address="2001:db8:1:2:abcd::5", username="c") is not None
+    # The paired absence: the next /64 has its own budget.
+    assert limit.attempt(address="2001:db8:1:3::1", username="d") is None
+
+
+def test_two_ipv4_addresses_do_not_share_a_budget() -> None:
+    limit = limiter(Clock(), max_per_address=2, max_per_username=100)
+    for name in ("a", "b"):
+        assert limit.attempt(address="192.0.2.1", username=name) is None
+    assert limit.attempt(address="192.0.2.1", username="c") is not None
+
+    assert limit.attempt(address="192.0.2.2", username="d") is None
+
+
+@pytest.mark.parametrize(
+    ("address", "key"),
+    [
+        ("192.0.2.7", "192.0.2.7"),
+        ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"),
+        ("2001:DB8:1:2::1", "2001:db8:1:2::/64"),
+        ("::ffff:192.0.2.7", "192.0.2.7"),
+        ("testclient", "testclient"),
+    ],
+)
+def test_address_keys(address: str, key: str) -> None:
+    assert address_key(address) == key
 
 
 @pytest.mark.parametrize(("wait_s", "header"), [(0.0, "1"), (0.2, "1"), (59.1, "60")])
