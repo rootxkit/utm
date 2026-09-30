@@ -1221,3 +1221,31 @@ async def test_a_gap_on_a_resumed_session_starts_at_the_durable_resume_point() -
 
     assert ack["seq"] == 599
     assert "gap:500-600" in store.calls
+
+
+# --- the path carries the protocol version (S-08, protocol §14) ------------
+
+
+async def test_a_connection_to_another_path_is_refused_with_http_404() -> None:
+    """A relay speaking a version this Gateway does not serve is told so at
+    the upgrade, before its token is looked at."""
+    async with running() as server:
+        with pytest.raises(websockets.InvalidStatus) as caught:
+            async with connect(
+                f"ws://127.0.0.1:{server.port_in_use}/relay/v2",
+                additional_headers=auth(),
+            ):
+                pass
+
+    assert caught.value.response.status_code == 404
+
+
+async def test_the_relay_v1_path_is_served() -> None:
+    """The presence half: `url()` is `/relay/v1`, and it is welcomed."""
+    async with (
+        running() as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        welcome = await handshake(connection, hello())
+
+    assert welcome["type"] == "welcome"

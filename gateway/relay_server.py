@@ -65,6 +65,12 @@ _CLOSE_PROTOCOL_ERROR: Final = 1008
 
 _AUTHORIZATION_SCHEME: Final = "Bearer "
 
+# protocol §2 and §14: the path carries the major version. A relay speaking
+# a version this Gateway does not serve is told so with 404 at the upgrade,
+# before its credential is looked at, rather than being welcomed onto a
+# protocol whose record layout or guarantees it may not share.
+RELAY_PATH: Final = "/relay/v1"
+
 
 class RecordProcessor(Protocol):
     """What happens to records once they are durably stored.
@@ -220,6 +226,12 @@ class RelayServer:
         never ran while its tests passed - which is why `agent/` now has a test
         that drives a real 401.
         """
+        if request.path.split("?", 1)[0] != RELAY_PATH:
+            self._log_rejected_connection(
+                connection, f"unsupported path {request.path!r}"
+            )
+            return connection.respond(404, f"not found; relay-v1 is at {RELAY_PATH}\n")
+
         presented = request.headers.get("Authorization")
         if presented is None or not presented.startswith(_AUTHORIZATION_SCHEME):
             self._log_rejected_connection(connection, "missing bearer token")

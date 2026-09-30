@@ -74,7 +74,27 @@ class FileAuthenticator:
                 raise ValueError(
                     f"{path}:{number}: expected 'station_id: token', got {line!r}"
                 )
-            self._by_token[token.strip()] = station_id.strip()
+            station_id = station_id.strip()
+            token = token.strip()
+            # S-08. An empty token would be a station anyone can claim by
+            # sending `Authorization: Bearer ` with nothing after it, and a
+            # token shared by two stations makes the second silently steal
+            # the first's identity: the last line wins in a dict and every
+            # record lands under the wrong station. Both are refused at
+            # startup, where the operator is looking, not at the upgrade.
+            if not station_id:
+                raise ValueError(f"{path}:{number}: the station_id is empty")
+            if not token:
+                raise ValueError(
+                    f"{path}:{number}: the token for {station_id!r} is empty"
+                )
+            if token in self._by_token:
+                raise ValueError(
+                    f"{path}:{number}: the token for {station_id!r} is already "
+                    f"assigned to {self._by_token[token]!r}; a token identifies "
+                    f"exactly one station (relay-v1 §3)"
+                )
+            self._by_token[token] = station_id
         if not self._by_token:
             raise ValueError(f"{path} defines no tokens")
 
