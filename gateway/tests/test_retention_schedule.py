@@ -23,6 +23,7 @@ from gateway.retention import Hold, RetentionSchedule, SweepResult
 class FakeRetention:
     calls: list[str | None] = field(default_factory=list)
     fail_first: bool = False
+    fail_with: type[Exception] = StoreError
     expiring: list[Hold] = field(default_factory=list)
 
     async def sweep(
@@ -30,7 +31,7 @@ class FakeRetention:
     ) -> SweepResult:
         self.calls.append(only_station)
         if self.fail_first and len(self.calls) == 1:
-            raise StoreError("database away")
+            raise self.fail_with("database away")
         return SweepResult(deleted_by_age=1)
 
     async def holds_expiring_within(
@@ -84,6 +85,20 @@ async def test_a_failed_pass_does_not_end_the_schedule() -> None:
     assert schedule.failures == 1
     assert schedule.passes >= 3
     assert len(retention.calls) == schedule.passes
+
+
+async def test_an_unexpected_error_in_a_pass_does_not_end_the_schedule() -> None:
+    """Not only the store's own errors: a stat on a disk that has gone away
+    raises OSError, and that too must cost one pass, not every later one."""
+    retention = FakeRetention(fail_first=True, fail_with=OSError)
+    schedule = RetentionSchedule(
+        retention=retention, store=FakeStore(), interval_s=0.01
+    )
+
+    await run_for(schedule, 0.1)
+
+    assert schedule.failures == 1
+    assert schedule.passes >= 3
 
 
 async def test_the_schedule_stops_promptly_when_told() -> None:

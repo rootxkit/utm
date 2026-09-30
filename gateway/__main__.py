@@ -222,7 +222,14 @@ async def run(args: argparse.Namespace) -> int:
         _log.info("gateway stopping")
         stopping.set()
         if sweeper is not None:
-            await sweeper
+            try:
+                await sweeper
+            except Exception as error:
+                # Shutdown goes on regardless: the server must stop and the
+                # state writer must flush whatever the sweeper did.
+                _log.error(
+                    "retention task ended with an error", extra={"error": repr(error)}
+                )
         await server.stop()
         # After the server, so no batch can arrive once the last flush ran.
         await state_writer.close()

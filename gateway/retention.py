@@ -62,7 +62,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from common import get_logger
-from gateway.archive import ArchiveError, RawArchive
+from gateway.archive import RawArchive
 from gateway.ingest_store import StoreError
 
 _log = get_logger(__name__)
@@ -543,8 +543,14 @@ class ArchiveRetention:
         # Under the station lock, so the unlink cannot race an append to
         # the same hour file from a session of this station.
         async with self.archive.station_lock(first.station_id):
-            existed = (self.archive.root / first.relative_path).exists()
-            freed = self.archive.delete_segment(first.relative_path)
+            # Off the event loop: a stat and an unlink on a slow or remote
+            # disk are time in which no station is served.
+            existed = await asyncio.to_thread(
+                (self.archive.root / first.relative_path).exists
+            )
+            freed = await asyncio.to_thread(
+                self.archive.delete_segment, first.relative_path
+            )
 
             try:
                 async with self.engine.begin() as connection:
@@ -649,11 +655,16 @@ class RetentionSchedule:
             result = await self.retention.sweep(only_station=self.only_station)
             purged = await self.store.purge_closed_epochs()
             expiring = await self.retention.holds_expiring_within()
-        except (StoreError, ArchiveError) as error:
+        except Exception as error:
+            # Anything: a StoreError or ArchiveError from the sweep, but
+            # also an OSError from a stat on a disk that has gone away. A
+            # pass that stops the schedule for good returns the archive to
+            # being bounded by the disk, silently, which is the one outcome
+            # this task exists to prevent.
             self.failures += 1
             _log.error(
                 "retention pass failed; retrying at the next interval",
-                extra={"error": str(error), "interval_s": self.interval_s},
+                extra={"error": repr(error), "interval_s": self.interval_s},
             )
             return
         finally:
