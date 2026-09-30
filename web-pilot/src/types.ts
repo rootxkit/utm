@@ -93,10 +93,6 @@ export interface Alert {
     zone_name?: string;
     zone_type?: string;
     alt_amsl_m?: number;
-    // From an authority's ED-269 file (P5-18).
-    external_id?: string;
-    restriction?: string;
-    message?: string | null;
     height_agl_m?: number;
     max_height_agl_m?: number;
     ground_elevation_m?: number;

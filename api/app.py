@@ -132,17 +132,6 @@ class ZoneOut(BaseModel):
     type: str
     min_alt_amsl_m: float | None
     max_alt_amsl_m: float | None
-    # Bounds above the ground, from an authority's file (P5-18).
-    min_height_agl_m: float | None
-    max_height_agl_m: float | None
-    # The authority's source name and zone identifier; None for hand-drawn.
-    source: str | None
-    external_id: str | None
-    # ED-269: PROHIBITED, REQ_AUTHORISATION or CONDITIONAL.
-    restriction: str | None
-    message: str | None
-    # False outside the times the zone is published as applying.
-    in_force: bool
     # A GeoJSON Polygon in WGS84, as PostGIS writes it.
     geometry: dict[str, Any]
 

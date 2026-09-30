@@ -58,10 +58,7 @@ function zonesGeoJson(zones: Zone[]): Collection {
       properties: {
         name: zone.name,
         type: zone.type,
-        // A zone published as applying only at certain times is drawn faint
-        // outside them, and the monitor does not alert on it then (P5-18).
-        colour: zone.in_force ? (ZONE_COLOURS[zone.type] ?? "#616161") : "#9e9e9e",
-        opacity: zone.in_force ? 0.15 : 0.05,
+        colour: ZONE_COLOURS[zone.type] ?? "#616161",
       },
     })),
   };
@@ -113,7 +110,7 @@ function addOverlays(map: MapLibre): void {
     id: "zones-fill",
     type: "fill",
     source: "zones",
-    paint: { "fill-color": ["get", "colour"], "fill-opacity": ["get", "opacity"] },
+    paint: { "fill-color": ["get", "colour"], "fill-opacity": 0.15 },
   });
   map.addLayer({
     id: "zones-line",

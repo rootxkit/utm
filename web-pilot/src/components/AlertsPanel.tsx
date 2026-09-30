@@ -121,7 +121,6 @@ export function AlertsPanel({
                     : (d.zone_type ?? "")}
                   {d.alt_amsl_m !== undefined && ` · ${num(d.alt_amsl_m, 0, "m AMSL")}`}
                 </div>
-                {d.message && <div className="small">{d.message}</div>}
               </>
             )}
             {!acked &&
