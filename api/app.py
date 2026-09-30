@@ -369,12 +369,16 @@ def create_api_app(
         after_id: int | None = None,
         limit: int = Query(default=500, ge=1, le=MAX_EVENTS_PER_PAGE),
     ) -> list[dict[str, Any]]:
-        """Filter by entity and time; page with `after_id` = the last `id` seen."""
+        """Filter by entity and time; page with `after_id` = the last `id` seen.
+
+        `since` and `until` must carry a zone, as in the replay routes: a
+        time without one is refused with 422, not guessed to be UTC.
+        """
         return await registry.events(
             entity_type=entity_type,
             entity_id=entity_id,
-            since=since,
-            until=until,
+            since=_utc(since) if since is not None else None,
+            until=_utc(until) if until is not None else None,
             after_id=after_id,
             limit=limit,
         )
