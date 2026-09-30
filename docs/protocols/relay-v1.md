@@ -227,6 +227,7 @@ in the flight record, which is the exact failure this design exists to prevent.
   "dropped_intake_total": 0,
   "dropped_cap_total": 0,
   "last_datagram_age_ms": 38,
+  "storage_ok": true,
   "uptime_s": 7321,
   "monotonic_ns": 992847110000000,
   "utc_ns": 1758412800123456789
@@ -237,9 +238,10 @@ in the flight record, which is the exact failure this design exists to prevent.
 |---|---|
 | `queue_depth` | Records on disk awaiting acknowledgement |
 | `queue_bytes` | Bytes those records occupy |
-| `dropped_intake_total` | Datagrams dropped before a `seq` was assigned, because the in-memory intake queue was full. Persisted across restarts |
+| `dropped_intake_total` | Datagrams dropped before a `seq` was assigned, because the in-memory intake queue was full. Persisted across restarts, except for drops counted while the disk was refusing writes and not yet written when the relay stopped (§11) |
 | `dropped_cap_total` | Records discarded from disk because the queue hit its size cap. Persisted across restarts |
 | `last_datagram_age_ms` | Milliseconds since a datagram last arrived on the UDP socket, or `null` if none ever has |
+| `storage_ok` | **Optional.** `false` while the relay's durable queue is refusing writes (disk full, I/O error), `true` otherwise. A relay that omits it is to be read as `true`. Informational: it says loss is likely, not that it has happened — see §11 |
 | `uptime_s` | Seconds since the relay started |
 
 The two drop counters are separate because they are different failures with
@@ -507,6 +509,26 @@ which is the question that actually gets asked after an incident.
 Loss #4 is visible the same way: `uptime_s` going backwards between two
 `status` messages means the relay restarted, and any records still in its
 memory at that moment were lost.
+
+### The durable queue refuses writes
+
+A full disk or an I/O error does not stop the relay. The writer holds the batch
+that failed and retries it with backoff, taking nothing new from intake
+meanwhile; the write is all or nothing, so a retry assigns the same sequence
+numbers and nothing is lost while intake still has room. `status` carries
+`storage_ok: false` for the duration.
+
+Once intake fills, datagrams are dropped and counted as loss #2, exactly as if
+the writer were merely slow. The count is taken in memory, so
+`dropped_intake_total` in `status` moves even though the disk cannot record
+it, and the next write that succeeds persists it. **The Gateway needs nothing
+new to see this loss**: its existing `dropped_intake_total` delta already
+reports it. `storage_ok` only says why, and says it before the loss begins.
+
+If the writer thread itself stops, the relay stops sending `status` and exits
+with a non-zero code rather than run on, bound to the socket and looking alive
+while nothing reaches disk. The Gateway sees `unreachable`, and a restart shows
+as loss #4.
 
 ## 12. Reconnection
 

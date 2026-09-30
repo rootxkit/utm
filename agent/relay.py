@@ -16,6 +16,7 @@ block, it counts a drop and carries on.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import queue as queue_module
 import random
@@ -33,7 +34,13 @@ from agent.queue import DurableQueue
 from agent.udp import ReceiveOnlyUDPSocket
 from common.logging import BoundLogger, bind, get_logger
 
-__all__ = ["PROTOCOL_VERSION", "RELAY_VERSION", "ProtocolError", "Relay"]
+__all__ = [
+    "PROTOCOL_VERSION",
+    "RELAY_VERSION",
+    "ProtocolError",
+    "Relay",
+    "WriterDiedError",
+]
 
 PROTOCOL_VERSION = 1
 RELAY_VERSION = "0.1.0"
@@ -41,6 +48,20 @@ RELAY_VERSION = "0.1.0"
 # relay-v1 §6: flush on whichever comes first.
 BATCH_INTERVAL_S = 0.1
 BATCH_MAX_BYTES = 64 * 1024
+
+# The writer's own batching: how many datagrams go into one SQLite commit.
+WRITER_BATCH_MAX_RECORDS = 1000
+WRITER_THREAD_NAME = "relay-writer"
+# Retry cadence while the durable queue refuses writes. Short at first, since
+# a transient lock or I/O error usually clears at once; capped so a full disk
+# is retried, and logged, every few seconds rather than in a tight loop.
+WRITER_BACKOFF_INITIAL_S = 0.1
+WRITER_BACKOFF_MAX_S = 5.0
+# Well inside the status cadence, so drops made during a backoff show up in the
+# next `status` rather than one backoff later.
+WRITER_DROP_FLUSH_INTERVAL_S = 0.25
+# How often the uplink checks that the writer thread is still running.
+WRITER_WATCH_INTERVAL_S = 0.5
 
 # relay-v1 §8.
 STATUS_INTERVAL_S = 1.0
@@ -57,6 +78,10 @@ class ProtocolError(RuntimeError):
 
 class FatalAuthError(RuntimeError):
     """The token was rejected. Retrying will not help."""
+
+
+class WriterDiedError(RuntimeError):
+    """The thread that writes to the durable queue has stopped."""
 
 
 def _first_exception(group: BaseExceptionGroup[BaseException]) -> BaseException:
@@ -112,6 +137,7 @@ class Relay:
         self._started_monotonic = time.monotonic()
         self._last_datagram_monotonic: float | None = None
         self._pending_intake_drops = 0
+        self._storage_ok = True
         self._counters_lock = threading.Lock()
 
     # --- intake -----------------------------------------------------------
@@ -135,29 +161,134 @@ class Relay:
                 with self._counters_lock:
                     self._pending_intake_drops += 1
 
+    def _collect_batch(self) -> list[tuple[int, bytes]]:
+        batch: list[tuple[int, bytes]] = []
+        deadline = time.monotonic() + BATCH_INTERVAL_S
+        while time.monotonic() < deadline and len(batch) < WRITER_BATCH_MAX_RECORDS:
+            timeout = max(deadline - time.monotonic(), 0.0)
+            try:
+                batch.append(self._intake.get(timeout=timeout))
+            except queue_module.Empty:
+                break
+        return batch
+
     def _writer_loop(self) -> None:
-        """Drain the memory queue into SQLite in batches."""
-        while not self._stop.is_set() or not self._intake.empty():
-            batch: list[tuple[int, bytes]] = []
-            deadline = time.monotonic() + BATCH_INTERVAL_S
+        """Drain the memory queue into SQLite in batches.
 
-            while time.monotonic() < deadline and len(batch) < 1000:
-                timeout = max(deadline - time.monotonic(), 0.0)
+        A storage failure must not end this thread: if it did, intake would
+        fill and drop everything while the status stream still looked healthy.
+        A batch that fails to write is held and offered again - `append` is all
+        or nothing, so the retry assigns the same sequence numbers - and
+        nothing new is taken from intake meanwhile. That keeps memory bounded:
+        once intake fills, datagrams are dropped at the socket and counted in
+        `dropped_intake_total`, which the Gateway already treats as data loss.
+        """
+        held: list[tuple[int, bytes]] = []
+        backoff_s = WRITER_BACKOFF_INITIAL_S
+        while not self._stop.is_set() or not self._intake.empty() or held:
+            if not held:
+                held = self._collect_batch()
+
+            failure: Exception | None = None
+            if held:
                 try:
-                    batch.append(self._intake.get(timeout=timeout))
-                except queue_module.Empty:
-                    break
+                    self._queue.append(held)
+                    held = []
+                except Exception as error:
+                    failure = error
 
-            if batch:
-                self._queue.append(batch)
-
+            # Counted even when the batch above failed: the in-memory total
+            # moves regardless of whether the disk accepts it, so the loss is
+            # visible in `status` while storage is down.
             drops = self._take_pending_drops()
             if drops:
-                self._queue.record_intake_drops(drops)
+                try:
+                    self._queue.record_intake_drops(drops)
+                except Exception as error:
+                    failure = failure or error
                 self._log.warning(
                     "intake queue full, datagrams dropped",
                     extra={"dropped": drops},
                 )
+
+            if failure is None:
+                if self._set_storage_ok(True):
+                    self._log.info("durable queue writable again")
+                backoff_s = WRITER_BACKOFF_INITIAL_S
+                continue
+
+            self._set_storage_ok(False)
+            if self._stop.is_set():
+                # Shutting down with a disk that refuses writes. These never
+                # got a sequence number, so they are intake drops by §11's
+                # definition; counting them is all that can still be done.
+                with contextlib.suppress(Exception):
+                    self._queue.record_intake_drops(len(held))
+                self._log.error(
+                    "stopping with an unwritable queue; datagrams abandoned",
+                    extra={"abandoned": len(held), "error": repr(failure)},
+                )
+                return
+            self._log.error(
+                "durable queue write failed; holding the batch and retrying",
+                extra={
+                    "error": repr(failure),
+                    "held_datagrams": len(held),
+                    "intake_backlog": self._intake.qsize(),
+                    "retry_in_s": round(backoff_s, 2),
+                },
+            )
+            self._wait_counting_drops(backoff_s)
+            backoff_s = min(backoff_s * BACKOFF_FACTOR, WRITER_BACKOFF_MAX_S)
+
+    def _wait_counting_drops(self, delay_s: float) -> None:
+        """Sleep before a retry, still moving intake drops into the counter.
+
+        The drops are the Gateway's evidence that the outage is costing data,
+        and a status sent during a multi-second backoff must already carry
+        them. Memory only: the disk has just refused a write, and the next
+        commit that succeeds persists the total.
+        """
+        deadline = time.monotonic() + delay_s
+        while not self._stop.is_set():
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                break
+            self._stop.wait(min(remaining_s, WRITER_DROP_FLUSH_INTERVAL_S))
+            self._queue.count_intake_drops(self._take_pending_drops())
+
+    def _run_writer(self) -> None:
+        try:
+            self._writer_loop()
+        except BaseException as error:
+            # Storage errors are handled inside the loop; reaching here is a
+            # bug. Logged in the service's own format rather than as a bare
+            # thread traceback, and the thread ends: the uplink's watchdog
+            # sees that and stops the relay.
+            self._log.critical(
+                "durable queue writer crashed", extra={"error": repr(error)}
+            )
+
+    def _set_storage_ok(self, value: bool) -> bool:
+        """Record storage health. Returns True if it changed."""
+        with self._counters_lock:
+            changed = self._storage_ok != value
+            self._storage_ok = value
+        return changed
+
+    @property
+    def storage_ok(self) -> bool:
+        """False while the durable queue is refusing writes."""
+        with self._counters_lock:
+            return self._storage_ok
+
+    @property
+    def writer_alive(self) -> bool:
+        """Whether the writer thread is running, once intake has started."""
+        return any(
+            thread.name == WRITER_THREAD_NAME and thread.is_alive()
+            for thread in self._threads
+        )
 
     def _take_pending_drops(self) -> int:
         with self._counters_lock:
@@ -172,10 +303,10 @@ class Relay:
             extra={"host": self._config.bind_host, "port": self._config.bind_port},
         )
         for target, name in (
-            (lambda: self._intake_loop(udp), "intake"),
-            (self._writer_loop, "writer"),
+            (lambda: self._intake_loop(udp), "relay-intake"),
+            (self._run_writer, WRITER_THREAD_NAME),
         ):
-            thread = threading.Thread(target=target, name=f"relay-{name}", daemon=True)
+            thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
         return udp
@@ -203,6 +334,7 @@ class Relay:
             "dropped_intake_total": self._queue.dropped_intake_total,
             "dropped_cap_total": self._queue.dropped_cap_total,
             "last_datagram_age_ms": self._last_datagram_age_ms(),
+            "storage_ok": self.storage_ok,
             "uptime_s": int(time.monotonic() - self._started_monotonic),
             "monotonic_ns": monotonic_ns,
             "utc_ns": utc_ns,
@@ -224,8 +356,47 @@ class Relay:
 
     # --- uplink -----------------------------------------------------------
 
+    def _check_writer(self) -> None:
+        """Raise if intake has started and its writer thread is gone.
+
+        Without a writer nothing reaches disk, intake fills and drops every
+        datagram, and a relay that kept sending `status` would be describing a
+        station that no longer exists. Stopping is the honest answer: the
+        Gateway then sees `unreachable`, and the restart shows as `uptime_s`
+        going backwards (relay-v1 §11 loss #4).
+        """
+        if self._threads and not self._stop.is_set() and not self.writer_alive:
+            raise WriterDiedError("the durable queue writer thread has stopped")
+
+    async def _watch_writer(self) -> None:
+        if not self._threads:
+            return
+        while not self._stop.is_set():
+            self._check_writer()
+            await asyncio.sleep(WRITER_WATCH_INTERVAL_S)
+
     async def run_uplink(self) -> None:
-        """Connect, ship, reconnect. Runs until cancelled."""
+        """Connect, ship, reconnect. Runs until cancelled.
+
+        Raises WriterDiedError if the writer thread stops while intake is
+        running; the process must not carry on as if it were healthy.
+        """
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self._watch_writer())
+                tasks.create_task(self._uplink_loop())
+        except BaseExceptionGroup as group:
+            failure = _first_exception(group)
+            if isinstance(failure, WriterDiedError):
+                self._log.critical(
+                    "durable queue writer stopped; shutting the relay down",
+                    extra={"error": str(failure)},
+                )
+            if isinstance(failure, Exception):
+                raise failure from None
+            raise
+
+    async def _uplink_loop(self) -> None:
         backoff = BACKOFF_INITIAL_S
         while not self._stop.is_set():
             try:
@@ -234,6 +405,8 @@ class Relay:
             except FatalAuthError:
                 # Retrying a rejected credential just floods the log.
                 self._log.error("token rejected by the Gateway; not retrying")
+                raise
+            except WriterDiedError:
                 raise
             except asyncio.CancelledError:
                 raise
@@ -364,6 +537,9 @@ class Relay:
 
     async def _status_loop(self, connection: ClientConnection) -> None:
         while True:
+            # Checked here as well as by the watchdog, so that not one more
+            # status leaves after the writer has gone.
+            self._check_writer()
             await connection.send(json.dumps(self._status_message()))
             await asyncio.sleep(STATUS_INTERVAL_S)
 

@@ -14,7 +14,7 @@ import pytest
 
 from agent.__main__ import main
 from agent.udp import ReceiveOnlyUDPSocket
-from tests.ports import free_udp_port
+from tests.ports import free_tcp_port, free_udp_port
 
 _VALID_TEMPLATE = """
 station_id = "cli-test"
@@ -183,3 +183,35 @@ def test_a_second_relay_refuses_to_start_on_a_held_port(
     reason = str(capture(capsys)[-1]["reason"])
     assert str(port) in reason
     assert "another process" in reason.lower()
+
+
+def test_a_dead_writer_thread_ends_the_process_with_a_failure_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """S-02. Without a writer nothing reaches disk; the relay must not run on.
+
+    Driven through the real asyncio.run and the real uplink, pointed at a
+    loopback port nothing listens on, so the only thing that can end the run
+    is the relay noticing its writer has gone.
+    """
+
+    def broken_writer(self: object) -> None:
+        raise RuntimeError("a bug outside the storage error handling")
+
+    monkeypatch.setattr("agent.relay.Relay._writer_loop", broken_writer)
+
+    station = tmp_path / "station"
+    station.mkdir()
+    config = valid_config().replace(
+        "wss://gateway.example.org/relay/v1",
+        f"ws://127.0.0.1:{free_tcp_port()}/relay/v1",
+    )
+    (station / "relay.toml").write_text(config, encoding="utf-8")
+    (station / "relay.token").write_text("a-real-token", encoding="utf-8")
+
+    code = main(["--config", str(station / "relay.toml")])
+
+    logs = capture(capsys)
+    assert code == 1
+    assert any(line.get("message") == "relay cannot continue" for line in logs), logs
+    assert any(line.get("message") == "durable queue writer crashed" for line in logs)
