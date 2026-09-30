@@ -23,8 +23,9 @@ was captured, which is the whole reason bindings have validity.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from common import get_logger
@@ -59,6 +60,12 @@ class _Observed:
     ts: datetime
     message: ParsedMessage
     source: Source
+    # Queued on the relay before the session that delivered it (S-11).
+    backlog: bool
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
 
 
 @dataclass
@@ -82,6 +89,9 @@ class IngestPipeline:
     live_state: LiveState | None = None
     # P1-11. Optional for the same reason as live state.
     firmware: FirmwareRegistry | None = None
+    # The Gateway's wall clock, stamped on each batch as `rx_ts` (S-11): one
+    # trusted clock for every station, unlike the relays' own.
+    wall: Callable[[], datetime] = _now_utc
 
     registry: SourceRegistry = field(init=False)
     assembler: StateAssembler = field(init=False)
@@ -99,8 +109,17 @@ class IngestPipeline:
         self.registry = SourceRegistry(station_id=self.station_id)
         self.assembler = StateAssembler(station_id=self.station_id)
 
-    async def process(self, epoch: str, records: list[Record]) -> list[DroneStateRow]:
+    async def process(
+        self, epoch: str, records: list[Record], *, newest_seq_held: int = -1
+    ) -> list[DroneStateRow]:
         """Convert a batch of stored records. Never raises into the transport.
+
+        `newest_seq_held` is the delivering session's `hello` value
+        (relay-v1 §5): a record with seq at or below it was queued before the
+        connection and is published with `backlog: true`, so the airspace
+        monitor does not raise live alerts from where an aircraft was during
+        an outage. Every published message also carries `rx_ts`, this batch's
+        receive time on the Gateway's clock.
 
         Three passes, so bindings are read once per batch rather than once per
         message (P1-13). Per message, the resolver cost one database query:
@@ -113,7 +132,8 @@ class IngestPipeline:
         classifying the whole batch first cannot leak a later HEARTBEAT back
         into an earlier message's resolution.
         """
-        observed = self._observe(epoch, records)
+        rx_ts = self.wall()
+        observed = self._observe(epoch, records, newest_seq_held)
         if not observed:
             return []
 
@@ -140,6 +160,9 @@ class IngestPipeline:
             return []
 
         rows: list[DroneStateRow] = []
+        # Parallel to `rows`: whether each came from a backlog record. A
+        # batch can straddle the `hello` boundary, so it is per row.
+        backlog: list[bool] = []
         # Which address each drone was seen on in this batch, for its link.
         sources_by_drone: dict[UUID, SourceId] = {}
         for item, resolution in zip(observed, resolutions, strict=True):
@@ -160,6 +183,7 @@ class IngestPipeline:
                 continue
             if row is not None:
                 rows.append(row)
+                backlog.append(item.backlog)
 
         if rows:
             labels: dict[UUID, str] = {}
@@ -174,7 +198,9 @@ class IngestPipeline:
                         for drone_id, source_id in sources_by_drone.items()
                     }
                     firmware = await self._firmware_summaries(rows)
-                    await self.publisher.publish_rows(rows, labels, links, firmware)
+                    await self.publisher.publish_rows(
+                        rows, labels, links, firmware, rx_ts=rx_ts, backlog=backlog
+                    )
             except Exception as error:
                 _log.error(
                     "could not write drone_state",
@@ -219,10 +245,13 @@ class IngestPipeline:
             tracker = self._links[source_id] = LinkQualityTracker()
         return tracker
 
-    def _observe(self, epoch: str, records: list[Record]) -> list[_Observed]:
+    def _observe(
+        self, epoch: str, records: list[Record], newest_seq_held: int
+    ) -> list[_Observed]:
         """Parse and classify every message, in order, with its capture time."""
         observed: list[_Observed] = []
         for record in records:
+            backlog = record.seq <= newest_seq_held
             try:
                 with self.timings.measure("process.parse"):
                     parsed = parse_datagram(record.datagram)
@@ -235,7 +264,7 @@ class IngestPipeline:
                 for message in parsed.messages:
                     source = self.registry.observe(message)
                     self._link(source.source_id).observe(message, ts)
-                    observed.append(_Observed(record.seq, ts, message, source))
+                    observed.append(_Observed(record.seq, ts, message, source, backlog))
             except Exception as error:
                 _log.error(
                     "could not convert a record",
@@ -415,5 +444,14 @@ class StationPipelines:
             self.pipelines[station_id] = pipeline
         return pipeline
 
-    async def process(self, station_id: str, epoch: str, records: list[Record]) -> None:
-        await self.for_station(station_id).process(epoch, records)
+    async def process(
+        self,
+        station_id: str,
+        epoch: str,
+        records: list[Record],
+        *,
+        newest_seq_held: int = -1,
+    ) -> None:
+        await self.for_station(station_id).process(
+            epoch, records, newest_seq_held=newest_seq_held
+        )

@@ -180,7 +180,15 @@ class RemoteIdTracker:
             "authenticated": False,
             "link": None,
             "firmware": None,
+            # `ts` is when the Gateway received the frame, not when the
+            # aircraft measured the position: the broadcast's own time
+            # (`seconds_after_hour`, decoded in `gateway.odid`) is not yet
+            # carried. `rx_ts` is therefore the same instant, and a broadcast
+            # is never a backlog: there is no queue between the receiver and
+            # here (S-11).
             "ts": frame.received_at.isoformat(),
+            "rx_ts": frame.received_at.isoformat(),
+            "backlog": False,
             "station_id": frame.receiver_id,
             "lat_deg": location.lat_deg,
             "lon_deg": location.lon_deg,

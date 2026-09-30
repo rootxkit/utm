@@ -118,6 +118,8 @@ class FakePublisher:
         self.links: dict[UUID, dict[str, Any]] = {}
         self.firmware: dict[UUID, dict[str, Any]] = {}
         self.unclaimed: list[SourceId] = []
+        self.rx_ts: list[datetime | None] = []
+        self.backlog: list[bool] = []
 
     async def publish_rows(
         self,
@@ -125,11 +127,16 @@ class FakePublisher:
         labels: dict[UUID, str] | None = None,
         links: dict[UUID, dict[str, Any]] | None = None,
         firmware: dict[UUID, dict[str, Any]] | None = None,
+        *,
+        rx_ts: datetime | None = None,
+        backlog: list[bool] | None = None,
     ) -> None:
         self.rows.extend(rows)
         self.labels = labels or {}
         self.links = links or {}
         self.firmware = firmware or {}
+        self.rx_ts.extend([rx_ts] * len(rows))
+        self.backlog.extend(backlog if backlog is not None else [False] * len(rows))
 
     async def publish_unclaimed(
         self, station_id: str, resolution: Resolution, source_id: SourceId
@@ -215,6 +222,38 @@ async def test_the_row_timestamp_is_the_records_capture_time() -> None:
     )
 
     assert rows[0].ts == datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+
+
+async def test_rows_are_published_with_the_gateways_receive_time() -> None:
+    """S-11. `rx_ts` is the Gateway's clock at the batch, not the relay's
+    capture time, and without a session every record is live."""
+    pipeline, _, _, publisher = build()
+    received = datetime(2026, 9, 24, 12, 0, 5, tzinfo=UTC)
+    pipeline.wall = lambda: received
+
+    rows = await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position(), offset_ns=300_000_000)]
+    )
+
+    assert len(rows) == 1
+    assert publisher.rx_ts == [received]
+    assert publisher.backlog == [False]
+
+
+async def test_records_up_to_newest_seq_held_are_backlog_and_the_rest_live() -> None:
+    """S-11. The session's `hello` declared `newest_seq_held` = 3: seq 0-3
+    were on the relay's disk before the connection; seq 4 onward were
+    captured while it was up. One batch straddles the boundary."""
+    pipeline, _, _, publisher = build()
+
+    rows = await pipeline.process(
+        EPOCH,
+        [record(0, heartbeat())] + [record(seq, position()) for seq in range(1, 7)],
+        newest_seq_held=3,
+    )
+
+    assert len(rows) == 6
+    assert publisher.backlog == [True, True, True, False, False, False]
 
 
 async def test_messages_that_are_not_on_the_hot_path_emit_no_row() -> None:

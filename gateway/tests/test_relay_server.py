@@ -935,9 +935,49 @@ class RecordingProcessor:
     """Notes every record handed to the pipeline, batch by batch."""
 
     batches: list[list[int]] = field(default_factory=list)
+    # What each batch's session declared in `hello`, so the pipeline can
+    # tell backlog from live (S-11).
+    newest_seq_held: list[int] = field(default_factory=list)
 
-    async def process(self, station_id: str, epoch: str, records: list[Record]) -> None:
+    async def process(
+        self,
+        station_id: str,
+        epoch: str,
+        records: list[Record],
+        *,
+        newest_seq_held: int = -1,
+    ) -> None:
         self.batches.append([record.seq for record in records])
+        self.newest_seq_held.append(newest_seq_held)
+
+
+async def test_each_batch_is_processed_with_its_sessions_newest_seq_held() -> None:
+    """S-11. The relay connects holding seq 0-9 on disk and drains them,
+    then sends what it captures live. It reconnects later holding up to 24:
+    the new session's `hello` value is what its batches are judged by, so
+    the pipeline can flag 0-9 and 15-24 as backlog and 10-14 as live."""
+    processor = RecordingProcessor()
+    async with running(processor=processor, ack_interval_s=0.05) as server:
+        async with connect(url(server), additional_headers=auth()) as connection:
+            await handshake(connection, hello(newest_seq_held=9))
+            await connection.send(batch(0, 10))
+            await connection.send(batch(10, 5))
+            ack = await read_until(connection, "ack")
+            while ack["seq"] < 14:
+                ack = await read_until(connection, "ack")
+        async with connect(url(server), additional_headers=auth()) as connection:
+            await handshake(connection, hello(newest_seq_held=24))
+            await connection.send(batch(15, 10))
+            ack = await read_until(connection, "ack")
+            while ack["seq"] < 24:
+                ack = await read_until(connection, "ack")
+
+    assert processor.batches == [
+        list(range(10)),
+        list(range(10, 15)),
+        list(range(15, 25)),
+    ]
+    assert processor.newest_seq_held == [9, 9, 24]
 
 
 async def test_a_retransmitted_batch_is_not_processed_again() -> None:

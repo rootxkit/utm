@@ -41,6 +41,10 @@ def test_a_pack_with_identity_and_position_is_one_observation() -> None:
     assert seen["source"] == "remote_id"
     assert seen["authenticated"] is False
     assert seen["station_id"] == "rx-1"
+    # S-11: stamped when the Gateway received it, on both fields, and never
+    # a backlog: nothing queues between a receiver and the Gateway.
+    assert seen["ts"] == seen["rx_ts"] == NOW.isoformat()
+    assert seen["backlog"] is False
     assert seen["lat_deg"] == pytest.approx(LAT)
     assert seen["lon_deg"] == pytest.approx(LON)
     assert seen["alt_hae_m"] == 520.0

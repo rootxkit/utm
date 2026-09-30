@@ -82,8 +82,19 @@ class RecordProcessor(Protocol):
     """
 
     async def process(
-        self, station_id: str, epoch: str, records: list[Record]
-    ) -> None: ...
+        self,
+        station_id: str,
+        epoch: str,
+        records: list[Record],
+        *,
+        newest_seq_held: int = -1,
+    ) -> None:
+        """`newest_seq_held` is what the delivering session's `hello`
+        declared (relay-v1 §5): records with a seq at or below it were on
+        the relay's disk before this connection, so they are backlog; those
+        past it were captured while the connection was up. -1 (the
+        default, for callers without a session) makes every record live."""
+        ...
 
 
 class StationReporter(Protocol):
@@ -485,7 +496,10 @@ class _Session:
         if self.server.processor is not None:
             with timings.measure("process"):
                 await self.server.processor.process(
-                    self.station_id, self.epoch, stored.stored
+                    self.station_id,
+                    self.epoch,
+                    stored.stored,
+                    newest_seq_held=self.newest_seq_held,
                 )
         timings.count("batches", 1)
         timings.count("records", len(stored.stored))
