@@ -122,6 +122,9 @@ class DurableQueue:
         # causing; the next commit that succeeds persists the total. Guarded
         # by `_stats_lock`, not `_lock`, so counting never waits for a write.
         self._dropped_intake: int = self._get_int(_DROPPED_INTAKE)
+        # The total as last committed, so an ack need not rewrite it unchanged.
+        self._dropped_intake_persisted: int = self._dropped_intake
+
         self._dropped_cap: int = self._get_int(_DROPPED_CAP)
 
         # The counters are also published as an immutable snapshot under a
@@ -284,12 +287,14 @@ class DurableQueue:
         """Write the intake drop total. Raises if the disk refuses it."""
         with self._lock:
             self._check_usable_locked()
+            total = self._intake_drops_total()
             try:
-                self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
+                self._set_int(_DROPPED_INTAKE, total)
                 self._connection.commit()
             except sqlite3.Error:
                 self._rollback_locked()
                 raise
+            self._dropped_intake_persisted = total
 
     def append(self, datagrams: Sequence[tuple[int, bytes]]) -> list[Record]:
         """Assign sequence numbers to (recv_utc_ns, datagram) pairs and store them.
@@ -328,7 +333,8 @@ class DurableQueue:
                 )
                 self._set_int(_NEXT_SEQ, seq + len(records))
                 # Carries any intake drops whose own write failed.
-                self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
+                drops_total = self._intake_drops_total()
+                self._set_int(_DROPPED_INTAKE, drops_total)
                 self._depth += len(records)
                 self._total_bytes += sum(r.encoded_size for r in records)
                 self._enforce_cap_locked()
@@ -338,6 +344,7 @@ class DurableQueue:
                 self._dropped_cap = dropped_cap
                 self._rollback_locked()
                 raise
+            self._dropped_intake_persisted = drops_total
             self._publish_stats()
 
         return records
@@ -454,11 +461,19 @@ class DurableQueue:
                     )
                 # Carries any intake drops whose own write failed; on a link
                 # with no new telemetry, acks are the only commits there are.
-                self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
-                self._connection.commit()
+                # Only when it changed: under synchronous=FULL every commit is
+                # an fsync, and acks arrive several times a second.
+                drops_total = self._intake_drops_total()
+                drops_changed = drops_total != self._dropped_intake_persisted
+                if drops_changed:
+                    self._set_int(_DROPPED_INTAKE, drops_total)
+                if count or drops_changed:
+                    self._connection.commit()
             except sqlite3.Error:
                 self._rollback_locked()
                 raise
+            if drops_changed:
+                self._dropped_intake_persisted = drops_total
             # Only once the delete is durable, or the cap would be enforced
             # against records that are still on disk.
             self._depth -= count

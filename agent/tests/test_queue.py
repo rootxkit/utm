@@ -712,3 +712,41 @@ def test_a_poisoned_queue_will_not_report_sequence_numbers(queue_path: Path) -> 
             _ = queue.oldest_seq_held
         with pytest.raises(QueuePoisonedError):
             _ = queue.newest_seq_held
+
+
+def _statements(queue: DurableQueue) -> list[str]:
+    traced: list[str] = []
+    queue._connection.set_trace_callback(traced.append)
+    return traced
+
+
+def test_an_ack_does_not_rewrite_an_unchanged_drop_count(queue_path: Path) -> None:
+    """Every commit is an fsync under synchronous=FULL; acks are frequent."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        traced = _statements(queue)
+
+        queue.acknowledge(1)
+        queue.acknowledge(1)  # nothing left to delete either
+        queue._connection.set_trace_callback(None)
+
+    updates = [s for s in traced if s.startswith("UPDATE meta")]
+    commits = [s for s in traced if s.strip().upper() == "COMMIT"]
+    assert updates == []
+    # One for the ack that deleted; none for the one that changed nothing.
+    assert len(commits) == 1, traced
+
+
+def test_an_ack_writes_a_drop_count_that_changed(queue_path: Path) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        queue.count_intake_drops(3)
+        traced = _statements(queue)
+
+        queue.acknowledge(1)
+        queue.acknowledge(2)
+        queue._connection.set_trace_callback(None)
+
+    updates = [s for s in traced if s.startswith("UPDATE meta")]
+    assert len(updates) == 1, traced
+    assert _persisted_intake_drops(queue_path) == 3
