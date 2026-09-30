@@ -216,9 +216,25 @@ class SeparationPolicy:
     neighbour_radius_m: float
 
     def is_conflict(self, approach: Approach) -> bool:
-        """Alert when all three hold, as §6.2 specifies."""
-        return (
+        """Alert when the pair is inside both minima now, or will be at its
+        closest approach within the window (all three of §6.2).
+
+        The first clause is what the SITL run found missing: two aircraft
+        hovering 30 m apart have a relative velocity of centimetres per
+        second of GPS noise, which puts their "closest approach" hundreds of
+        seconds away and outside the window, and §6.2's three-part test
+        alone let the alert clear as resolved while they were still 30 m
+        apart. A pair inside the minima is in conflict whatever the
+        arithmetic says about when it will be closest. The same clause holds
+        a diverging pair's alert until it is actually past the minimum.
+        """
+        inside_now = (
+            approach.d_horizontal_now_m < self.d_horizontal_min_m
+            and approach.d_alt_now_m < self.d_vertical_min_m
+        )
+        closing_inside = (
             approach.t_cpa_s < self.t_cpa_max_s
             and approach.d_cpa_horizontal_m < self.d_horizontal_min_m
             and approach.d_alt_at_cpa_m < self.d_vertical_min_m
         )
+        return inside_now or closing_inside

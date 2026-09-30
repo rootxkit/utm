@@ -665,6 +665,50 @@ def test_a_sample_older_than_the_one_held_is_ignored(
     assert len(not_evaluated(caplog)) == 2
 
 
+# --- inside the minimum is a conflict, whatever t_cpa says -------------------
+
+
+def test_a_hovering_pair_inside_the_minimum_stays_alerted() -> None:
+    """Found in SITL: 29.9 m apart, hovering, velocity noise. The alert must
+    be raised and must not clear as resolved while they stay there."""
+    monitor = AirspaceMonitor(policy=POLICY, clear_after_s=3.0)
+    cleared = []
+    for t in range(0, 30):
+        noise = 0.01 if t % 2 else -0.01
+        for sample in (
+            message(A, 0, vn=noise, at_s=float(t)),
+            message(B, 29.9, vn=-noise, at_s=float(t)),
+        ):
+            cleared.extend(monitor.observe(sample, now_s=float(t)).cleared)
+    assert [alert.kind for alert in monitor.active] == [AlertKind.CONFLICT]
+    assert cleared == []
+
+
+def test_a_hovering_pair_outside_the_minimum_raises_nothing() -> None:
+    monitor = AirspaceMonitor(policy=POLICY)
+    for t in range(0, 10):
+        monitor.observe(message(A, 0, vn=0.01, at_s=float(t)), now_s=float(t))
+        monitor.observe(message(B, 80, vn=-0.01, at_s=float(t)), now_s=float(t))
+    assert monitor.active == []
+
+
+def test_a_diverging_pair_clears_resolved_only_once_past_the_minimum() -> None:
+    """B opens from A at 5 m/s: 40 m at t=0, 60 m at t=4. Inside until
+    t=3 (55 m), shown clear from t=4, resolved once the hysteresis has
+    passed since it was last shown inside: at t=7."""
+    monitor = AirspaceMonitor(policy=POLICY, clear_after_s=3.0)
+    monitor.observe(message(A, 0, at_s=0.0), now_s=0.0)
+    changes = []
+    for t in range(0, 9):
+        changes.append(
+            monitor.observe(message(B, 40 + 5 * t, vn=5, at_s=float(t)), now_s=float(t))
+        )
+    assert [alert.kind for alert in changes[0].raised] == [AlertKind.CONFLICT]
+    cleared_at = [t for t, change in enumerate(changes) if change.cleared]
+    assert cleared_at == [7], "last inside at t=3, shown clear from t=4"
+    assert [c.reason for c in changes[7].cleared] == [ClearReason.RESOLVED]
+
+
 # --- B2: a silent neighbour is not evidence ---------------------------------
 
 
