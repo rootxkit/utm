@@ -26,15 +26,22 @@ arrived. What `ts` is depends on the path:
   Gateway, not when the aircraft measured it. Carrying the broadcast time is
   a Gateway follow-up.
 
-Neither clock is trusted as such. `airspace/clock.py` keeps, per source
-(`station_id`), a running minimum of `wall - ts` as that source's offset,
-relaxing at `CLOCK_RELAX_S_PER_S`; a message is a replayed backlog only when
-its delay *above* that offset exceeds `LIVE_MAX_AGE_S`. A clock that is
-merely wrong, by any amount, costs no alerts; nor does a steady delivery
-delay. Capture times are put on the monitor's clock with the offset, so two
-aircraft on two ground stations are compared at one instant. A pair whose
-neighbour sample is older than `NEIGHBOUR_MAX_AGE_S` is not judged by that
-message: neither refreshed nor cleared, because silence is not evidence.
+Neither clock is trusted for placing an aircraft in time. Every message also
+carries `rx_ts`, when the Gateway received the batch on its own clock, and
+`backlog`, the Gateway's verdict that the record was queued on the relay
+before the session that delivered it (`gateway/README.md`, relay-v1 §5). A
+track is placed at `rx_ts`: one clock for every station, so two aircraft on
+two ground stations are compared at one instant with no skew to guess. A
+message flagged `backlog` is counted and not evaluated for live alerts. A
+station clock that is wrong by any amount costs no alerts, and a Gateway
+that is behind yields late alerts placed at `rx_ts`, not none.
+`LIVE_MAX_AGE_S` applies only to `wall - rx_ts`, the Gateway-to-monitor
+leg. `ts` orders samples within one source: one older than the last that
+source gave, and not received later, is out of order and ignored. A message
+without `rx_ts` is placed at its arrival time and counted; per-source state
+is bounded by `SOURCE_STATE_MAX`. A pair whose neighbour sample is older
+than `NEIGHBOUR_MAX_AGE_S` is not judged by that message: neither refreshed
+nor cleared, because silence is not evidence.
 
 Rejected messages, failed checks, unreadable tiles and audit-queue losses are
 counted and logged in the `airspace monitor status` line every minute.
@@ -43,6 +50,6 @@ counted and logged in the `airspace monitor status` line every minute.
 
 `DATABASE_URL`, `NATS_URL`, `TERRAIN_DIR` as in `common/config.py`, plus,
 all in `airspace/config.py` with their defaults and reasons: `LIVE_MAX_AGE_S`,
-`NEIGHBOUR_MAX_AGE_S`, `CLOCK_RELAX_S_PER_S`, `AUDIT_QUEUE_SIZE`,
+`NEIGHBOUR_MAX_AGE_S`, `SOURCE_STATE_MAX`, `AUDIT_QUEUE_SIZE`,
 `AUDIT_CLOSE_TIMEOUT_S`, `TERRAIN_CACHE_TILES`. Separation minima and the
 height limit are policy in the database, never here.

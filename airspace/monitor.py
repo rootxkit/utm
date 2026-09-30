@@ -19,29 +19,39 @@ An aircraft whose telemetry has not been heard for `stale_after_s` is dropped
 and its alerts cleared: it is not known to be anywhere any more, and the link
 state already says why (P1-05).
 
-## Time is the capture time, not the arrival time (S-11)
+## Time is the Gateway's receive time, not the arrival time (S-11)
 
-Every message carries `ts`, the clock of whoever captured it: on the relay
-path the ground PC's `recv_utc_ns` (relay-v1 §9: it may be wrong, drifting
-or stepped); on the Remote ID path the Gateway's own receive time, since the
-broadcast's `seconds_after_hour` is decoded but not yet carried, so a
-Remote ID position is stamped when it reached the Gateway, not when the
-aircraft measured it. `ts` is put on the monitor's clock with the source's
-estimated offset (`airspace/clock.py`), and a track is placed at that
-instant. A pair's CPA is computed at the later of the two capture times with
-the older track advanced along its velocity (`cpa.advance`): a neighbour's
-5 s old sample, used as if current, is 75 m wrong at 15 m/s against a 60 m
-threshold. A neighbour older than `neighbour_max_age_s` is not advanced at
-all, and the pair is not evaluated by that message: neither refreshed nor
-shown clear, since silence is not evidence.
+Every message carries two times (`gateway/README.md`). `ts` is the clock of
+whoever captured it: on the relay path the ground PC's `recv_utc_ns`
+(relay-v1 §9: it may be wrong, drifting or stepped); on the Remote ID path
+the Gateway's own receive time, since the broadcast's `seconds_after_hour`
+is decoded but not yet carried, so a Remote ID position is stamped when it
+reached the Gateway, not when the aircraft measured it. `rx_ts` is when the
+Gateway received the batch, on the Gateway's clock: one clock for every
+station. A track is placed at `rx_ts`, so two aircraft on two stations are
+compared at one instant without guessing either station's skew, and a
+pair's CPA is computed at the later of the two with the older track
+advanced along its velocity (`cpa.advance`): a neighbour's 5 s old sample,
+used as if current, is 75 m wrong at 15 m/s against a 60 m threshold. A
+neighbour older than `neighbour_max_age_s` is not advanced at all, and the
+pair is not evaluated by that message: neither refreshed nor shown clear,
+since silence is not evidence.
 
-A message delivered more than `live_max_age_s` later than its source's
-usual delay is a replayed backlog, and is counted and not evaluated: it
-must not raise an alert about where an aircraft was minutes ago. A clock
-that is merely wrong is not a backlog: skew alone never costs an alert. A
-message older than the sample its own source already gave for the aircraft
-is ignored as out of order; another source's sample is never compared,
-since two sources' clocks agree only to their offsets.
+Whether a message is a replayed backlog is the Gateway's verdict, not an
+estimate: `backlog` is true for records that were queued on the relay before
+the session that delivered them (`newest_seq_held`, relay-v1 §5). Those are
+counted and not evaluated: they must not raise an alert about where an
+aircraft was minutes ago. Nothing here infers a backlog from `ts`, so a
+station clock that is wrong by any amount, or a Gateway that is behind
+(ADR-002), costs no alerts: the latter yields late alerts, placed at
+`rx_ts`. `live_max_age_s` applies only to `wall - rx_ts`, the delay from
+the Gateway to here, which is ours to control. A message without `rx_ts`
+(an older Gateway, a test) is placed at its arrival time and counted.
+
+`ts` is used for one thing: within one source, a sample older than the last
+one that source gave, delivered no later than it, is out of order and
+ignored. Another source's sample is never compared, since two stations'
+clocks agree only by accident.
 
 ## Raise once, clear with hysteresis
 
@@ -81,14 +91,14 @@ and P5-09, not built here.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
-from airspace.clock import SourceClocks
 from airspace.cpa import Approach, SeparationPolicy, Track, closest_approach
 from airspace.neighbours import NeighbourIndex
 from airspace.zones import Zone, ZoneType
@@ -164,37 +174,48 @@ def source_of(message: dict[str, Any]) -> str:
     return "unknown"
 
 
-def captured_at_s(message: dict[str, Any]) -> float | None:
-    """The message's capture time as epoch seconds, from its ISO 8601 `ts`,
-    on the source's clock (see the module docstring for what that is on
-    each path); None when the message carries no `ts`.
+def time_field_s(message: dict[str, Any], name: str) -> float | None:
+    """An ISO 8601 time field as epoch seconds; None when absent or null.
 
-    Both Gateway producers always send one (`gateway/publisher.py`,
-    `gateway/remote_id.py`). A message without it is still evaluated, at
-    its arrival time, and counted: a missed alert costs more than a
-    position a second or two out of place.
-
-    Raises ValueError for a `ts` that is not a timestamp.
+    Raises ValueError for a value that is not a timestamp.
     """
-    ts = message.get("ts")
-    if ts is None:
+    value = message.get(name)
+    if value is None:
         return None
-    if not isinstance(ts, str):
-        raise ValueError(f"ts is not a timestamp: {ts!r}")
-    moment = datetime.fromisoformat(ts)
+    if not isinstance(value, str):
+        raise ValueError(f"{name} is not a timestamp: {value!r}")
+    moment = datetime.fromisoformat(value)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return moment.timestamp()
+
+
+def captured_at_s(message: dict[str, Any]) -> float | None:
+    """The station's capture time (`ts`) as epoch seconds; None when the
+    message carries none. See the module docstring for whose clock it is."""
+    return time_field_s(message, "ts")
+
+
+def received_at_s(message: dict[str, Any]) -> float | None:
+    """The Gateway's receive time (`rx_ts`) as epoch seconds; None when the
+    message carries none (an older Gateway, or a test)."""
+    return time_field_s(message, "rx_ts")
+
+
+def is_backlog(message: dict[str, Any]) -> bool:
+    """The Gateway's verdict that the record was queued before the session
+    that delivered it (`gateway/README.md`). Absent means live."""
+    return message.get("backlog") is True
 
 
 def track_from_telemetry(
     message: dict[str, Any], *, arrived_at_s: float
 ) -> Track | None:
     """A Track, or None if the message cannot place the aircraft in 3-D.
-    A message without `ts` is placed at `arrived_at_s`.
+    Placed at `rx_ts`, or at `arrived_at_s` when the message has none.
 
     Raises ValueError for a message that has the fields but cannot be used:
-    a `ts` that is not a timestamp, or a number that is not finite (an
+    a time that is not a timestamp, or a number that is not finite (an
     `inf` latitude would reach `math.floor` in the neighbour grid and
     overflow there, S-12).
     """
@@ -205,7 +226,7 @@ def track_from_telemetry(
     for name, value in values.items():
         if not math.isfinite(value):
             raise ValueError(f"{name} is not finite: {value}")
-    captured = captured_at_s(message)
+    received = received_at_s(message)
     return Track(
         drone_id=UUID(str(message["drone_id"])),
         lat_deg=values["lat_deg"],
@@ -214,8 +235,9 @@ def track_from_telemetry(
         vn_ms=values["vx_ms"],
         ve_ms=values["vy_ms"],
         vd_ms=values["vz_ms"],
-        captured_at_s=arrived_at_s if captured is None else captured,
+        captured_at_s=arrived_at_s if received is None else received,
         source=source_of(message),
+        source_ts_s=captured_at_s(message),
     )
 
 
@@ -253,20 +275,23 @@ class AirspaceMonitor:
     # S-11; the defaults match `airspace.config.AirspaceSettings`.
     live_max_age_s: float = 10.0
     neighbour_max_age_s: float = 10.0
-    clock_relax_s_per_s: float = 0.1
+    source_state_max: int = 4096
 
     index: NeighbourIndex = field(init=False)
-    clocks: SourceClocks = field(init=False)
-    # Messages not evaluated: a replayed backlog, or a sample older than the
-    # one its source already gave. Counted so a backlog shows in the log,
-    # and in the service's periodic status line, rather than in the silence.
+    # Messages not evaluated: the Gateway flagged a replayed backlog; the
+    # Gateway-to-monitor delay exceeded `live_max_age_s`; or the sample is
+    # older than the one its source already gave. Counted so each shows in
+    # the log, and in the service's status line, rather than in the silence.
     rejected_backlog: int = field(default=0, init=False)
+    rejected_late: int = field(default=0, init=False)
     rejected_out_of_order: int = field(default=0, init=False)
     # Messages evaluated at their arrival time because they carried no
-    # `ts`. No Gateway producer omits it, so a count here is a producer bug.
+    # `rx_ts`, and messages with no `ts` at all. Neither Gateway producer
+    # omits either, so a count here is an older producer or a bug.
+    without_receive_time: int = field(default=0, init=False)
     without_capture_time: int = field(default=0, init=False)
     _rejected_logged: set[UUID] = field(default_factory=set, init=False)
-    _without_ts_logged: set[UUID] = field(default_factory=set, init=False)
+    _without_time_logged: set[UUID] = field(default_factory=set, init=False)
     # Alert keys the current message could not judge (B2): a pair whose
     # neighbour sample is too old to advance, or one whose CPA raised.
     _unevaluated_keys: set[str] = field(default_factory=set, init=False)
@@ -275,10 +300,12 @@ class AirspaceMonitor:
     check_failures: int = field(default=0, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
-    # The latest capture time each source gave for each aircraft, so a
-    # sample is judged out of order only against its own source's.
-    _last_by_source_s: dict[tuple[UUID, str], float] = field(
-        default_factory=dict, init=False
+    # The latest (`ts`, `rx_ts`) each source gave for each aircraft, so a
+    # sample is judged out of order only against its own source's. Bounded
+    # to `source_state_max` entries, least recently seen out, so a stream
+    # of new station ids cannot grow it without limit.
+    _last_by_source_s: OrderedDict[tuple[UUID, str], tuple[float, float]] = field(
+        default_factory=OrderedDict, init=False
     )
     _active: dict[str, Alert] = field(default_factory=dict, init=False)
     # When each active alert's condition was last seen true, and last seen
@@ -287,8 +314,9 @@ class AirspaceMonitor:
     _last_false_s: dict[str, float] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
+        if self.source_state_max < 1:
+            raise ValueError("source_state_max must be at least 1")
         self.index = NeighbourIndex(radius_m=self.policy.neighbour_radius_m)
-        self.clocks = SourceClocks(relax_s_per_s=self.clock_relax_s_per_s)
 
     @property
     def active(self) -> list[Alert]:
@@ -296,7 +324,7 @@ class AirspaceMonitor:
 
     @property
     def rejected(self) -> int:
-        return self.rejected_backlog + self.rejected_out_of_order
+        return self.rejected_backlog + self.rejected_late + self.rejected_out_of_order
 
     @property
     def tracked(self) -> int:
@@ -325,20 +353,20 @@ class AirspaceMonitor:
     ) -> Change:
         """Take one telemetry message; return the alerts it raised or cleared.
 
-        `now_s` is the monitor's wall clock. The message's `ts` is put on
-        that clock with its source's offset and the message is evaluated at
-        that instant; `now_s` itself only decides whether the message is a
-        backlog, and what has gone stale. With `height_available` False the
-        caller could not get the terrain under the aircraft (S-13): the
+        `now_s` is the monitor's wall clock. The message is evaluated at its
+        `rx_ts` (the Gateway's clock); `now_s` decides only whether it is
+        late, and what has gone stale. A message the Gateway flagged as
+        backlog is counted and not evaluated. With `height_available` False
+        the caller could not get the terrain under the aircraft (S-13): the
         height limit is not evaluated by this message, the other checks are.
         """
         drone_id = UUID(str(message["drone_id"]))
         self._labels[drone_id] = message.get("label")
-        track = None
-        if _flying(message):
-            track = track_from_telemetry(message, arrived_at_s=now_s)
-            if track is not None and captured_at_s(message) is None:
-                self._note_missing_ts(track)
+        track = (
+            track_from_telemetry(message, arrived_at_s=now_s)
+            if _flying(message)
+            else None
+        )
 
         raised: list[Alert] = []
         if track is None:
@@ -346,13 +374,9 @@ class AirspaceMonitor:
             self._last_seen_s.pop(drone_id, None)
             for key in [k for k in self._last_by_source_s if k[0] == drone_id]:
                 del self._last_by_source_s[key]
-        else:
-            delay = self.clocks.observe(
-                track.source, wall_s=now_s, ts_s=track.captured_at_s
-            )
-            track = replace(track, captured_at_s=track.captured_at_s + delay.offset_s)
-            if not self._rejects(track, excess_s=delay.excess_s):
-                raised = self._evaluate(track, height_available=height_available)
+        elif not self._rejects(track, message, now_s=now_s):
+            self._note_missing_times(track, message)
+            raised = self._evaluate(track, height_available=height_available)
 
         cleared = self._expire(now_s)
         return Change(raised=raised, cleared=cleared)
@@ -362,7 +386,12 @@ class AirspaceMonitor:
         drone_id = track.drone_id
         self.index.upsert(track)
         self._last_seen_s[drone_id] = at_s
-        self._last_by_source_s[(drone_id, track.source)] = at_s
+        if track.source_ts_s is not None:
+            key_by_source = (drone_id, track.source)
+            self._last_by_source_s[key_by_source] = (track.source_ts_s, at_s)
+            self._last_by_source_s.move_to_end(key_by_source)
+            while len(self._last_by_source_s) > self.source_state_max:
+                self._last_by_source_s.popitem(last=False)
         self._unevaluated_keys.clear()
         raised: list[Alert] = []
         # Each check on its own: a missing terrain tile must not silence
@@ -420,31 +449,54 @@ class AirspaceMonitor:
             )
             return None
 
-    def _note_missing_ts(self, track: Track) -> None:
-        self.without_capture_time += 1
-        if track.drone_id not in self._without_ts_logged:
-            self._without_ts_logged.add(track.drone_id)
+    def _note_missing_times(self, track: Track, message: dict[str, Any]) -> None:
+        """Count a message without `rx_ts` (placed at its arrival time) or
+        without `ts` (not ordered within its source); log once per aircraft.
+        Neither Gateway producer omits either, so a count is a producer bug,
+        and a missed alert would cost more than a position a second out."""
+        missing = []
+        if "rx_ts" not in message or message.get("rx_ts") is None:
+            self.without_receive_time += 1
+            missing.append("rx_ts")
+        if track.source_ts_s is None:
+            self.without_capture_time += 1
+            missing.append("ts")
+        if missing and track.drone_id not in self._without_time_logged:
+            self._without_time_logged.add(track.drone_id)
             _log.warning(
-                "telemetry has no ts; evaluated at its arrival time",
+                "telemetry is missing a time field; evaluated at its arrival time",
                 extra={
                     "drone_id": str(track.drone_id),
                     "station_id": track.source,
+                    "missing": missing,
+                    "without_receive_time": self.without_receive_time,
                     "without_capture_time": self.without_capture_time,
                 },
             )
 
-    def _rejects(self, track: Track, *, excess_s: float) -> bool:
-        """Whether the sample must not be evaluated: a backlog (delivered
-        `excess_s` later than its source's usual delay), or older than the
-        sample its own source already gave. Counted, and logged once per
-        aircraft per run of rejections, so a backlog of thousands is one
-        line, not thousands; the totals go in the service's status line.
+    def _rejects(self, track: Track, message: dict[str, Any], *, now_s: float) -> bool:
+        """Whether the sample must not be evaluated: the Gateway flagged it
+        as backlog; it reached here more than `live_max_age_s` after the
+        Gateway received it; or it is older, on its station's clock, than
+        the sample that station already gave and was not received later
+        (out of order). Counted, and logged once per aircraft per run of
+        rejections, so a backlog of thousands is one line, not thousands;
+        the totals go in the service's status line.
         """
-        latest_s = self._last_by_source_s.get((track.drone_id, track.source))
-        if excess_s > self.live_max_age_s:
+        delay_s = now_s - track.captured_at_s
+        last = self._last_by_source_s.get((track.drone_id, track.source))
+        if is_backlog(message):
             reason = "backlog"
             self.rejected_backlog += 1
-        elif latest_s is not None and track.captured_at_s < latest_s:
+        elif delay_s > self.live_max_age_s:
+            reason = "late"
+            self.rejected_late += 1
+        elif (
+            last is not None
+            and track.source_ts_s is not None
+            and track.source_ts_s < last[0]
+            and track.captured_at_s <= last[1]
+        ):
             reason = "older than the sample held"
             self.rejected_out_of_order += 1
         else:
@@ -458,10 +510,7 @@ class AirspaceMonitor:
                     "drone_id": str(track.drone_id),
                     "station_id": track.source,
                     "reason": reason,
-                    "excess_delay_s": round(excess_s, 1),
-                    "clock_offset_s": round(
-                        self.clocks.offset_s(track.source) or 0.0, 1
-                    ),
+                    "gateway_delay_s": round(delay_s, 1),
                     "live_max_age_s": self.live_max_age_s,
                     "rejected": self.rejected,
                 },

@@ -28,22 +28,22 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     terrain_cache_tiles: int = Field(
         default=8, ge=1, validation_alias="TERRAIN_CACHE_TILES"
     )
-    # S-11. A telemetry message delivered more than this later than its
-    # source's usual delay is not live: a backlog replayed after an outage.
-    # It is counted and logged, never evaluated as "now". Delay is measured
-    # against the source's own clock offset (`airspace/clock.py`), so a
-    # ground-station clock that is wrong by any constant amount costs no
-    # alerts. Live delivery is under 2 s end to end, and this is kept below
-    # the 15 s after which an aircraft is dropped as stale, so an accepted
-    # message is evaluated before it is already stale.
+    # S-11. A telemetry message that reaches the monitor more than this
+    # after the Gateway received it (`rx_ts`) is late: the bus or this
+    # service is behind. It is counted and logged, never evaluated as "now".
+    # Only the Gateway-to-monitor leg is judged; whether a record is a
+    # replayed backlog is the Gateway's own flag, and a wrong station clock
+    # or a slow Gateway costs no alerts. Live delivery on this leg is well
+    # under a second, and this is kept below the 15 s after which an
+    # aircraft is dropped as stale, so an accepted message is evaluated
+    # before it is already stale.
     live_max_age_s: float = Field(default=10.0, gt=0, validation_alias="LIVE_MAX_AGE_S")
-    # S-11. How fast a source's clock offset estimate (a running minimum of
-    # `wall - ts`) relaxes upwards, in seconds per second. It has to move at
-    # all, or a clock stepped backwards would look like a backlog for ever;
-    # at 0.1 a 60 s step is absorbed in 10 minutes, while a backlog replay,
-    # which drains many times faster than real time, cannot hide behind it.
-    clock_relax_s_per_s: float = Field(
-        default=0.1, ge=0, validation_alias="CLOCK_RELAX_S_PER_S"
+    # S-11. Per (aircraft, station) ordering state kept, least recently seen
+    # out. One entry per pair actually reporting; 4096 is far beyond any
+    # fleet and station count here, and a stream of new station ids (a
+    # misconfigured relay) is bounded instead of growing memory.
+    source_state_max: int = Field(
+        default=4096, ge=1, validation_alias="SOURCE_STATE_MAX"
     )
     # S-11. A neighbour's latest sample older than this, relative to the
     # subject's capture time, is left out of the CPA check. Younger ones are

@@ -232,12 +232,15 @@ def head_on(geoid: FlatGeoid | None) -> list[str]:
     monitor = AirspaceMonitor(policy=policy())
     east_m = 400.0
     lon_east = LON + math.degrees(east_m / (6_371_000 * math.cos(math.radians(LAT))))
-    monitor.observe(mavlink(LAT, lon_east, 500.0), now_s=0.0)
+    # The monitor's clock is the wall clock the frames are stamped with:
+    # the MAVLink fixture carries no time and is placed at its arrival.
+    wall_s = NOW.timestamp()
+    monitor.observe(mavlink(LAT, lon_east, 500.0), now_s=wall_s)
     seen = RemoteIdTracker(geoid=geoid).take(
         frame(pack(basic(), location(climb_ms=0.0))), now_s=0.0
     )
     assert seen is not None
-    change = monitor.observe(seen, now_s=0.0)
+    change = monitor.observe(seen, now_s=wall_s)
     return [alert.key for alert in change.raised]
 
 

@@ -28,14 +28,24 @@ POLICY = SeparationPolicy(
 
 
 def payload(
-    drone_id: UUID, north_m: float, vn: float, armed: bool = True, at_s: float = 0.0
+    drone_id: UUID,
+    north_m: float,
+    vn: float,
+    armed: bool = True,
+    at_s: float = 0.0,
+    *,
+    backlog: bool = False,
 ) -> bytes:
+    """As the Gateway publishes it: captured and received at `at_s`."""
     n1, _ = local_offset_m(LAT0, LON0, LAT0 + 0.001, LON0)
     return json.dumps(
         {
             "drone_id": str(drone_id),
             "label": f"D{drone_id.int}",
             "ts": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
+            "rx_ts": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
+            "backlog": backlog,
+            "station_id": "gs-1",
             "lat_deg": LAT0 + 0.001 * north_m / n1,
             "lon_deg": LON0,
             "alt_amsl_m": 550.0,
@@ -352,8 +362,8 @@ async def test_the_tick_logs_the_running_totals_on_its_cadence(
     svc.status_every_s = 10.0
     await svc.on_telemetry(payload(A, 0, 10))
     await svc.on_telemetry(payload(B, 500, -10))
-    # A backlog message: the station's offset is 0, this one is 30 s late.
-    await svc.on_telemetry(payload(A, 0, 10, at_s=-30.0))
+    # A message the Gateway flagged as replayed backlog.
+    await svc.on_telemetry(payload(A, 0, 10, backlog=True))
 
     for clock.now_s in (1.0, 5.0, 12.0):
         await svc.on_tick()

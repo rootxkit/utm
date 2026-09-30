@@ -40,14 +40,27 @@ def message(
     label: str | None = None,
     at_s: float = 0.0,
     station: str = "gs-1",
+    rx_at_s: float | None = None,
+    backlog: bool = False,
+    with_rx: bool = True,
 ) -> dict[str, Any]:
-    """A message captured at `at_s` (epoch seconds) on `station`'s clock, as
-    the Gateway's `ts` and `station_id`."""
+    """A message as the Gateway publishes it: captured at `at_s` (epoch
+    seconds) on `station`'s clock (`ts`), received by the Gateway at
+    `rx_at_s` (`rx_ts`, the same instant unless said otherwise), flagged
+    `backlog` by the Gateway. `with_rx` False leaves `rx_ts` out, as an
+    older Gateway would."""
     n1, _ = local_offset_m(LAT0, LON0, LAT0 + 0.001, LON0)
+    rx_s = at_s if rx_at_s is None else rx_at_s
     return {
         "drone_id": str(drone_id),
         "label": label or f"D{drone_id.int}",
         "ts": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
+        **(
+            {"rx_ts": datetime.fromtimestamp(rx_s, tz=UTC).isoformat()}
+            if with_rx
+            else {}
+        ),
+        "backlog": backlog,
         "station_id": station,
         "lat_deg": LAT0 + 0.001 * north_m / n1,
         "lon_deg": LON0,
@@ -294,10 +307,11 @@ def test_a_message_without_a_capture_time_is_evaluated_at_arrival_and_counted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """No producer omits `ts`; if one did, dropping its aircraft would cost
-    alerts, so it is placed at its arrival time and the count says so."""
+    alerts, so it is placed at its `rx_ts` all the same and the count says
+    so (it only loses ordering within its source)."""
     monitor = AirspaceMonitor(policy=POLICY)
     for north_m, vn in ((0, 10), (10, 10)):
-        without = message(A, north_m, vn=vn)
+        without = message(A, north_m, vn=vn, at_s=5.0 + north_m / 10)
         del without["ts"]
         monitor.observe(without, now_s=5.0 + north_m / 10)
     raised = monitor.observe(message(B, 510, vn=-10, at_s=6.0), now_s=6.0).raised
@@ -305,9 +319,7 @@ def test_a_message_without_a_capture_time_is_evaluated_at_arrival_and_counted(
     assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
     assert raised[0].detail["t_cpa_s"] == 25.0
     assert monitor.without_capture_time == 2
-    warnings = [
-        r for r in caplog.records if r.getMessage().startswith("telemetry has no ts")
-    ]
+    warnings = [r for r in caplog.records if "missing a time field" in r.getMessage()]
     assert len(warnings) == 1, "once per aircraft"
 
 
@@ -379,122 +391,206 @@ def test_a_neighbour_older_than_the_maximum_age_is_left_out(
     assert len(raised) == alerts
 
 
-@pytest.mark.parametrize("skew_s", [60.0, -60.0, 0.0], ids=["behind", "ahead", "true"])
-def test_a_station_clock_off_by_a_minute_still_raises_the_conflict(
+@pytest.mark.parametrize(
+    "skew_s", [60.0, -3600.0, 0.0], ids=["behind-1min", "ahead-1h", "true"]
+)
+def test_a_station_clock_off_by_any_amount_still_raises_the_conflict(
     skew_s: float,
 ) -> None:
-    """B1. The station's `ts` reads `wall - skew`: a minute slow, a minute
-    fast, or right. Its aircraft alert all the same, at the right CPA."""
+    """B1. The station's `ts` reads `wall - skew`: a minute slow, an hour
+    fast, or right. The track is placed at the Gateway's `rx_ts`, so its
+    aircraft alert all the same, at the right CPA, and nothing is rejected."""
     monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
     for wall_s in (100.0, 101.0):
         north_m = 10 * (wall_s - 100.0)
-        monitor.observe(message(A, north_m, vn=10, at_s=wall_s - skew_s), now_s=wall_s)
+        monitor.observe(
+            message(A, north_m, vn=10, at_s=wall_s - skew_s, rx_at_s=wall_s),
+            now_s=wall_s,
+        )
     raised = monitor.observe(
-        message(B, 510, vn=-10, at_s=101.0 - skew_s), now_s=101.0
+        message(B, 510, vn=-10, at_s=101.0 - skew_s, rx_at_s=101.0), now_s=101.0
     ).raised
 
     assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
     assert raised[0].detail["t_cpa_s"] == 25.0
     assert monitor.rejected == 0
-    assert monitor.clocks.offset_s("gs-1") == pytest.approx(skew_s)
 
 
-def test_two_stations_with_different_skews_are_put_on_one_clock() -> None:
-    """A on a station a minute slow, B on one that is right, sampled at the
-    same wall instant: the CPA must be 25 s, not a minute of advance."""
+def test_two_stations_with_different_skews_are_compared_at_the_gateways_clock() -> None:
+    """A on a station a minute slow, B on one that is right, both received
+    by the Gateway at the same instant: the CPA is 25 s, not a minute of
+    advance, and no station's skew had to be guessed."""
     monitor = AirspaceMonitor(policy=POLICY)
-    monitor.observe(message(A, 0, vn=10, at_s=40.0, station="slow"), now_s=100.0)
+    monitor.observe(
+        message(A, 0, vn=10, at_s=40.0, rx_at_s=100.0, station="slow"), now_s=100.0
+    )
     raised = monitor.observe(
-        message(B, 500, vn=-10, at_s=100.0, station="right"), now_s=100.0
+        message(B, 500, vn=-10, at_s=100.0, rx_at_s=100.0, station="right"),
+        now_s=100.0,
     ).raised
     assert len(raised) == 1
     assert raised[0].detail["t_cpa_s"] == 25.0
     assert raised[0].detail["d_horizontal_now_m"] == 500.0
 
 
-def test_a_backlog_is_judged_against_the_stations_own_offset(
+def replay(
+    monitor: AirspaceMonitor, *, captured_wall_s: range, rx_s: float, speed: float = 1.0
+) -> None:
+    """B's positions from an outage, flagged `backlog` by the Gateway,
+    delivered in one burst at `rx_s`. `speed` is how much faster than real
+    time the relay drains; the flag makes it irrelevant."""
+    for n, captured_s in enumerate(captured_wall_s):
+        monitor.observe(
+            message(
+                B,
+                100,
+                vn=10,
+                at_s=float(captured_s),
+                rx_at_s=rx_s + n / speed,
+                backlog=True,
+            ),
+            now_s=rx_s + n / speed,
+        )
+
+
+def test_a_relay_backlog_raises_nothing_and_live_records_alert_again(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """B1. The station runs a minute slow and delivers in about a second.
-    After an outage the relay replays 40 s of old positions in a burst:
-    those are not evaluated, and the first live one after them is."""
-    monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0, clock_relax_s_per_s=0)
-    skew_s = 60.0
+    """B1. After an outage the relay replays 36 s of B's positions, each
+    flagged `backlog` by the Gateway (relay-v1 §5): none is evaluated, B is
+    not even placed, and the reason is logged once. The first live record
+    after them is evaluated and, head-on with A, raises the conflict."""
+    monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
     for wall_s in (0.0, 1.0, 2.0):
-        monitor.observe(message(A, 0, at_s=wall_s - 1 - skew_s), now_s=wall_s)
-    assert monitor.rejected == 0
-    assert monitor.clocks.offset_s("gs-1") == 61.0
+        monitor.observe(message(A, 0, vn=10, at_s=wall_s), now_s=wall_s)
 
-    # Replayed at wall 45: captured at wall 3..38, delivered 42 s to 7 s
-    # late against the usual 1 s. Those more than 10 s over it (3..33) are
-    # not evaluated; the last five are.
-    for captured_wall_s in range(3, 39):
-        monitor.observe(
-            message(B, 100, vn=10, at_s=captured_wall_s - skew_s), now_s=45.0
-        )
-    assert monitor.rejected_backlog == 31
-    held = monitor.index.track(B)
-    assert held is not None and held.captured_at_s == pytest.approx(38.0 + 1.0)
-    assert [r.reason for r in not_evaluated(caplog)] == ["backlog"]
-    assert not_evaluated(caplog)[0].station_id == "gs-1"
+    replay(monitor, captured_wall_s=range(3, 39), rx_s=45.0, speed=36.0)
+    assert monitor.rejected_backlog == 36
+    assert monitor.index.track(B) is None
+    logged = not_evaluated(caplog)
+    assert [(r.reason, r.station_id) for r in logged] == [("backlog", "gs-1")]
 
-    # Live again: A still reporting, B head-on with it, delivered a second
-    # late as usual.
     for wall_s in (44.0, 45.0, 46.0):
-        monitor.observe(message(A, 0, vn=10, at_s=wall_s - 1 - skew_s), now_s=wall_s)
-    raised = monitor.observe(
-        message(B, 500, vn=-10, at_s=45.0 - skew_s), now_s=46.0
-    ).raised
+        monitor.observe(message(A, 0, vn=10, at_s=wall_s), now_s=wall_s)
+    raised = monitor.observe(message(B, 500, vn=-10, at_s=46.0), now_s=46.0).raised
     assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
+    assert monitor.rejected_backlog == 36
 
 
-def test_a_steady_delivery_delay_still_alerts() -> None:
-    """B1. Gateway saturation: everything arrives 47.6 s late, steadily.
-    A constant delay is indistinguishable from skew, and costs no alerts."""
+def test_review_scenario_1_a_source_first_heard_mid_replay_raises_nothing() -> None:
+    """The monitor restarts while a relay is 30 min into a replay. Every
+    replayed record is flagged by the Gateway, so a monitor with no history
+    of the source evaluates none of them; the same records unflagged (the
+    presence pair) would be evaluated."""
+    fresh = AirspaceMonitor(policy=POLICY)
+    fresh.observe(message(A, 0, vn=10, at_s=1800.0), now_s=1800.0)
+    replay(fresh, captured_wall_s=range(0, 1800, 60), rx_s=1800.0, speed=10.0)
+    assert fresh.rejected_backlog == 30 and fresh.active == []
+
+    unflagged = AirspaceMonitor(policy=POLICY)
+    unflagged.observe(message(A, 0, vn=10, at_s=1800.0), now_s=1800.0)
+    unflagged.observe(message(B, 500, vn=-10, at_s=1800.0), now_s=1800.0)
+    assert len(unflagged.active) == 1
+
+
+def test_review_scenario_2_a_slow_replay_after_a_live_warm_up_raises_nothing() -> None:
+    """A live warm-up, then a replay draining at only 1.5x real time for
+    long enough that any estimator would have absorbed it. The flag does
+    not estimate, so no replayed position is evaluated."""
+    monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
+    for wall_s in range(0, 60):
+        monitor.observe(message(A, 0, vn=10, at_s=float(wall_s)), now_s=float(wall_s))
+    replay(monitor, captured_wall_s=range(60, 960), rx_s=960.0, speed=1.5)
+    assert monitor.rejected_backlog == 900
+    assert monitor.index.track(B) is None and monitor.active == []
+
+
+def test_review_scenario_3_one_future_stamped_ts_changes_nothing_after_it() -> None:
+    """A station sends one record stamped an hour ahead, then sane ones.
+    Nothing is pinned: the sane records are received later, so they are not
+    out of order, and the pair alerts."""
+    monitor = AirspaceMonitor(policy=POLICY)
+    monitor.observe(message(A, 0, vn=10, at_s=3600.0, rx_at_s=0.0), now_s=0.0)
+    for wall_s in (1.0, 2.0):
+        monitor.observe(message(A, 10 * wall_s, vn=10, at_s=wall_s), now_s=wall_s)
+    raised = monitor.observe(message(B, 520, vn=-10, at_s=2.0), now_s=2.0).raised
+    assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
+    assert monitor.rejected == 0
+    held = monitor.index.track(A)
+    assert held is not None and held.captured_at_s == 2.0
+
+
+def test_a_gateway_that_is_behind_yields_late_alerts_not_none() -> None:
+    """ADR-002: the Gateway is 47.6 s behind the relay, so `ts` is 47.6 s
+    older than `rx_ts`. The track is placed at `rx_ts` and alerts."""
     monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
     lag_s = 47.6
-    for wall_s in (100.0, 101.0, 102.0):
-        monitor.observe(message(A, 0, vn=10, at_s=wall_s - lag_s), now_s=wall_s)
+    for wall_s in (100.0, 101.0):
+        monitor.observe(
+            message(A, 10 * (wall_s - 100), vn=10, at_s=wall_s - lag_s, rx_at_s=wall_s),
+            now_s=wall_s,
+        )
     raised = monitor.observe(
-        message(B, 500, vn=-10, at_s=102.0 - lag_s), now_s=102.0
+        message(B, 510, vn=-10, at_s=101.0 - lag_s, rx_at_s=101.0), now_s=101.0
     ).raised
     assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
     assert monitor.rejected == 0
 
 
-def test_the_first_message_from_a_source_is_evaluated_not_dropped() -> None:
-    """Without data on a source there is no offset to judge against."""
+@pytest.mark.parametrize(("behind_s", "alerts"), [(9.0, 1), (10.5, 0)])
+def test_the_live_window_applies_to_the_gateway_to_monitor_leg_only(
+    behind_s: float, alerts: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`wall - rx_ts` beyond `live_max_age_s` is this service being behind;
+    those messages are counted as late and not evaluated."""
     monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
-    monitor.observe(message(A, 0, vn=10, at_s=0.0, station="new-1"), now_s=1000.0)
+    monitor.observe(message(A, 0, vn=10, at_s=100.0), now_s=100.0)
     raised = monitor.observe(
-        message(B, 500, vn=-10, at_s=0.0, station="new-2"), now_s=1000.0
+        message(B, 500, vn=-10, at_s=100.0), now_s=100.0 + behind_s
     ).raised
-    assert len(raised) == 1 and monitor.rejected == 0
+    assert len(raised) == alerts
+    assert monitor.rejected_late == (0 if alerts else 1)
+    assert [r.reason for r in not_evaluated(caplog)] == ([] if alerts else ["late"])
 
 
-def test_a_stepped_clock_is_absorbed_at_the_relax_rate(
+def test_a_message_without_rx_ts_is_placed_at_its_arrival_and_counted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The station's clock is set back 30 s at wall 3. Its messages look
-    30 s late until the offset, relaxing at 1 s per second here, is within
-    the live window of them: from wall 22 they are evaluated again. Every
-    one not evaluated is counted."""
-    monitor = AirspaceMonitor(
-        policy=POLICY, live_max_age_s=10.0, clock_relax_s_per_s=1.0
-    )
-    for wall_s in range(0, 3):
-        monitor.observe(message(A, 0, at_s=wall_s), now_s=wall_s)
-    rejected_at: list[int] = []
-    for wall_s in range(3, 40):
-        before = monitor.rejected_backlog
-        monitor.observe(message(A, 0, at_s=wall_s - 30), now_s=wall_s)
-        if monitor.rejected_backlog > before:
-            rejected_at.append(wall_s)
+    """An older Gateway, or a test fixture: evaluated, never dropped."""
+    monitor = AirspaceMonitor(policy=POLICY)
+    monitor.observe(message(A, 0, vn=10, at_s=-500.0, with_rx=False), now_s=5.0)
+    raised = monitor.observe(message(B, 500, vn=-10, at_s=5.0), now_s=5.0).raised
 
-    assert rejected_at == list(range(3, 22))
-    assert monitor.rejected_backlog == 19
-    assert monitor.tracked == 1
-    assert len(not_evaluated(caplog)) == 1, "one line for the whole run"
+    assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
+    assert raised[0].detail["t_cpa_s"] == 25.0, "placed at arrival, not at ts"
+    assert monitor.without_receive_time == 1 and monitor.rejected == 0
+    warnings: list[Any] = [
+        r for r in caplog.records if "missing a time field" in r.getMessage()
+    ]
+    assert [r.missing for r in warnings] == [["rx_ts"]]
+
+
+def test_messages_without_ts_do_not_disturb_ordering() -> None:
+    monitor = AirspaceMonitor(policy=POLICY)
+    for wall_s in (0.0, 1.0):
+        without = message(A, 10 * wall_s, vn=10, at_s=wall_s)
+        del without["ts"]
+        monitor.observe(without, now_s=wall_s)
+    monitor.observe(message(A, 20, vn=10, at_s=2.0), now_s=2.0)
+    monitor.observe(message(A, 30, vn=10, at_s=3.0), now_s=3.0)
+    assert monitor.rejected == 0 and monitor.without_capture_time == 2
+
+
+def test_per_source_state_is_bounded_however_many_station_ids_appear() -> None:
+    monitor = AirspaceMonitor(policy=POLICY, source_state_max=100)
+    for n in range(5000):
+        monitor.observe(
+            message(A, 0, at_s=float(n), station=f"station-{n}"), now_s=float(n)
+        )
+    assert len(monitor._last_by_source_s) == 100
+    assert monitor.rejected == 0
+    with pytest.raises(ValueError, match="source_state_max"):
+        AirspaceMonitor(policy=POLICY, source_state_max=0)
 
 
 def test_two_sources_for_one_aircraft_are_not_ordered_against_each_other() -> None:
@@ -502,19 +598,22 @@ def test_two_sources_for_one_aircraft_are_not_ordered_against_each_other() -> No
     is a minute fast. Neither source's samples are rejected as older than
     the other's, so a resuming source does not go stale and re-raise."""
     monitor = AirspaceMonitor(policy=POLICY)
-    monitor.observe(message(A, 0, at_s=60.0, station="relay"), now_s=0.0)
-    monitor.observe(message(A, 0, at_s=61.0, station="relay"), now_s=1.0)
+    monitor.observe(message(A, 0, at_s=60.0, rx_at_s=0.0, station="relay"), now_s=0.0)
+    monitor.observe(message(A, 0, at_s=61.0, rx_at_s=1.0, station="relay"), now_s=1.0)
     monitor.observe(message(A, 0, at_s=1.5, station="rid"), now_s=1.5)
-    monitor.observe(message(A, 0, at_s=62.0, station="relay"), now_s=2.0)
+    monitor.observe(message(A, 0, at_s=62.0, rx_at_s=2.0, station="relay"), now_s=2.0)
     monitor.observe(message(A, 0, at_s=2.5, station="rid"), now_s=2.5)
 
     assert monitor.rejected == 0
     held = monitor.index.track(A)
     assert held is not None and held.source == "rid"
     assert held.captured_at_s == pytest.approx(2.5)
-    # Within one source the order still holds.
-    monitor.observe(message(A, 500, at_s=61.5, station="relay"), now_s=3.0)
+    # Within one source the order still holds: an older record received no
+    # later than the last one (the same batch) is out of order.
+    monitor.observe(message(A, 500, at_s=61.5, rx_at_s=2.0, station="relay"), now_s=3.0)
     assert monitor.rejected_out_of_order == 1
+    held = monitor.index.track(A)
+    assert held is not None and held.source == "rid"
 
 
 def test_a_sample_older_than_the_one_held_is_ignored(

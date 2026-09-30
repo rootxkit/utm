@@ -54,7 +54,7 @@ async def run(settings: AirspaceSettings) -> None:
         max_height_agl_m=max_height_agl_m,
         live_max_age_s=settings.live_max_age_s,
         neighbour_max_age_s=settings.neighbour_max_age_s,
-        clock_relax_s_per_s=settings.clock_relax_s_per_s,
+        source_state_max=settings.source_state_max,
     )
     bus = await nats.connect(str(settings.nats_url))
     service = AirspaceService(

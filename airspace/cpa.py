@@ -60,14 +60,19 @@ class Track:
     ve_ms: float
     # Positive down, as MAVLink sends it.
     vd_ms: float
-    # When the sample was taken, as epoch seconds on the monitor's clock:
-    # the message's `ts` plus its source's clock offset (`airspace.clock`),
-    # never when it arrived. Two tracks are only comparable at one instant,
-    # so the older is advanced to the newer (`advance`) before the CPA.
+    # When the sample was taken, as epoch seconds on one clock for every
+    # aircraft: the Gateway's receive time of the batch (`rx_ts`), which is
+    # within the delivery delay of the capture and, unlike the station's own
+    # clock, comparable across stations (S-11). Two tracks are only
+    # comparable at one instant, so the older is advanced to the newer
+    # (`advance`) before the CPA.
     captured_at_s: float
     # Who captured it: the ground station or Remote ID receiver whose clock
     # `ts` came from. Samples are ordered only within a source.
     source: str = "unknown"
+    # The station's own capture clock (`ts`), for ordering within a source;
+    # None when the message carried none. Never compared across sources.
+    source_ts_s: float | None = None
 
 
 def _radii_m(lat_deg: float) -> tuple[float, float]:
@@ -108,6 +113,7 @@ def advance(track: Track, dt_s: float) -> Track:
         vd_ms=track.vd_ms,
         captured_at_s=track.captured_at_s + dt_s,
         source=track.source,
+        source_ts_s=track.source_ts_s,
     )
 
 
