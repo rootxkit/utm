@@ -27,7 +27,7 @@ from websockets.asyncio.client import connect
 
 from agent.framing import Record as RelayRecord
 from agent.framing import encode_records
-from gateway.ingest_store import InMemoryIngestStore, StoredBatch
+from gateway.ingest_store import InMemoryIngestStore, StoredBatch, StoreError
 from gateway.rate_limit import RateLimiter
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
@@ -961,3 +961,165 @@ async def test_a_retransmitted_batch_is_not_processed_again() -> None:
     # Presence: the first copy was processed, and the new tail of the
     # overlapping batch. Absence: neither duplicate reached the pipeline.
     assert processor.batches == [list(range(10)), list(range(10, 15))]
+
+
+# --- a superseded session writes nothing (S-06) ----------------------------
+#
+# Trackers are shared per station. After a half-open link the relay
+# reconnects in seconds; the old session notices only when its own pings time
+# out, and its last act was to log and publish `unreachable` over a station
+# whose new session was healthy and streaming.
+
+
+async def test_a_stale_session_closing_does_not_mark_a_live_station_unreachable() -> (
+    None
+):
+    store = InMemoryIngestStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        old = await connect(url(server), additional_headers=auth())
+        await handshake(old, hello())
+        await old.send(status())
+        await wait_for_state(reporter, LinkState.HEALTHY)
+
+        # The relay reconnects while the old socket is still open.
+        async with connect(url(server), additional_headers=auth()) as new:
+            await handshake(new, hello())
+            await new.send(status())
+            await wait_for_state(reporter, LinkState.HEALTHY)
+            since = len(reporter.reports)
+
+            # Now the old session finds out, the way it would after a ping
+            # timeout, and ends.
+            await old.close()
+            await asyncio.sleep(0.2)
+
+            assert LinkState.UNREACHABLE not in [
+                state for _, state in reporter.reports[since:]
+            ], "the stale session overwrote the live station's state"
+            logged_while_live = [state for _, state, _ in store.link_states]
+            assert logged_while_live[-1] is LinkState.HEALTHY
+
+        # Presence: when the session that speaks for the station ends, the
+        # station really is unreachable, and it is said.
+        await wait_for_state(reporter, LinkState.UNREACHABLE)
+
+    logged_after = [state for _, state, _ in store.link_states]
+    assert logged_after[-1] is LinkState.UNREACHABLE
+
+
+# --- the reporter outlives a store failure (S-06) --------------------------
+
+
+@dataclass
+class FailingLinkStateStore(InMemoryIngestStore):
+    """`record_link_state` raises for the states named, once each."""
+
+    fail_on: set[LinkState] = field(default_factory=set)
+    failures: list[LinkState] = field(default_factory=list)
+
+    async def record_link_state(
+        self, station_id: str, state: LinkState, *, at_utc_ns: int
+    ) -> None:
+        if state in self.fail_on:
+            self.fail_on.discard(state)
+            self.failures.append(state)
+            raise StoreError(f"event log unavailable while writing {state}")
+        await super().record_link_state(station_id, state, at_utc_ns=at_utc_ns)
+
+
+async def test_a_store_failure_in_one_tick_does_not_end_the_reporter() -> None:
+    """The console froze: a StoreError killed the reporter task, and nothing
+    was published for the rest of the session. The tick must log and go on,
+    and the transition it failed to write must reach the log on a later tick.
+    """
+    store = FailingLinkStateStore(fail_on={LinkState.HEALTHY})
+    reporter = RecordingReporter()
+    async with (
+        running(
+            store=store, station_reporter=reporter, station_report_interval_s=0.02
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(status())
+        await wait_for_state(reporter, LinkState.HEALTHY)
+        assert store.failures == [LinkState.HEALTHY]
+        # Still alive: reports keep arriving after the failure.
+        seen = len(reporter.reports)
+        await wait_for_reports(reporter, seen + 3)
+
+    # Retried, and logged, once the store came back.
+    assert LinkState.HEALTHY in [state for _, state, _ in store.link_states]
+
+
+async def test_a_failed_disconnect_write_still_reports_the_station_unreachable() -> (
+    None
+):
+    """The `except StoreError` in `_report_disconnected`, which had never run.
+
+    The session is over either way; what must survive the failure is the
+    report, so the console is not left showing `healthy` for a station that
+    left.
+    """
+    store = FailingLinkStateStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        async with connect(url(server), additional_headers=auth()) as connection:
+            await handshake(connection, hello())
+            await connection.send(status())
+            await wait_for_state(reporter, LinkState.HEALTHY)
+            # Arm the failure for the disconnect write only.
+            store.fail_on.add(LinkState.UNREACHABLE)
+        await wait_for_state(reporter, LinkState.UNREACHABLE)
+
+    assert store.failures == [LinkState.UNREACHABLE]
+    assert reporter.reports[-1] == (STATION, LinkState.UNREACHABLE)
+
+
+@dataclass
+class RaisingReporter:
+    """A bus that is down, from the session's point of view."""
+
+    attempts: int = 0
+
+    async def publish_station(
+        self,
+        station_id: str,
+        state: LinkState,
+        *,
+        last_datagram_age_ms: int | None = None,
+        queue_depth: int | None = None,
+        losses: Any = None,
+        lag_s: float | None = None,
+    ) -> None:
+        self.attempts += 1
+        raise RuntimeError("bus unavailable")
+
+
+async def test_a_reporter_that_raises_does_not_break_ingest() -> None:
+    """The console is a view of the record, never a condition of it."""
+    store = InMemoryIngestStore()
+    reporter = RaisingReporter()
+    async with (
+        running(
+            store=store,
+            station_reporter=reporter,
+            station_report_interval_s=0.02,
+            ack_interval_s=0.05,
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(status())
+        await asyncio.sleep(0.1)
+        await connection.send(batch(0, 4))
+        ack = await read_until(connection, "ack")
+
+    assert ack["seq"] == 3
+    assert reporter.attempts >= 3, "the reporter stopped after the first failure"
+    assert len(store.records[(STATION, EPOCH)]) == 4

@@ -154,11 +154,32 @@ class RelayServer:
     def __post_init__(self) -> None:
         self._server: Server | None = None
         self._trackers: dict[str, StationLinkTracker] = {}
+        # S-06: the generation of the newest session per station. A session
+        # whose generation is no longer current has been superseded by a
+        # reconnect and must write nothing about the station's link state.
+        self._generations: dict[str, int] = {}
 
     @property
     def trackers(self) -> dict[str, StationLinkTracker]:
         """Live link state per station, for whoever publishes to the console."""
         return self._trackers
+
+    def _next_generation(self, station_id: str) -> int:
+        generation = self._generations.get(station_id, 0) + 1
+        self._generations[station_id] = generation
+        return generation
+
+    def is_current(self, station_id: str, generation: int) -> bool:
+        """Whether a session of this generation still speaks for the station.
+
+        Trackers are shared per station, so two sessions can exist for one:
+        the relay reconnects after a half-open link, and the old session
+        notices only when its own pings time out, about 20 s later. Without
+        this check the old session's last act was to log and publish
+        `unreachable` for a station whose new session was healthy and
+        streaming (S-06).
+        """
+        return self._generations.get(station_id) == generation
 
     async def start(self) -> None:
         self._server = await serve(
@@ -258,6 +279,7 @@ class RelayServer:
             epoch=hello.epoch,
             tracker=tracker,
             log=log,
+            generation=self._next_generation(station_id),
         )
         await session.run()
 
@@ -321,6 +343,7 @@ class _Session:
     epoch: str
     tracker: StationLinkTracker
     log: BoundLogger
+    generation: int = 0
 
     def __post_init__(self) -> None:
         # The highest seq durably stored for this epoch, cumulative. -1 means
@@ -331,16 +354,21 @@ class _Session:
         self._last_state: LinkState | None = None
         self.tracker.start_session()
 
+    @property
+    def superseded(self) -> bool:
+        """A newer session for this station exists; this one must stay quiet."""
+        return not self.server.is_current(self.station_id, self.generation)
+
     async def run(self) -> None:
-        # The state at connect, recorded and reported before anything is
-        # waited for. Without it both are left to a race: whether the log
-        # opens with `unreachable` depends on whether a timer tick beat the
-        # station's first `status`, and a console watching a station come up
-        # sees nothing until a tick has passed.
-        await self._tick()
         acker = asyncio.create_task(self._acknowledge_periodically())
         reporter = asyncio.create_task(self._report_periodically())
         try:
+            # The state at connect, recorded and reported before anything is
+            # waited for. Without it both are left to a race: whether the log
+            # opens with `unreachable` depends on whether a timer tick beat
+            # the station's first `status`, and a console watching a station
+            # come up sees nothing until a tick has passed.
+            await self._tick_logged()
             async for message in self.connection:
                 if isinstance(message, bytes):
                     await self._ingest_batch(message)
@@ -353,10 +381,19 @@ class _Session:
             with contextlib.suppress(websockets.WebSocketException):
                 await self.connection.close(_CLOSE_PROTOCOL_ERROR, str(error)[:120])
         finally:
-            for task in (acker, reporter):
+            # Each step here runs whatever the previous one did. A task that
+            # died with an exception used to re-raise from `await task` and
+            # skip the final ack and the disconnect report (S-06).
+            for name, task in (("acker", acker), ("reporter", reporter)):
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                try:
                     await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as error:
+                    self.log.error(
+                        "session task died", extra={"task": name, "error": repr(error)}
+                    )
             # A final ack for anything stored since the last tick. The relay
             # survives without it - protocol §5 makes a lost ack cost a
             # retransmission, never a gap - but sending it saves the station
@@ -402,7 +439,16 @@ class _Session:
         if isinstance(message, Status):
             for loss in self.tracker.observe_status(message, now_s=now_s):
                 await self.server.store.record_loss(self.station_id, self.epoch, loss)
-            await self._record_state_change(now_s, message.utc_ns)
+            try:
+                await self._record_state_change(now_s, message.utc_ns)
+            except StoreError as error:
+                # Same as the timer path: the event log being unavailable is
+                # not a reason to drop the connection that carries telemetry.
+                # The transition is retried on the next tick.
+                self.log.error(
+                    "could not log the link state; retrying next tick",
+                    extra={"error": str(error)},
+                )
             return
 
         if isinstance(message, Gap):
@@ -458,11 +504,13 @@ class _Session:
         an incident is reconstructed from.
         """
         state = self.tracker.state(now_s=now_s, now_utc_ns=time.time_ns())
-        if state != self._last_state:
-            self._last_state = state
+        if state != self._last_state and not self.superseded:
             await self.server.store.record_link_state(
                 self.station_id, state, at_utc_ns=at_utc_ns
             )
+            # After the write, so a write that failed is retried on the next
+            # tick rather than the transition going unlogged.
+            self._last_state = state
         return state
 
     async def _report_periodically(self) -> None:
@@ -481,10 +529,29 @@ class _Session:
         """
         while True:
             await asyncio.sleep(self.server.station_report_interval_s)
+            await self._tick_logged()
+
+    async def _tick_logged(self) -> None:
+        """One tick, with a store failure logged rather than raised.
+
+        A `StoreError` from the event log used to end this task, and with it
+        every report to the console for the rest of the session: the stations
+        panel froze on whatever was last published (S-06). The transition is
+        retried on the next tick because `_record_state_change` only notes
+        the state once it is written.
+        """
+        try:
             await self._tick()
+        except StoreError as error:
+            self.log.error(
+                "could not log the link state; retrying next tick",
+                extra={"error": str(error)},
+            )
 
     async def _tick(self) -> None:
         """Log the state if it changed, and report it either way."""
+        if self.superseded:
+            return
         now_s = time.monotonic()
         # `time.time_ns` because a transition detected by a timer has no
         # message to take a timestamp from.
@@ -502,7 +569,17 @@ class _Session:
         §9: a relay we cannot reach is presumed buffering, not losing.
         `unreachable` says that; `data_lost` stays reserved for loss that has
         actually been observed, and so is never overwritten here.
+
+        Unless this session has been superseded. Then the station is not
+        gone - it reconnected, and the new session speaks for it - and the
+        one thing this must not do is write `unreachable` over a live link.
         """
+        if self.superseded:
+            self.log.info(
+                "superseded session ended; link state left to the newer one",
+                extra={"generation": self.generation},
+            )
+            return
         state = self.tracker.state(now_s=time.monotonic())
         if state is not LinkState.DATA_LOST:
             state = LinkState.UNREACHABLE
@@ -534,13 +611,21 @@ class _Session:
         # and once the relay is unreachable we have no basis to advance it -
         # doing so would report radio silence we cannot observe, on a link
         # that may be carrying telemetry into a buffer perfectly well.
-        await reporter.publish_station(
-            self.station_id,
-            state,
-            last_datagram_age_ms=None
-            if status is None
-            else status.last_datagram_age_ms,
-            queue_depth=None if status is None else status.queue_depth,
-            losses=list(self.tracker.losses),
-            lag_s=self.tracker.lag_s(now_utc_ns=time.time_ns()),
-        )
+        try:
+            await reporter.publish_station(
+                self.station_id,
+                state,
+                last_datagram_age_ms=None
+                if status is None
+                else status.last_datagram_age_ms,
+                queue_depth=None if status is None else status.queue_depth,
+                losses=list(self.tracker.losses),
+                lag_s=self.tracker.lag_s(now_utc_ns=time.time_ns()),
+            )
+        except Exception as error:
+            # The console is a view of the record, never a condition of it.
+            # A bus that is down must not end the reporter, let alone the
+            # session that stores and acknowledges.
+            self.log.error(
+                "could not publish the station state", extra={"error": repr(error)}
+            )
