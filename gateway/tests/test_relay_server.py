@@ -27,7 +27,7 @@ from websockets.asyncio.client import connect
 
 from agent.framing import Record as RelayRecord
 from agent.framing import encode_records
-from gateway.ingest_store import InMemoryIngestStore
+from gateway.ingest_store import InMemoryIngestStore, StoredBatch
 from gateway.rate_limit import RateLimiter
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
@@ -58,7 +58,7 @@ class OrderRecordingStore(InMemoryIngestStore):
 
     async def store_records(
         self, station_id: str, epoch: str, records: list[Record]
-    ) -> int:
+    ) -> StoredBatch:
         if records:
             self.calls.append(f"store:{records[0].seq}-{records[-1].seq}")
         return await super().store_records(station_id, epoch, records)
@@ -346,7 +346,7 @@ async def test_nothing_is_acknowledged_before_it_is_stored() -> None:
     class SlowStore(InMemoryIngestStore):
         async def store_records(
             self, station_id: str, epoch: str, records: list[Record]
-        ) -> int:
+        ) -> StoredBatch:
             if records:
                 await asyncio.sleep(0.3)
                 order.append("stored")
@@ -925,3 +925,39 @@ async def test_a_valid_token_logs_no_rejection(monkeypatch: pytest.MonkeyPatch) 
     assert not [
         r for r in handler.records if r.getMessage() == "rejected relay connection"
     ]
+
+
+# --- the pipeline sees each record once (S-05) -----------------------------
+
+
+@dataclass
+class RecordingProcessor:
+    """Notes every record handed to the pipeline, batch by batch."""
+
+    batches: list[list[int]] = field(default_factory=list)
+
+    async def process(self, station_id: str, epoch: str, records: list[Record]) -> None:
+        self.batches.append([record.seq for record in records])
+
+
+async def test_a_retransmitted_batch_is_not_processed_again() -> None:
+    """§10 at-least-once: the resend is stored-and-ignored, and the pipeline
+    must not see it either, or it republishes the telemetry and counts the
+    same datagrams twice in link quality."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello())
+        await connection.send(batch(0, 10))
+        await read_until(connection, "ack")
+        await connection.send(batch(0, 10))
+        await connection.send(batch(5, 10))
+        ack = await read_until(connection, "ack")
+        while ack["seq"] < 14:
+            ack = await read_until(connection, "ack")
+
+    # Presence: the first copy was processed, and the new tail of the
+    # overlapping batch. Absence: neither duplicate reached the pipeline.
+    assert processor.batches == [list(range(10)), list(range(10, 15))]

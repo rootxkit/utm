@@ -133,7 +133,7 @@ async def test_a_retransmission_is_dropped(
 ) -> None:
     await store.store_records(station, EPOCH, records(0, 50))
 
-    watermark = await store.store_records(station, EPOCH, records(0, 50))
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
 
     assert watermark == 49
     async with store.engine.connect() as connection:
@@ -154,7 +154,7 @@ async def test_a_partially_overlapping_batch_stores_only_the_new_part(
 ) -> None:
     await store.store_records(station, EPOCH, records(0, 50))
 
-    watermark = await store.store_records(station, EPOCH, records(40, 30))
+    watermark = (await store.store_records(station, EPOCH, records(40, 30))).watermark
 
     assert watermark == 69
     stored = store.archive.read_segment(_only_segment_path(store, station))
@@ -228,7 +228,7 @@ async def test_records_after_a_gap_continue_the_watermark(
         station, EPOCH, Gap(epoch=EPOCH, from_seq=50, to_seq=80, reason="queue_cap")
     )
 
-    watermark = await store.store_records(station, EPOCH, records(80, 10))
+    watermark = (await store.store_records(station, EPOCH, records(80, 10))).watermark
 
     assert watermark == 89
     assert await store.resume_from_seq(station, EPOCH) == 90
@@ -270,7 +270,7 @@ async def test_a_sequence_discontinuity_is_archived_but_not_acknowledged(
     """
     await store.store_records(station, EPOCH, records(0, 10))
 
-    watermark = await store.store_records(station, EPOCH, records(50, 5))
+    watermark = (await store.store_records(station, EPOCH, records(50, 5))).watermark
 
     assert watermark == 9
     assert await store.resume_from_seq(station, EPOCH) == 10
@@ -477,7 +477,7 @@ async def test_a_resend_after_a_crash_between_index_and_watermark_recovers(
     await _rewind_watermark(engine, station, EMPTY_WATERMARK)
     assert await store.resume_from_seq(station, EPOCH) == 0
 
-    watermark = await store.store_records(station, EPOCH, records(0, 50))
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
 
     assert watermark == 49
     assert await store.resume_from_seq(station, EPOCH) == 50
@@ -495,7 +495,7 @@ async def test_a_resend_recovers_when_only_part_of_it_is_indexed(
     await store.store_records(station, EPOCH, records(30, 20))
     await _rewind_watermark(engine, station, 29)
 
-    watermark = await store.store_records(station, EPOCH, records(30, 20))
+    watermark = (await store.store_records(station, EPOCH, records(30, 20))).watermark
 
     assert watermark == 49
     assert await _index_rows(engine, station) == 2
@@ -523,7 +523,7 @@ async def test_an_index_conflict_the_precheck_missed_is_not_an_error(
     await store.store_records(station, EPOCH, records(0, 50))
     await _rewind_watermark(engine, station, EMPTY_WATERMARK)
 
-    watermark = await store.store_records(station, EPOCH, records(0, 50))
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
 
     assert watermark == 49
     assert await _index_rows(engine, station) == 1
@@ -557,3 +557,21 @@ async def test_the_index_and_the_watermark_commit_together(
 
     assert await store.resume_from_seq(station, EPOCH) == 0
     assert await _index_rows(engine, station) == 0
+
+
+# --- what the store reports as new (S-05) ----------------------------------
+
+
+async def test_the_store_reports_only_the_new_records(
+    store: TimescaleIngestStore, station: str
+) -> None:
+    """The pipeline behind the store processes `stored`, so it must hold the
+    first copy of everything and no copy of a retransmission."""
+    first = await store.store_records(station, EPOCH, records(0, 50))
+    resent = await store.store_records(station, EPOCH, records(0, 50))
+    overlapping = await store.store_records(station, EPOCH, records(40, 30))
+
+    assert [record.seq for record in first.stored] == list(range(50))
+    assert resent.stored == []
+    assert resent.watermark == 49
+    assert [record.seq for record in overlapping.stored] == list(range(50, 70))

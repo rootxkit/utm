@@ -64,7 +64,7 @@ from gateway.archive import (
     group_by_hour,
     segment_relative_path,
 )
-from gateway.ingest_store import StoreError
+from gateway.ingest_store import StoredBatch, StoreError
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
 from gateway.stage_timing import StageTimings, shared_timings
@@ -135,7 +135,7 @@ class TimescaleIngestStore:
 
     async def store_records(
         self, station_id: str, epoch: str, records: list[Record]
-    ) -> int:
+    ) -> StoredBatch:
         """Archive, index and advance the watermark. Durable before returning.
 
         Order matters and is the point of the method: the datagrams reach disk
@@ -152,7 +152,7 @@ class TimescaleIngestStore:
             # Everything was a retransmission. Still refresh liveness so a
             # station that is only resending does not look idle.
             await self._touch(station_id, epoch)
-            return watermark
+            return StoredBatch(watermark)
 
         if fresh[0].seq != watermark + 1:
             # §10 promises in-order delivery and §5 makes us authoritative
@@ -172,11 +172,12 @@ class TimescaleIngestStore:
                 },
             )
             await self._archive_and_index(station_id, epoch, fresh, advance_to=None)
-            return watermark
+            return StoredBatch(watermark, fresh)
 
         advanced = fresh[-1].seq
         await self._archive_and_index(station_id, epoch, fresh, advance_to=advanced)
-        return await self._extend_through_gaps(station_id, epoch, advanced)
+        extended = await self._extend_through_gaps(station_id, epoch, advanced)
+        return StoredBatch(extended, fresh)
 
     async def record_gap(self, station_id: str, epoch: str, gap: Gap) -> None:
         """protocol §11. Permanent, and it advances the resume point."""

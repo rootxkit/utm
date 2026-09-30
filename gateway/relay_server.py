@@ -372,19 +372,27 @@ class _Session:
         if not records:
             return
         with timings.measure("store"):
-            self._watermark = await self.server.store.store_records(
+            stored = await self.server.store.store_records(
                 self.station_id, self.epoch, records
             )
-        self.tracker.observe_stored(max(record.recv_utc_ns for record in records))
+        self._watermark = stored.watermark
+        if not stored.stored:
+            # A retransmission, in full. Nothing new to look inside, and
+            # counting it would count the same telemetry twice (S-05).
+            timings.count("retransmitted_batches", 1)
+            return
+        self.tracker.observe_stored(max(record.recv_utc_ns for record in stored.stored))
         # Only now, with the bytes durable and the watermark advanced, does
-        # anything look inside them. Obligation 9.
+        # anything look inside them. Obligation 9. Only the records that were
+        # new: the pipeline republishes what it parses and folds it into link
+        # quality, and a resent batch is not a second flight.
         if self.server.processor is not None:
             with timings.measure("process"):
                 await self.server.processor.process(
-                    self.station_id, self.epoch, records
+                    self.station_id, self.epoch, stored.stored
                 )
         timings.count("batches", 1)
-        timings.count("records", len(records))
+        timings.count("records", len(stored.stored))
         timings.report_if_due()
 
     async def _handle_control(self, payload: str) -> None:
@@ -425,9 +433,9 @@ class _Session:
         # evidence.
         await self.server.store.record_gap(self.station_id, self.epoch, gap)
         self.tracker.observe_gap(gap, now_s=now_s)
-        self._watermark = await self.server.store.store_records(
-            self.station_id, self.epoch, []
-        )
+        self._watermark = (
+            await self.server.store.store_records(self.station_id, self.epoch, [])
+        ).watermark
 
     async def _acknowledge_periodically(self) -> None:
         while True:
