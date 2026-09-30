@@ -4,6 +4,7 @@ import { createContext, useContext } from "react";
 
 const en = {
   console: "operator console",
+  product_name: "UTM",
   aircraft: "Aircraft",
   alerts: "Alerts",
   stations: "Stations",
@@ -97,6 +98,7 @@ type Key = keyof typeof en;
 
 const ka: Partial<Record<Key, string>> = {
   console: "ოპერატორის ცენტრი",
+  product_name: "UTM",
   aircraft: "აპარატები",
   alerts: "გაფრთხილებები",
   stations: "სადგურები",
