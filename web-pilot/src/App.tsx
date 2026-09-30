@@ -5,8 +5,9 @@ import { SignInRequired, apiGet, apiPost } from "./api/client";
 import { AircraftList } from "./components/AircraftList";
 import { AlertsPanel } from "./components/AlertsPanel";
 import { DronePanel } from "./components/DronePanel";
+import { RegistryView } from "./components/RegistryView";
 import { StationsPanel, UnclaimedPanel } from "./components/StationsPanel";
-import { type Me, TopBar } from "./components/TopBar";
+import { type Me, TopBar, type View } from "./components/TopBar";
 import { useFeed } from "./feed";
 import { I18n, type Lang, translator } from "./i18n";
 import { type Base, type Layers, MapView, type Zone } from "./map/MapView";
@@ -56,6 +57,9 @@ function useNow(intervalMs: number): number {
 
 export function App() {
   const [lang, setLang] = useState<Lang>(storedLang);
+  const [view, setView] = useState<View>(() =>
+    location.hash === "#registry" ? "registry" : "map",
+  );
   const t = useMemo(() => translator(lang), [lang]);
   const [me, setMe] = useState<Me | null>(null);
   const [feedUrl, setFeedUrl] = useState<string | null>(null);
@@ -77,6 +81,12 @@ export function App() {
       // Not remembered; the choice still applies to this page.
     }
   }, [lang]);
+
+  // The registry view is linkable (/app/#registry) and survives a reload.
+  useEffect(() => {
+    const target = view === "registry" ? "#registry" : location.pathname + location.search;
+    history.replaceState(null, "", target);
+  }, [view]);
 
   // Signed in? A 401 here goes to /login and comes back.
   useEffect(() => {
@@ -156,81 +166,94 @@ export function App() {
   return (
     <I18n.Provider value={{ lang, t }}>
       <div className={`shell${unacknowledgedCritical ? " critical" : ""}`}>
-        <TopBar me={me} status={status} onLang={setLang} onSignOut={() => void signOut()} />
-        <nav className="sidebar">
-          <div className="tabs" role="tablist">
-            {tabs.map(([id, label, count]) => (
-              <button
-                key={id}
-                type="button"
-                role="tab"
-                aria-selected={tab === id}
-                className={`tab${tab === id ? " active" : ""}${id === "alerts" && count > 0 ? " has-alerts" : ""}`}
-                onClick={() => setTab(id)}
-              >
-                {label} <span className="count">{count}</span>
-              </button>
-            ))}
-          </div>
-          <div className="tab-body">
-            {tab === "aircraft" && (
-              <AircraftList
-                aircraft={state.aircraft}
-                alerts={state.alerts}
-                selected={selected}
-                now={now}
-                onSelect={select}
-              />
-            )}
-            {tab === "alerts" && (
-              <AlertsPanel
-                alerts={state.alerts}
-                aircraft={state.aircraft}
-                acknowledged={activeAcks}
-                canAcknowledge={canAcknowledge}
-                onAcknowledge={acknowledge}
-                onSelect={select}
-              />
-            )}
-            {tab === "stations" && <StationsPanel stations={state.stations} />}
-            {tab === "unclaimed" && <UnclaimedPanel unclaimed={state.unclaimed} />}
-          </div>
-          <fieldset className="layers">
-            <legend>{t("layers")}</legend>
-            {(["zones", "bases", "labels"] as const).map((key) => (
-              <label key={key}>
-                <input
-                  type="checkbox"
-                  checked={layers[key]}
-                  onChange={(event) => setLayers({ ...layers, [key]: event.target.checked })}
-                />{" "}
-                {t(key)}
-              </label>
-            ))}
-            {zonesFailed && <div className="small muted">{t("zones_unavailable")}</div>}
-          </fieldset>
-        </nav>
-        <main className="main">
-          <MapView
-            aircraft={state.aircraft}
-            alerts={state.alerts}
-            zones={zones}
-            bases={bases}
-            layers={layers}
-            selected={selected}
-            onSelect={select}
-          />
-        </main>
-        {selected ? (
-          <DronePanel
-            droneId={selected}
-            aircraft={state.aircraft.get(selected)}
-            alerts={selectedAlerts}
-            now={now}
-            onClose={() => setSelected(null)}
-          />
+        <TopBar
+          me={me}
+          status={status}
+          view={view}
+          onView={setView}
+          onLang={setLang}
+          onSignOut={() => void signOut()}
+        />
+        {view === "registry" ? (
+          <RegistryView isAdmin={me.role === "admin"} now={now} />
         ) : (
-          <aside className="detail muted pad">{t("select_hint")}</aside>
+          <>
+            <nav className="sidebar">
+              <div className="tabs" role="tablist">
+                {tabs.map(([id, label, count]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    role="tab"
+                    aria-selected={tab === id}
+                    className={`tab${tab === id ? " active" : ""}${id === "alerts" && count > 0 ? " has-alerts" : ""}`}
+                    onClick={() => setTab(id)}
+                  >
+                    {label} <span className="count">{count}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="tab-body">
+                {tab === "aircraft" && (
+                  <AircraftList
+                    aircraft={state.aircraft}
+                    alerts={state.alerts}
+                    selected={selected}
+                    now={now}
+                    onSelect={select}
+                  />
+                )}
+                {tab === "alerts" && (
+                  <AlertsPanel
+                    alerts={state.alerts}
+                    aircraft={state.aircraft}
+                    acknowledged={activeAcks}
+                    canAcknowledge={canAcknowledge}
+                    onAcknowledge={acknowledge}
+                    onSelect={select}
+                  />
+                )}
+                {tab === "stations" && <StationsPanel stations={state.stations} />}
+                {tab === "unclaimed" && <UnclaimedPanel unclaimed={state.unclaimed} />}
+              </div>
+              <fieldset className="layers">
+                <legend>{t("layers")}</legend>
+                {(["zones", "bases", "labels"] as const).map((key) => (
+                  <label key={key}>
+                    <input
+                      type="checkbox"
+                      checked={layers[key]}
+                      onChange={(event) => setLayers({ ...layers, [key]: event.target.checked })}
+                    />{" "}
+                    {t(key)}
+                  </label>
+                ))}
+                {zonesFailed && <div className="small muted">{t("zones_unavailable")}</div>}
+              </fieldset>
+            </nav>
+            <main className="main">
+              <MapView
+                aircraft={state.aircraft}
+                alerts={state.alerts}
+                zones={zones}
+                bases={bases}
+                layers={layers}
+                selected={selected}
+                onSelect={select}
+              />
+            </main>
+            {selected ? (
+              <DronePanel
+                droneId={selected}
+                aircraft={state.aircraft.get(selected)}
+                alerts={selectedAlerts}
+                now={now}
+                onClose={() => setSelected(null)}
+              />
+            ) : (
+              <aside className="detail muted pad">{t("select_hint")}</aside>
+            )}
+          </>
         )}
       </div>
     </I18n.Provider>

@@ -25,6 +25,19 @@ export async function apiGet<P extends keyof paths>(path: P, query = ""): Promis
   return (await response.json()) as GetResponse<P>;
 }
 
+// A lookup of exactly one record: null when the API says there is none (404),
+// an error for anything else that is not a success.
+export async function apiLookup<P extends keyof paths>(
+  path: P,
+  query: string,
+): Promise<GetResponse<P> | null> {
+  const response = await fetch(`${String(path)}${query}`, { credentials: "same-origin" });
+  if (response.status === 401) toSignIn();
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`${String(path)}: ${response.status}`);
+  return (await response.json()) as GetResponse<P>;
+}
+
 // State changes carry X-Courier-Request, which a form on another site cannot
 // send (api/auth.py). The API refuses a cookie-authenticated change without it.
 export async function apiPost(path: string, body?: unknown): Promise<Response> {
