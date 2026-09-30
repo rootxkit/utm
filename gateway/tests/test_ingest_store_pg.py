@@ -13,6 +13,7 @@ epoch of the wrong shape. A fake would agree with whatever the code did.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -20,7 +21,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from gateway.archive import RawArchive
+from gateway.archive import RawArchive, SegmentWrite
 from gateway.ingest_store_pg import EMPTY_WATERMARK, TimescaleIngestStore
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
@@ -393,3 +394,35 @@ async def test_a_link_state_change_is_recorded(
 async def test_the_empty_watermark_is_minus_one_not_zero() -> None:
     """0 would claim record zero had arrived."""
     assert EMPTY_WATERMARK == -1
+
+
+# --- the archive write stays off the event loop (S-04) ---------------------
+
+
+class ThreadRecordingArchive(RawArchive):
+    """Notes which thread `append` ran on."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root=root)
+        self.append_threads: list[threading.Thread] = []
+
+    def append(
+        self, station_id: str, epoch: str, records: list[Record]
+    ) -> list[SegmentWrite]:
+        self.append_threads.append(threading.current_thread())
+        return super().append(station_id, epoch, records)
+
+
+async def test_the_archive_append_runs_off_the_event_loop_thread(
+    engine: AsyncEngine, archive_root: Path, station: str
+) -> None:
+    """Compression and fsync block; on the loop they stall every station."""
+    archive = ThreadRecordingArchive(archive_root)
+    store = TimescaleIngestStore(engine=engine, archive=archive)
+
+    await store.store_records(station, EPOCH, records(0, 10))
+
+    assert len(archive.append_threads) == 1
+    assert archive.append_threads[0] is not threading.current_thread()
+    # And it still stored: the thread hop must not lose the write.
+    assert await store.resume_from_seq(station, EPOCH) == 10

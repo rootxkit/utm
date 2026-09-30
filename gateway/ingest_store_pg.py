@@ -45,6 +45,7 @@ than the retention period, which is itself worth an event.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -298,10 +299,13 @@ class TimescaleIngestStore:
         # leaves an unindexed segment, which is recoverable by rescanning the
         # tree. The opposite order leaves an index entry for bytes that do not
         # exist, which is not.
-        # Synchronous: compression and fsync run on the event loop, so this
-        # stage is also time in which no other connection is served.
+        # On a worker thread: compression and `fsync` are blocking, and run on
+        # the event loop they were time in which no other station was served,
+        # so one station's fsync stalled every other station's acks (S-04).
         with self.timings.measure("store.archive"):
-            writes = self.archive.append(station_id, epoch, records)
+            writes = await asyncio.to_thread(
+                self.archive.append, station_id, epoch, records
+            )
         try:
             async with self.engine.begin() as connection:
                 await connection.execute(
