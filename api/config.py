@@ -77,6 +77,18 @@ class ApiSettings(
     login_lockout_s: float = Field(
         default=900.0, gt=0, validation_alias="LOGIN_LOCKOUT_S"
     )
+    # S-15. Sign-in attempts allowed per client address and per username
+    # within the window, before any password is hashed. Beyond them the
+    # API answers 429. Unknown usernames are counted like known ones.
+    login_rate_window_s: float = Field(
+        default=300.0, gt=0, validation_alias="LOGIN_RATE_WINDOW_S"
+    )
+    login_rate_max_per_address: int = Field(
+        default=20, ge=1, validation_alias="LOGIN_RATE_MAX_PER_ADDRESS"
+    )
+    login_rate_max_per_username: int = Field(
+        default=10, ge=1, validation_alias="LOGIN_RATE_MAX_PER_USERNAME"
+    )
     # Secure cookies are sent only over HTTPS. Off only for plain-HTTP
     # development on this machine.
     cookie_secure: bool = Field(default=True, validation_alias="COOKIE_SECURE")

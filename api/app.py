@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from api.assets import STATIC, mount_map_assets
 from api.auth import Operator, Role
 from api.auth_http import AccountStore, Authenticator, auth_router, require
+from api.ratelimit import LoginRateLimiter
 from api.registry import (
     AirframeParams,
     ConflictError,
@@ -192,6 +193,7 @@ def create_api_app(
     console_feed_url: str | None = None,
     console_app_dir: Path | None = None,
     terrain: Terrain | None = None,
+    login_limiter: LoginRateLimiter | None = None,
 ) -> FastAPI:
     """The API. `auth` is required: there is no way to build it open.
 
@@ -208,6 +210,7 @@ def create_api_app(
             feed_secret=feed_secret,
             feed_ticket_ttl_s=feed_ticket_ttl_s,
             cookie_secure=cookie_secure,
+            login_limiter=login_limiter,
         )
     )
 

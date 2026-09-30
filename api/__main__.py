@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from api.app import create_api_app
 from api.auth import OperatorStore
 from api.config import ApiSettings
+from api.ratelimit import LoginRateLimiter
 from api.registry import FleetRegistry
 from api.replay import ReplayStore
 from common import configure_logging, load_settings
@@ -72,6 +73,11 @@ def build_app(settings: ApiSettings) -> FastAPI:
         console_feed_url=settings.console_feed_url,
         console_app_dir=settings.console_app_dir,
         terrain=Terrain(settings.terrain_dir) if settings.terrain_dir else None,
+        login_limiter=LoginRateLimiter(
+            max_per_address=settings.login_rate_max_per_address,
+            max_per_username=settings.login_rate_max_per_username,
+            window_s=settings.login_rate_window_s,
+        ),
     )
 
     @asynccontextmanager
