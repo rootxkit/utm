@@ -164,16 +164,44 @@ class RelayServer:
         # whose generation is no longer current has been superseded by a
         # reconnect and must write nothing about the station's link state.
         self._generations: dict[str, int] = {}
+        self._issued_generations: dict[str, int] = {}
+        self._open_generations: dict[str, set[int]] = {}
 
     @property
     def trackers(self) -> dict[str, StationLinkTracker]:
         """Live link state per station, for whoever publishes to the console."""
         return self._trackers
 
-    def _next_generation(self, station_id: str) -> int:
-        generation = self._generations.get(station_id, 0) + 1
+    def _session_started(self, station_id: str) -> int:
+        """Issue the next generation and make it the station's current one."""
+        generation = self._issued_generations.get(station_id, 0) + 1
+        self._issued_generations[station_id] = generation
+        self._open_generations.setdefault(station_id, set()).add(generation)
         self._generations[station_id] = generation
         return generation
+
+    def _session_ended(self, station_id: str, generation: int) -> None:
+        """Hand the station back to the newest session still open, if any.
+
+        A reconnect that dies at once - a bad hello, a proxy that drops it -
+        would otherwise leave the older, healthy session superseded for
+        ever: mute, reporting nothing, with the console frozen. If nothing
+        else is open the ending session stays current, so its disconnect
+        report goes out.
+        """
+        still_open = self._open_generations.get(station_id, set())
+        still_open.discard(generation)
+        if self._generations.get(station_id) == generation and still_open:
+            successor = max(still_open)
+            self._generations[station_id] = successor
+            _log.info(
+                "station handed back to an older session",
+                extra={
+                    "station_id": station_id,
+                    "ended_generation": generation,
+                    "current_generation": successor,
+                },
+            )
 
     def is_current(self, station_id: str, generation: int) -> bool:
         """Whether a session of this generation still speaks for the station.
@@ -291,7 +319,7 @@ class RelayServer:
             epoch=hello.epoch,
             tracker=tracker,
             log=log,
-            generation=self._next_generation(station_id),
+            generation=self._session_started(station_id),
             resume_from_seq=resume_from_seq,
             newest_seq_held=hello.newest_seq_held,
         )
@@ -406,6 +434,9 @@ class _Session:
             with contextlib.suppress(websockets.WebSocketException):
                 await self.connection.close(_CLOSE_PROTOCOL_ERROR, str(error)[:120])
         finally:
+            # First, so that if an older session is still open it becomes
+            # current before this one decides whether to report a disconnect.
+            self.server._session_ended(self.station_id, self.generation)
             # Each step here runs whatever the previous one did. A task that
             # died with an exception used to re-raise from `await task` and
             # skip the final ack and the disconnect report (S-06).
@@ -443,7 +474,10 @@ class _Session:
             # counting it would count the same telemetry twice (S-05).
             timings.count("retransmitted_batches", 1)
             return
-        self.tracker.observe_stored(max(record.recv_utc_ns for record in stored.stored))
+        if not self.superseded:
+            self.tracker.observe_stored(
+                max(record.recv_utc_ns for record in stored.stored)
+            )
         # Only now, with the bytes durable and the watermark advanced, does
         # anything look inside them. Obligation 9. Only the records that were
         # new: the pipeline republishes what it parses and folds it into link
@@ -462,6 +496,12 @@ class _Session:
         now_s = time.monotonic()
 
         if isinstance(message, Status):
+            if self.superseded:
+                # The tracker is shared and belongs to the current session.
+                # A status from a superseded socket would move its baseline
+                # and could log a loss, or a healthy state, for a link the
+                # station is no longer using.
+                return
             for loss in self.tracker.observe_status(message, now_s=now_s):
                 await self.server.store.record_loss(self.station_id, self.epoch, loss)
             try:
@@ -483,7 +523,8 @@ class _Session:
         if isinstance(message, IgnoredMessage):
             # protocol §14: ignore, do not reject. Counted so that a relay
             # speaking a newer dialect is visible.
-            self.tracker.observe_ignored_message()
+            if not self.superseded:
+                self.tracker.observe_ignored_message()
             return
 
         # A second `hello` on an open connection. §5 sends one per connection.
@@ -524,7 +565,8 @@ class _Session:
         # it: a replay that draws a smooth track through missing data invents
         # evidence.
         await self.server.store.record_gap(self.station_id, self.epoch, gap)
-        self.tracker.observe_gap(gap, now_s=now_s)
+        if not self.superseded:
+            self.tracker.observe_gap(gap, now_s=now_s)
         self._watermark = (
             await self.server.store.store_records(self.station_id, self.epoch, [])
         ).watermark

@@ -1249,3 +1249,77 @@ async def test_the_relay_v1_path_is_served() -> None:
         welcome = await handshake(connection, hello())
 
     assert welcome["type"] == "welcome"
+
+
+# --- the station goes back to an older session when the newer dies (S-06) --
+
+
+async def test_the_station_is_handed_back_when_the_newer_session_dies() -> None:
+    """A reconnect that dies at once must not leave the older, healthy
+    session mute for ever. When the newer session ends and the older one is
+    still open, the older one speaks for the station again."""
+    store = InMemoryIngestStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        old = await connect(url(server), additional_headers=auth())
+        await handshake(old, hello())
+        await old.send(status())
+        await wait_for_state(reporter, LinkState.HEALTHY)
+
+        async with connect(url(server), additional_headers=auth()) as new:
+            await handshake(new, hello())
+            await new.send(status())
+            await wait_for_state(reporter, LinkState.HEALTHY)
+        # The newer session is gone; the older socket is still up.
+        since = len(reporter.reports)
+        await old.send(status())
+        await wait_for_reports(reporter, since + 3)
+
+        after = [state for _, state in reporter.reports[since:]]
+        assert LinkState.UNREACHABLE not in after, (
+            "the newer session's end was reported as the station leaving"
+        )
+        assert LinkState.HEALTHY in after, "the surviving session stayed mute"
+        logged = [state for _, state, _ in store.link_states]
+        assert logged[-1] is LinkState.HEALTHY
+
+        # Presence: when the survivor ends too, the station is unreachable.
+        await old.close()
+        await wait_for_state(reporter, LinkState.UNREACHABLE)
+
+    logged_after = [state for _, state, _ in store.link_states]
+    assert logged_after[-1] is LinkState.UNREACHABLE
+
+
+async def test_a_superseded_session_does_not_feed_the_tracker_or_the_loss_log() -> None:
+    """The tracker is shared. A status on the old socket must not move its
+    baseline or write a loss; the same status on the live socket must."""
+    store = InMemoryIngestStore()
+    reporter = RecordingReporter()
+    async with running(
+        store=store, station_reporter=reporter, station_report_interval_s=0.02
+    ) as server:
+        old = await connect(url(server), additional_headers=auth())
+        await handshake(old, hello())
+        await old.send(status(dropped_intake_total=0))
+        await wait_for_state(reporter, LinkState.HEALTHY)
+
+        async with connect(url(server), additional_headers=auth()) as new:
+            await handshake(new, hello())
+            await new.send(status(dropped_intake_total=0))
+            await wait_for_state(reporter, LinkState.HEALTHY)
+
+            # Absence: a loss reported on the superseded socket is not ours.
+            await old.send(status(dropped_intake_total=40))
+            await asyncio.sleep(0.2)
+            assert store.losses == []
+            assert reporter.reports[-1] == (STATION, LinkState.HEALTHY)
+
+            # Presence: the same delta on the live socket is a loss.
+            await new.send(status(dropped_intake_total=40))
+            await wait_for_state(reporter, LinkState.DATA_LOST)
+            assert [loss.datagram_count for _, _, loss in store.losses] == [40]
+
+        await old.close()
