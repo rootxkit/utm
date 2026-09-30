@@ -82,6 +82,10 @@ class RelayConfig(BaseModel):
     bind_port: int = Field(default=14445, ge=1, le=65535)
     queue_max_bytes: int = Field(default=DEFAULT_QUEUE_MAX_BYTES, gt=0)
     intake_queue_size: int = Field(default=DEFAULT_INTAKE_QUEUE_SIZE, gt=0)
+    # How long the disk writer may go without completing a loop before the
+    # relay reports `storage_ok: false`. A write that hangs in fsync neither
+    # fails nor finishes, so only its duration can reveal it.
+    writer_stall_timeout_s: float = Field(default=5.0, gt=0.0)
 
     # A PEM bundle for a development CA, when the Gateway or the verification
     # sink serves a self-signed certificate. Absent means the system trust

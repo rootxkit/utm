@@ -18,16 +18,23 @@ surfaced as a `gap`.
 
 from __future__ import annotations
 
+import dataclasses
 import secrets
 import sqlite3
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from agent.framing import Record
+from agent.framing import RECORD_HEADER_BYTES, Record
 
-__all__ = ["DEFAULT_QUEUE_MAX_BYTES", "DurableQueue"]
+__all__ = [
+    "DEFAULT_QUEUE_MAX_BYTES",
+    "DurableQueue",
+    "QueuePoisonedError",
+    "QueueStats",
+]
 
 # 1 GiB. At the ~2.8 KiB/s per aircraft measured in ADR-001, three aircraft
 # fill this in roughly a day and a half of continuous disconnection.
@@ -51,6 +58,20 @@ _EPOCH = "epoch"
 _NEXT_SEQ = "next_seq"
 _DROPPED_INTAKE = "dropped_intake_total"
 _DROPPED_CAP = "dropped_cap_total"
+
+
+class QueuePoisonedError(sqlite3.Error):
+    """A rollback failed, so the connection's transaction state is unknown."""
+
+
+@dataclass(frozen=True, slots=True)
+class QueueStats:
+    """The counters `status` reports, as of the last committed change."""
+
+    depth: int
+    total_bytes: int
+    dropped_intake_total: int
+    dropped_cap_total: int
 
 
 class DurableQueue:
@@ -95,6 +116,26 @@ class DurableQueue:
         ).fetchone()
         self._depth: int = row[0]
         self._total_bytes: int = row[1]
+        # Held in memory and written through, rather than read back from the
+        # database. A drop is counted the moment it is reported even when the
+        # disk refuses the write, so a failing disk cannot hide the loss it is
+        # causing; the next commit that succeeds persists the total. Guarded
+        # by `_stats_lock`, not `_lock`, so counting never waits for a write.
+        self._dropped_intake: int = self._get_int(_DROPPED_INTAKE)
+        # The total as last committed, so an ack need not rewrite it unchanged.
+        self._dropped_intake_persisted: int = self._dropped_intake
+
+        self._dropped_cap: int = self._get_int(_DROPPED_CAP)
+
+        # The counters are also published as an immutable snapshot under a
+        # lock of their own, which is never held across a statement. `status`
+        # reads that, so a status message is never queued behind the writer's
+        # fsync (S-03), and never sees a transaction that has not committed.
+        self._stats_lock = threading.Lock()
+        self._stats = QueueStats(0, 0, 0, 0)
+        self._publish_stats()
+        # Set, never cleared, when a rollback fails (see _rollback_locked).
+        self._poisoned = False
 
     # --- metadata ---------------------------------------------------------
 
@@ -139,19 +180,40 @@ class DurableQueue:
 
     # --- state ------------------------------------------------------------
 
+    def _publish_stats(self) -> None:
+        """Snapshot the working counters. Call with `_lock` held."""
+        with self._stats_lock:
+            self._stats = QueueStats(
+                depth=self._depth,
+                total_bytes=self._total_bytes,
+                dropped_intake_total=self._dropped_intake,
+                dropped_cap_total=self._dropped_cap,
+            )
+
+    def _intake_drops_total(self) -> int:
+        with self._stats_lock:
+            return self._dropped_intake
+
+    def stats(self) -> QueueStats:
+        """The latest committed counters. Never waits for a database write."""
+        with self._stats_lock:
+            return self._stats
+
     @property
     def depth(self) -> int:
-        with self._lock:
-            return self._depth
+        return self.stats().depth
 
     @property
     def total_bytes(self) -> int:
-        with self._lock:
-            return self._total_bytes
+        return self.stats().total_bytes
 
     @property
     def next_seq(self) -> int:
         with self._lock:
+            # These three read through the same connection as the failed
+            # transaction, so a poisoned queue could report sequence numbers
+            # that were never committed, and `hello` would claim them.
+            self._check_usable_locked()
             return self._get_int(_NEXT_SEQ)
 
     @property
@@ -163,6 +225,7 @@ class DurableQueue:
         relay-v1 §5 describes.
         """
         with self._lock:
+            self._check_usable_locked()
             row = self._connection.execute("SELECT MIN(seq) FROM records").fetchone()
             if row[0] is None:
                 return self._get_int(_NEXT_SEQ)
@@ -171,6 +234,7 @@ class DurableQueue:
     @property
     def newest_seq_held(self) -> int:
         with self._lock:
+            self._check_usable_locked()
             row = self._connection.execute("SELECT MAX(seq) FROM records").fetchone()
             if row[0] is None:
                 return self._get_int(_NEXT_SEQ) - 1
@@ -178,13 +242,12 @@ class DurableQueue:
 
     @property
     def dropped_intake_total(self) -> int:
-        with self._lock:
-            return self._get_int(_DROPPED_INTAKE)
+        """Intake drops reported so far, including any not yet on disk."""
+        return self.stats().dropped_intake_total
 
     @property
     def dropped_cap_total(self) -> int:
-        with self._lock:
-            return self._get_int(_DROPPED_CAP)
+        return self.stats().dropped_cap_total
 
     # --- mutation ---------------------------------------------------------
 
@@ -193,12 +256,45 @@ class DurableQueue:
 
         These cannot appear as a `gap` — the sequence remains contiguous across
         them — so the count is all the Gateway gets (relay-v1 §11).
+
+        The count is taken in memory before the write is attempted, so
+        `dropped_intake_total` includes it even if this raises. What is written
+        is the absolute total, which makes a later retry, or any later commit,
+        idempotent rather than a second increment.
         """
         if count <= 0:
             return
+        self.count_intake_drops(count)
+        self.persist_intake_drops()
+
+    def count_intake_drops(self, count: int) -> None:
+        """Count intake drops in memory only, without touching the disk.
+
+        Takes only the counters' own lock, never the lock a write holds, so it
+        cannot wait behind a hung fsync: the relay calls it while holding the
+        lock its intake thread needs. The total is reported at once and
+        persisted by the next commit that succeeds.
+        """
+        if count <= 0:
+            return
+        with self._stats_lock:
+            self._dropped_intake += count
+            self._stats = dataclasses.replace(
+                self._stats, dropped_intake_total=self._dropped_intake
+            )
+
+    def persist_intake_drops(self) -> None:
+        """Write the intake drop total. Raises if the disk refuses it."""
         with self._lock:
-            self._set_int(_DROPPED_INTAKE, self._get_int(_DROPPED_INTAKE) + count)
-            self._connection.commit()
+            self._check_usable_locked()
+            total = self._intake_drops_total()
+            try:
+                self._set_int(_DROPPED_INTAKE, total)
+                self._connection.commit()
+            except sqlite3.Error:
+                self._rollback_locked()
+                raise
+            self._dropped_intake_persisted = total
 
     def append(self, datagrams: Sequence[tuple[int, bytes]]) -> list[Record]:
         """Assign sequence numbers to (recv_utc_ns, datagram) pairs and store them.
@@ -206,28 +302,80 @@ class DurableQueue:
         Returns the stored records. Enforces the size cap afterwards, dropping
         oldest first; intake is never blocked, because blocking would discard
         live telemetry to preserve old telemetry.
+
+        All or nothing: if the write fails the transaction is rolled back, the
+        in-memory accounting is restored and the error propagates, so the same
+        datagrams can be offered again and receive the same sequence numbers.
         """
         if not datagrams:
             return []
 
         with self._lock:
-            seq = self._get_int(_NEXT_SEQ)
-            records = [
-                Record(seq=seq + offset, recv_utc_ns=recv_utc_ns, datagram=datagram)
-                for offset, (recv_utc_ns, datagram) in enumerate(datagrams)
-            ]
-            self._connection.executemany(
-                "INSERT INTO records (seq, recv_utc_ns, datagram, nbytes) "
-                "VALUES (?, ?, ?, ?)",
-                [(r.seq, r.recv_utc_ns, r.datagram, r.encoded_size) for r in records],
+            self._check_usable_locked()
+            depth, total_bytes, dropped_cap = (
+                self._depth,
+                self._total_bytes,
+                self._dropped_cap,
             )
-            self._set_int(_NEXT_SEQ, seq + len(records))
-            self._depth += len(records)
-            self._total_bytes += sum(r.encoded_size for r in records)
-            self._enforce_cap_locked()
-            self._connection.commit()
+            try:
+                seq = self._get_int(_NEXT_SEQ)
+                records = [
+                    Record(seq=seq + offset, recv_utc_ns=recv_utc_ns, datagram=datagram)
+                    for offset, (recv_utc_ns, datagram) in enumerate(datagrams)
+                ]
+                self._connection.executemany(
+                    "INSERT INTO records (seq, recv_utc_ns, datagram, nbytes) "
+                    "VALUES (?, ?, ?, ?)",
+                    [
+                        (r.seq, r.recv_utc_ns, r.datagram, r.encoded_size)
+                        for r in records
+                    ],
+                )
+                self._set_int(_NEXT_SEQ, seq + len(records))
+                # Carries any intake drops whose own write failed.
+                drops_total = self._intake_drops_total()
+                self._set_int(_DROPPED_INTAKE, drops_total)
+                self._depth += len(records)
+                self._total_bytes += sum(r.encoded_size for r in records)
+                self._enforce_cap_locked()
+                self._connection.commit()
+            except sqlite3.Error:
+                self._depth, self._total_bytes = depth, total_bytes
+                self._dropped_cap = dropped_cap
+                self._rollback_locked()
+                raise
+            self._dropped_intake_persisted = drops_total
+            self._publish_stats()
 
         return records
+
+    def _rollback_locked(self) -> None:
+        """Discard a failed transaction, or poison the connection trying.
+
+        A failed commit can leave the transaction open, and the next statement
+        would silently join it. If the rollback fails too, the transaction's
+        fate is unknown: a later commit on this connection could make the
+        failed batch durable after all, beside its retry under different
+        sequence numbers. So the connection refuses all further use.
+        """
+        try:
+            self._connection.rollback()
+        except sqlite3.Error:
+            with self._stats_lock:
+                self._poisoned = True
+
+    def _check_usable_locked(self) -> None:
+        if self.poisoned:
+            raise QueuePoisonedError(
+                "a rollback failed; the durable queue refuses further use "
+                "until the relay is restarted"
+            )
+
+    @property
+    def poisoned(self) -> bool:
+        """True once a rollback has failed. Restarting the relay clears it."""
+        with self._stats_lock:
+            return self._poisoned
 
     def _enforce_cap_locked(self) -> None:
         if self._total_bytes <= self._max_bytes:
@@ -246,7 +394,8 @@ class DurableQueue:
             dropped += 1
 
         if dropped:
-            self._set_int(_DROPPED_CAP, self._get_int(_DROPPED_CAP) + dropped)
+            self._dropped_cap += dropped
+            self._set_int(_DROPPED_CAP, self._dropped_cap)
 
     def read_from(self, seq: int, *, max_bytes: int) -> list[Record]:
         """Return stored records from `seq` onward, up to a byte budget.
@@ -254,24 +403,41 @@ class DurableQueue:
         At least one record is returned when any exists at or after `seq`, even
         if it alone exceeds the budget — otherwise an oversized record would
         wedge the queue permanently.
-        """
-        with self._lock:
-            rows = self._connection.execute(
-                "SELECT seq, recv_utc_ns, datagram, nbytes FROM records "
-                "WHERE seq >= ? ORDER BY seq",
-                (seq,),
-            ).fetchall()
 
+        Only the rows the budget can hold are read. Every record costs at least
+        `RECORD_HEADER_BYTES`, so no batch can hold more rows than the LIMIT
+        below, and the cursor is stepped one row at a time and abandoned as
+        soon as the budget is spent. Reading the whole backlog here, under the
+        lock the writer needs, made draining a large backlog quadratic and
+        stalled intake while it ran.
+        """
+        row_limit = max(max_bytes // RECORD_HEADER_BYTES, 0) + 1
         records: list[Record] = []
         budget = 0
-        for row in rows:
-            size = int(row[3])
-            if records and budget + size > max_bytes:
-                break
-            records.append(
-                Record(seq=int(row[0]), recv_utc_ns=int(row[1]), datagram=bytes(row[2]))
+        with self._lock:
+            # A poisoned connection may still see the failed batch in its
+            # open transaction, and those records must never be sent.
+            self._check_usable_locked()
+            cursor = self._connection.execute(
+                "SELECT seq, recv_utc_ns, datagram, nbytes FROM records "
+                "WHERE seq >= ? ORDER BY seq LIMIT ?",
+                (seq, row_limit),
             )
-            budget += size
+            try:
+                for row in cursor:
+                    size = int(row[3])
+                    if records and budget + size > max_bytes:
+                        break
+                    records.append(
+                        Record(
+                            seq=int(row[0]),
+                            recv_utc_ns=int(row[1]),
+                            datagram=bytes(row[2]),
+                        )
+                    )
+                    budget += size
+            finally:
+                cursor.close()
         return records
 
     def acknowledge(self, seq: int) -> int:
@@ -281,22 +447,75 @@ class DurableQueue:
         already passed is harmless and deletes nothing.
         """
         with self._lock:
-            rows = self._connection.execute(
-                "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM records WHERE seq <= ?",
-                (seq,),
-            ).fetchone()
-            count, freed = int(rows[0]), int(rows[1])
-            if count:
-                self._connection.execute("DELETE FROM records WHERE seq <= ?", (seq,))
-                self._depth -= count
-                self._total_bytes -= freed
-            self._connection.commit()
+            self._check_usable_locked()
+            try:
+                rows = self._connection.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM records "
+                    "WHERE seq <= ?",
+                    (seq,),
+                ).fetchone()
+                count, freed = int(rows[0]), int(rows[1])
+                if count:
+                    self._connection.execute(
+                        "DELETE FROM records WHERE seq <= ?", (seq,)
+                    )
+                # Carries any intake drops whose own write failed; on a link
+                # with no new telemetry, acks are the only commits there are.
+                # Only when it changed: under synchronous=FULL every commit is
+                # an fsync, and acks arrive several times a second.
+                drops_total = self._intake_drops_total()
+                drops_changed = drops_total != self._dropped_intake_persisted
+                if drops_changed:
+                    self._set_int(_DROPPED_INTAKE, drops_total)
+                if count or drops_changed:
+                    self._connection.commit()
+            except sqlite3.Error:
+                self._rollback_locked()
+                raise
+            if drops_changed:
+                self._dropped_intake_persisted = drops_total
+            # Only once the delete is durable, or the cap would be enforced
+            # against records that are still on disk.
+            self._depth -= count
+            self._total_bytes -= freed
+            self._publish_stats()
         return count
 
-    def close(self) -> None:
-        with self._lock:
-            self._connection.commit()
+    def close(self, *, timeout_s: float | None = None) -> bool:
+        """Close, writing any intake drops counted while the disk refused them.
+
+        Best effort: if the disk still refuses, the count is lost with the
+        process, which the Gateway sees as a restart (relay-v1 §11 loss #4).
+
+        With `timeout_s`, gives up if the lock cannot be had in that time -
+        a write hung in fsync holds it indefinitely - and returns False with
+        the connection left as it is; the caller decides what to report.
+        Returns True once closed.
+        """
+        acquired = (
+            self._lock.acquire()
+            if timeout_s is None
+            else self._lock.acquire(timeout=timeout_s)
+        )
+        if not acquired:
+            return False
+        try:
+            if not self.poisoned:
+                try:
+                    self._set_int(_DROPPED_INTAKE, self._intake_drops_total())
+                    self._connection.commit()
+                except sqlite3.Error:
+                    self._rollback_locked()
+            # Closing discards whatever a poisoned connection still had open.
             self._connection.close()
+        finally:
+            self._lock.release()
+        return True
+
+    @property
+    def unpersisted_intake_drops(self) -> int:
+        """Intake drops counted in memory but not yet written to disk."""
+        return self._intake_drops_total() - self._dropped_intake_persisted
 
     def __enter__(self) -> DurableQueue:
         return self

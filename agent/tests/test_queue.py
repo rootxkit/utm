@@ -7,12 +7,17 @@ this package.
 
 from __future__ import annotations
 
+import sqlite3
+import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent.framing import RECORD_HEADER_BYTES
-from agent.queue import DurableQueue
+from agent.queue import DurableQueue, QueuePoisonedError
 
 
 @pytest.fixture
@@ -267,6 +272,105 @@ def test_read_from_past_the_end_is_empty(queue_path: Path) -> None:
         assert queue.read_from(99, max_bytes=1 << 20) == []
 
 
+class _CountingCursor:
+    """Counts the rows SQLite actually hands back, however they are fetched."""
+
+    def __init__(self, cursor: sqlite3.Cursor, owner: _CountingConnection) -> None:
+        self._cursor = cursor
+        self._owner = owner
+
+    def __iter__(self) -> Iterator[Any]:
+        for row in self._cursor:
+            self._owner.rows_fetched += 1
+            yield row
+
+    def fetchone(self) -> Any:
+        row = self._cursor.fetchone()
+        if row is not None:
+            self._owner.rows_fetched += 1
+        return row
+
+    def fetchall(self) -> list[Any]:
+        rows = self._cursor.fetchall()
+        self._owner.rows_fetched += len(rows)
+        return rows
+
+    def close(self) -> None:
+        self._cursor.close()
+
+
+class _CountingConnection:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self.rows_fetched = 0
+
+    def execute(self, sql: str, parameters: Any = ()) -> _CountingCursor:
+        return _CountingCursor(self._connection.execute(sql, parameters), self)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def _count_rows(queue: DurableQueue) -> _CountingConnection:
+    counting = _CountingConnection(queue._connection)
+    queue._connection = counting  # type: ignore[assignment]
+    return counting
+
+
+def test_read_from_a_large_backlog_fetches_only_what_the_budget_holds(
+    queue_path: Path,
+) -> None:
+    """S-01. The whole backlog used to be fetched to return ten records."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(20_000, size=32))
+        counting = _count_rows(queue)
+
+        batch = queue.read_from(0, max_bytes=(RECORD_HEADER_BYTES + 32) * 10)
+
+    assert len(batch) == 10
+    # Ten that fit, plus at most the one that proved the budget was spent.
+    assert counting.rows_fetched <= 11
+
+
+def test_an_oversized_first_record_is_read_without_the_backlog_behind_it(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append([(1, b"x" * 4096)])
+        queue.append(datagrams(5_000, size=32))
+        counting = _count_rows(queue)
+
+        batch = queue.read_from(0, max_bytes=1)
+
+    assert [r.seq for r in batch] == [0]
+    assert counting.rows_fetched <= 2
+
+
+def test_draining_a_backlog_fetches_each_record_about_once(
+    queue_path: Path,
+) -> None:
+    """Draining N records must cost O(N) rows, not O(N^2)."""
+    count = 5_000
+    budget = (RECORD_HEADER_BYTES + 32) * 50
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(count, size=32))
+        counting = _count_rows(queue)
+
+        drained = 0
+        next_seq = 0
+        batches = 0
+        while batch := queue.read_from(next_seq, max_bytes=budget):
+            drained += len(batch)
+            next_seq = batch[-1].seq + 1
+            batches += 1
+            queue.acknowledge(batch[-1].seq)
+
+    assert drained == count
+    # Each batch reads its own rows plus one look-ahead, and each ack reads one
+    # aggregate row. The old full read fetched about count**2 / 100 rows here.
+    assert counting.rows_fetched <= count + 2 * batches
+
+
 def test_datagrams_are_returned_byte_identical(queue_path: Path) -> None:
     payload = bytes(range(256)) * 4
     with DurableQueue(queue_path) as queue:
@@ -310,3 +414,369 @@ def test_the_two_drop_counters_are_independent(queue_path: Path) -> None:
 
         assert queue.dropped_intake_total == 7
         assert queue.dropped_cap_total == 3
+
+
+# --- storage failures (S-02) ------------------------------------------------
+
+
+def fill_disk(queue: DurableQueue) -> None:
+    """Make SQLite refuse to grow, which it reports as a genuine SQLITE_FULL."""
+    pages = queue._connection.execute("PRAGMA page_count").fetchone()[0]
+    queue._connection.execute(f"PRAGMA max_page_count = {pages}")
+
+
+def free_disk(queue: DurableQueue) -> None:
+    queue._connection.execute("PRAGMA max_page_count = 1073741823")
+
+
+class _FailingCommits:
+    """A connection whose commit fails, as an fsync on a dying disk would."""
+
+    def __init__(
+        self, connection: sqlite3.Connection, *, fail_rollback: bool = False
+    ) -> None:
+        self._connection = connection
+        self.failing = True
+        self.fail_rollback = fail_rollback
+
+    def commit(self) -> None:
+        if self.failing:
+            raise sqlite3.OperationalError("disk I/O error")
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        if self.fail_rollback:
+            raise sqlite3.OperationalError("disk I/O error during rollback")
+        self._connection.rollback()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def test_a_failed_append_raises_and_leaves_the_accounting_untouched(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        depth, total_bytes, next_seq = queue.depth, queue.total_bytes, queue.next_seq
+        fill_disk(queue)
+
+        with pytest.raises(sqlite3.OperationalError, match="full"):
+            queue.append(datagrams(50, size=3000))
+
+        assert (queue.depth, queue.total_bytes, queue.next_seq) == (
+            depth,
+            total_bytes,
+            next_seq,
+        )
+        assert [r.seq for r in queue.read_from(0, max_bytes=1 << 20)] == list(range(5))
+
+
+def test_a_failed_append_can_be_retried_with_the_same_sequence_numbers(
+    queue_path: Path,
+) -> None:
+    """The writer holds a failed batch and offers it again (S-02)."""
+    batch = datagrams(50, size=3000)
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        fill_disk(queue)
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(batch)
+
+        free_disk(queue)
+        records = queue.append(batch)
+
+        assert [r.seq for r in records] == list(range(5, 55))
+        assert queue.depth == 55
+        assert queue.total_bytes == sum(
+            r.encoded_size for r in queue.read_from(0, max_bytes=1 << 30)
+        )
+
+
+def test_a_failed_acknowledge_keeps_the_records_and_their_accounting(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(10))
+        total_bytes = queue.total_bytes
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.acknowledge(4)
+
+        assert (queue.depth, queue.total_bytes) == (10, total_bytes)
+        failing.failing = False
+        assert queue.read_from(0, max_bytes=1 << 20)[0].seq == 0
+
+
+def test_intake_drops_are_counted_even_when_the_disk_refuses_them(
+    queue_path: Path,
+) -> None:
+    """A failing disk must not hide the loss it causes (S-02)."""
+    with DurableQueue(queue_path) as queue:
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.record_intake_drops(4)
+        queue.count_intake_drops(3)
+
+        assert queue.dropped_intake_total == 7
+
+        # The next commit that succeeds persists the total, once.
+        failing.failing = False
+        queue.append(datagrams(1))
+        assert queue.dropped_intake_total == 7
+
+    with DurableQueue(queue_path) as reopened:
+        assert reopened.dropped_intake_total == 7
+
+
+def test_an_append_whose_commit_fails_is_rolled_back_and_retryable(
+    queue_path: Path,
+) -> None:
+    """The insert succeeded, the fsync did not: nothing may count as stored."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        total_bytes = queue.total_bytes
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+
+        assert (queue.depth, queue.total_bytes) == (5, total_bytes)
+        failing.failing = False
+        assert [r.seq for r in queue.append(datagrams(3))] == [5, 6, 7]
+
+    with DurableQueue(queue_path) as reopened:
+        assert reopened.depth == 8
+        assert [r.seq for r in reopened.read_from(0, max_bytes=1 << 20)] == list(
+            range(8)
+        )
+
+
+def test_a_failed_append_that_evicted_for_the_cap_restores_the_cap_count(
+    queue_path: Path,
+) -> None:
+    """The eviction rolls back with the insert, so its count must too."""
+    record_size = RECORD_HEADER_BYTES + 32
+    with DurableQueue(queue_path, max_bytes=record_size * 4) as queue:
+        queue.append(datagrams(4))
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+
+        # Two more would evict the two oldest, but the commit fails.
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(2))
+
+        assert queue.dropped_cap_total == 0
+        assert queue.depth == 4
+        assert [r.seq for r in queue.read_from(0, max_bytes=1 << 20)] == [0, 1, 2, 3]
+
+        # The next append evicts one record, and only that one is counted.
+        failing.failing = False
+        assert [r.seq for r in queue.append(datagrams(1))] == [4]
+        assert queue.dropped_cap_total == 1
+        assert queue.depth == 4
+        assert [r.seq for r in queue.read_from(0, max_bytes=1 << 20)] == [1, 2, 3, 4]
+
+    with DurableQueue(queue_path, max_bytes=record_size * 4) as reopened:
+        assert reopened.dropped_cap_total == 1
+
+
+def test_a_failed_rollback_poisons_the_queue_against_any_further_use(
+    queue_path: Path,
+) -> None:
+    """Otherwise a later commit could make the failed batch durable after all,
+    beside its retry under different sequence numbers."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        failing = _FailingCommits(queue._connection, fail_rollback=True)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+        assert queue.poisoned
+
+        # The disk recovering does not make the connection trustworthy again.
+        failing.failing = False
+        failing.fail_rollback = False
+        with pytest.raises(QueuePoisonedError):
+            queue.append(datagrams(3))
+        with pytest.raises(QueuePoisonedError):
+            queue.read_from(0, max_bytes=1 << 20)
+        with pytest.raises(QueuePoisonedError):
+            queue.acknowledge(4)
+        with pytest.raises(QueuePoisonedError):
+            queue.record_intake_drops(2)
+        # Still counted, and still reported.
+        assert queue.dropped_intake_total == 2
+
+    # Closing discarded the open transaction; only what committed survives.
+    with DurableQueue(queue_path) as reopened:
+        assert not reopened.poisoned
+        assert reopened.depth == 5
+        assert [r.seq for r in reopened.append(datagrams(1))] == [5]
+
+
+def test_a_queue_whose_rollbacks_succeed_is_never_poisoned(queue_path: Path) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+        failing.failing = False
+
+        assert not queue.poisoned
+        assert [r.seq for r in queue.append(datagrams(1))] == [5]
+
+
+def _persisted_intake_drops(queue_path: Path) -> int:
+    """Read the counter from disk through a second connection."""
+    connection = sqlite3.connect(queue_path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'dropped_intake_total'"
+        ).fetchone()
+        return int(row[0])
+    finally:
+        connection.close()
+
+
+def test_an_acknowledgement_persists_intake_drops_the_disk_refused(
+    queue_path: Path,
+) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(3))
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            queue.record_intake_drops(6)
+        assert _persisted_intake_drops(queue_path) == 0
+
+        failing.failing = False
+        queue.acknowledge(0)
+
+        assert _persisted_intake_drops(queue_path) == 6
+
+
+def test_closing_persists_intake_drops_the_disk_refused(queue_path: Path) -> None:
+    queue = DurableQueue(queue_path)
+    failing = _FailingCommits(queue._connection)
+    queue._connection = failing  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError):
+        queue.record_intake_drops(4)
+    queue.count_intake_drops(1)
+
+    failing.failing = False
+    queue.close()
+
+    assert _persisted_intake_drops(queue_path) == 5
+    with DurableQueue(queue_path) as reopened:
+        assert reopened.dropped_intake_total == 5
+
+
+def test_closing_while_the_disk_still_refuses_does_not_raise(
+    queue_path: Path,
+) -> None:
+    queue = DurableQueue(queue_path)
+    queue._connection = _FailingCommits(queue._connection)  # type: ignore[assignment]
+    queue.count_intake_drops(2)
+
+    queue.close()
+
+    assert _persisted_intake_drops(queue_path) == 0
+
+
+def test_a_poisoned_queue_will_not_report_sequence_numbers(queue_path: Path) -> None:
+    """They are read through the connection that may still hold the failed
+    batch, so they could name records that were never committed."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        # Healthy: the branch that answers.
+        assert (queue.next_seq, queue.oldest_seq_held, queue.newest_seq_held) == (
+            5,
+            0,
+            4,
+        )
+        queue._connection = _FailingCommits(  # type: ignore[assignment]
+            queue._connection, fail_rollback=True
+        )
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+
+        with pytest.raises(QueuePoisonedError):
+            _ = queue.next_seq
+        with pytest.raises(QueuePoisonedError):
+            _ = queue.oldest_seq_held
+        with pytest.raises(QueuePoisonedError):
+            _ = queue.newest_seq_held
+
+
+def _statements(queue: DurableQueue) -> list[str]:
+    traced: list[str] = []
+    queue._connection.set_trace_callback(traced.append)
+    return traced
+
+
+def test_an_ack_does_not_rewrite_an_unchanged_drop_count(queue_path: Path) -> None:
+    """Every commit is an fsync under synchronous=FULL; acks are frequent."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        traced = _statements(queue)
+
+        queue.acknowledge(1)
+        queue.acknowledge(1)  # nothing left to delete either
+        queue._connection.set_trace_callback(None)
+
+    updates = [s for s in traced if s.startswith("UPDATE meta")]
+    commits = [s for s in traced if s.strip().upper() == "COMMIT"]
+    assert updates == []
+    # One for the ack that deleted; none for the one that changed nothing.
+    assert len(commits) == 1, traced
+
+
+def test_an_ack_writes_a_drop_count_that_changed(queue_path: Path) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        queue.count_intake_drops(3)
+        traced = _statements(queue)
+
+        queue.acknowledge(1)
+        queue.acknowledge(2)
+        queue._connection.set_trace_callback(None)
+
+    updates = [s for s in traced if s.startswith("UPDATE meta")]
+    assert len(updates) == 1, traced
+    assert _persisted_intake_drops(queue_path) == 3
+
+
+def test_close_gives_up_on_a_write_that_never_finishes(queue_path: Path) -> None:
+    """A hung fsync holds the lock; shutdown must not wait for it forever."""
+    queue = DurableQueue(queue_path)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hung_write() -> None:
+        with queue._lock:
+            held.set()
+            release.wait(10.0)
+
+    writer = threading.Thread(target=hung_write)
+    writer.start()
+    held.wait()
+    try:
+        started = time.monotonic()
+        closed = queue.close(timeout_s=0.2)
+        waited_s = time.monotonic() - started
+    finally:
+        release.set()
+        writer.join()
+
+    assert closed is False
+    assert waited_s < 2.0
+    # The pair: once the write finishes, closing works.
+    assert queue.close(timeout_s=0.2) is True

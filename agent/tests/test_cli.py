@@ -8,13 +8,19 @@ on a laptop at a flying site, not at a debugger.
 from __future__ import annotations
 
 import json
+import socket
+import sqlite3
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent.__main__ import main
+from agent.queue import DurableQueue
 from agent.udp import ReceiveOnlyUDPSocket
-from tests.ports import free_udp_port
+from tests.ports import free_tcp_port, free_udp_port
 
 _VALID_TEMPLATE = """
 station_id = "cli-test"
@@ -183,3 +189,164 @@ def test_a_second_relay_refuses_to_start_on_a_held_port(
     reason = str(capture(capsys)[-1]["reason"])
     assert str(port) in reason
     assert "another process" in reason.lower()
+
+
+def test_a_dead_writer_thread_ends_the_process_with_a_failure_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """S-02. Without a writer nothing reaches disk; the relay must not run on.
+
+    Driven through the real asyncio.run and the real uplink, pointed at a
+    loopback port nothing listens on, so the only thing that can end the run
+    is the relay noticing its writer has gone.
+    """
+
+    def broken_writer(self: object) -> None:
+        raise RuntimeError("a bug outside the storage error handling")
+
+    monkeypatch.setattr("agent.relay.Relay._writer_loop", broken_writer)
+
+    station = tmp_path / "station"
+    station.mkdir()
+    config = valid_config().replace(
+        "wss://gateway.example.org/relay/v1",
+        f"ws://127.0.0.1:{free_tcp_port()}/relay/v1",
+    )
+    (station / "relay.toml").write_text(config, encoding="utf-8")
+    (station / "relay.token").write_text("a-real-token", encoding="utf-8")
+
+    code = main(["--config", str(station / "relay.toml")])
+
+    logs = capture(capsys)
+    assert code == 1
+    assert any(line.get("message") == "relay cannot continue" for line in logs), logs
+    assert any(line.get("message") == "durable queue writer crashed" for line in logs)
+
+
+class _PoisoningConnection:
+    """Commits and rollbacks both fail, so the queue's first write poisons it."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def rollback(self) -> None:
+        raise sqlite3.OperationalError("disk I/O error during rollback")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def test_a_poisoned_queue_ends_the_process_with_a_failure_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only a restart cures a poisoned queue, so the relay must not stay up.
+
+    Driven through the real main(): real intake, a real writer and a real
+    uplink pointed at a loopback port nothing listens on.
+    """
+
+    def poisoning_queue(path: Path, **kwargs: Any) -> DurableQueue:
+        queue = DurableQueue(path, **kwargs)
+        queue._connection = _PoisoningConnection(queue._connection)  # type: ignore[assignment]
+        return queue
+
+    monkeypatch.setattr("agent.__main__.DurableQueue", poisoning_queue)
+
+    udp_port = free_udp_port()
+    station = tmp_path / "station"
+    station.mkdir()
+    config = valid_config(udp_port).replace(
+        "wss://gateway.example.org/relay/v1",
+        f"ws://127.0.0.1:{free_tcp_port()}/relay/v1",
+    )
+    (station / "relay.toml").write_text(config, encoding="utf-8")
+    (station / "relay.token").write_text("a-real-token", encoding="utf-8")
+
+    # Traffic, so the writer has something to write and poisons the queue.
+    sending = threading.Event()
+
+    def send() -> None:
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            while not sending.is_set():
+                sender.sendto(b"x" * 32, ("127.0.0.1", udp_port))
+                time.sleep(0.05)
+        finally:
+            sender.close()
+
+    sender_thread = threading.Thread(target=send, daemon=True)
+    sender_thread.start()
+    try:
+        code = main(["--config", str(station / "relay.toml")])
+    finally:
+        sending.set()
+        sender_thread.join()
+
+    logs = capture(capsys)
+    assert code == 1, logs
+    assert any(line.get("message") == "relay cannot continue" for line in logs)
+    assert any(
+        line.get("message") == "durable queue is poisoned; the relay must restart"
+        for line in logs
+    )
+
+
+def test_shutdown_does_not_wait_forever_for_a_hung_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ctrl-C during a write stuck in fsync must still end the process."""
+    queues: list[DurableQueue] = []
+
+    def capturing_queue(path: Path, **kwargs: Any) -> DurableQueue:
+        queue = DurableQueue(path, **kwargs)
+        queues.append(queue)
+        return queue
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def hung_write() -> None:
+        with queues[0]._lock:
+            held.set()
+            release.wait(30.0)
+
+    writer = threading.Thread(target=hung_write, daemon=True)
+
+    def interrupted_run(coro: object) -> None:
+        getattr(coro, "close", lambda: None)()
+        writer.start()
+        held.wait()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("agent.__main__.DurableQueue", capturing_queue)
+    monkeypatch.setattr("agent.__main__.asyncio.run", interrupted_run)
+    monkeypatch.setattr("agent.__main__.QUEUE_CLOSE_TIMEOUT_S", 0.2)
+
+    station = tmp_path / "station"
+    station.mkdir()
+    (station / "relay.toml").write_text(valid_config(), encoding="utf-8")
+    (station / "relay.token").write_text("a-real-token", encoding="utf-8")
+
+    try:
+        started = time.monotonic()
+        code = main(["--config", str(station / "relay.toml")])
+        elapsed_s = time.monotonic() - started
+    finally:
+        release.set()
+        writer.join()
+        queues[0].close()
+
+    logs = capture(capsys)
+    abandoned = [
+        line
+        for line in logs
+        if line.get("message") == "durable queue still busy at shutdown; abandoning it"
+    ]
+    assert code == 1
+    assert elapsed_s < 5.0
+    assert len(abandoned) == 1, logs
+    assert abandoned[0]["held_datagrams"] == 0
+    assert abandoned[0]["unpersisted_intake_drops"] == 0
