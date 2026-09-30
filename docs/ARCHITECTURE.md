@@ -42,39 +42,79 @@ Shared infrastructure: PostgreSQL+PostGIS (registry, zones, audit), TimescaleDB
 
 ## 2. Data sources
 
-Every position the system shows comes from one of three sources, and every
-aircraft is checked against a fourth. They differ in how far they can be
-trusted, and the console never presents them as equivalent.
+Every position the system shows comes from one of the position sources
+below, and every aircraft is checked against the registry. They differ in
+how far they can be trusted, and the console never presents them as
+equivalent.
+
+**Remote ID is the primary source; the operator relay is an optional
+feature.** A deployment can run with the relay switched off entirely and lose
+nothing the regulator depends on. The EU
+model (2019/947, 2021/664) identifies every drone by Remote ID: direct
+broadcast, received on the ground, and network Remote ID, supplied through
+USSPs. That covers every manufacturer and needs nothing from the operator.
+The MAVLink relay needs an ArduPilot or PX4 aircraft and an operator who
+installs it, so it can never be how a regulator finds a drone that does not
+want to be found. It stays because it is the richest feed for cooperative
+operators (4 Hz position plus battery, mode, arming and GPS quality, which
+conformance monitoring and incident investigation use), because it is in
+effect a network-identification feed while Georgia has no USSP, and because
+it is how SITL aircraft enter the system for every end-to-end test.
 
 | Source | What it carries | Trust | Tasks |
 |---|---|---|---|
+| Direct Remote ID | ASTM F3411 / ASD-STAN EN 4709-002 broadcasts, decoded to Open Drone ID JSON by a receiver adapter | The receiver is authenticated (HMAC-signed datagrams); the broadcast itself is not, and is always marked unverified | P1-15, M-01, U-02 |
+| Network Remote ID | ASTM F3411 network identification served by USSPs or an operator's app | Authenticated per provider; the content is as trustworthy as the provider | U-02 |
 | Operator relays | The full MAVLink stream of an operator's aircraft, forwarded by QGC to a relay on the ground station and on to the Gateway | Authenticated per station (bearer token), and each `(station, SYSID)` checked against `source_bindings` | P1-01, P1-02, P1-07 |
-| Remote ID receivers | ASTM F3411 / ASD-STAN EN 4709-002 broadcasts, decoded to Open Drone ID JSON by a receiver adapter | The receiver is authenticated (HMAC-signed datagrams); the broadcast itself is not, and is always marked unverified | P1-15, M-01, S-10 |
-| ADS-B | Manned aircraft positions from a receiver or a licensed aggregator feed | Unauthenticated broadcast | P1-16, M-08 |
-| Registry | Operators, drones and serial numbers: our own records now, the authority's register later | Authoritative for identity, never for position | P2-05, P2-08, M-03 |
+| ADS-B / ADS-L | Manned aircraft positions from a receiver or a licensed aggregator feed | Unauthenticated broadcast | U-07 |
+| Non-cooperative sensors | Detections from RF or radar sensors operated by security agencies | As trustworthy as the sensor; carries no identity | U-14 |
+| Registry | Operators, drones and serial numbers: our own records now, the authority's register later | Authoritative for identity, never for position | P2-05, U-01 |
+
+### 2.1 Source isolation and control
+
+Each source is its own adapter process (its own container in production:
+`gateway` for relays, `remote-id` for receivers, and one per source added
+later). No adapter imports another, and the only thing they share is the
+internal track format they publish on NATS. So one can be stopped,
+redeployed or broken without touching the others.
+
+Each source can also be switched off without a deploy, at two levels (U-15):
+
+- **By type**: all operator relays, all Remote ID receivers, all network
+  Remote ID providers, all ADS-B feeds.
+- **By instance**: one station, one receiver, one provider, one feed.
+
+A disabled source is refused at the adapter (connections declined,
+datagrams dropped and counted), its tracks age out of the picture as
+*source disabled* rather than silently disappearing, and the airspace monitor
+stops judging them. Every switch is an audited `events` row with the actor
+and a reason, and the console shows each source's state (enabled, disabled,
+healthy, stale). An instance disabled by the authority is different from one
+that is merely silent, and the console says which.
 
 **Operator relays** are the richest source and the only one with a flight
 record complete enough for incident investigation: the relay forwards every
 datagram, unparsed and unfiltered, and buffers through internet outages (§3,
 `docs/protocols/relay-v1.md`).
 
-**Remote ID** reaches drones whose operators have no relay: anything that
-broadcasts. A broadcast can be spoofed, so a Remote ID track is shown as
-broadcast and unverified wherever it appears. A broadcast whose serial matches
-a registered aircraft is one track with that aircraft's relay telemetry, not
-two, and an unverified broadcast never speaks for a registered aircraft
-(S-10).
+**Remote ID** reaches every drone that broadcasts, whatever its make and
+whether or not its operator cooperates. A broadcast can be spoofed, so a
+direct Remote ID track is shown as broadcast and unverified wherever it
+appears. A broadcast whose serial matches a registered aircraft is one track
+with that aircraft's relay telemetry, not two, and an unverified broadcast
+never speaks for a registered aircraft (U-02).
 
 **ADS-B** puts manned aviation on the same map, so that a drone converging on a
 helicopter is alerted. Manned aircraft are never told to manoeuvre; the alert
 goes to the drone's operator and the control centre.
 
 **The registry** turns a serial number into an operator. An aircraft seen by
-any source whose serial is not registered is itself a violation (M-02, M-03).
+any source whose serial is not registered is itself a violation (M-02, U-02).
 
-All sources converge in the Gateway, which publishes one internal format on
-NATS. The airspace monitor and the console subscribe to it and do not care
-which source a track came from, except to show its trust level.
+All sources converge on one internal track format on NATS, each published
+by its own adapter (§2.1). The airspace monitor and the console subscribe to
+it and do not care which source a track came from, except to show its trust
+level and whether that source is enabled.
 
 ## 3. Link topology
 

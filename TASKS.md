@@ -1092,6 +1092,28 @@ The four services 2021/664 makes mandatory inside a U-space airspace are
 U-02, U-03, U-05 and U-07. U-06 (conformance) and U-08 (weather) are
 optional there and can be made mandatory by the authority.
 
+- [ ] **U-15** Source isolation and control (`ARCHITECTURE.md` §2.1):
+      every source is its own adapter process publishing the common track
+      format, and each can be switched off without a deploy, by type and by
+      instance (station, receiver, provider, feed). A disabled source is
+      refused at the adapter and counted, its tracks age out as *source
+      disabled*, the airspace monitor stops judging them, and the switch is
+      an audited `events` row with actor and reason. The console lists every
+      source with its state and lets an admin switch it. Comes before U-02,
+      which adds network Remote ID as a further source.
+      *Done when:* with SITL aircraft on both a relay and simulated Remote
+      ID, disabling Remote ID removes only the Remote ID tracks and their
+      alerts, disabling one station removes only its aircraft, both show as
+      disabled rather than silent, and re-enabling restores them.
+
+- [ ] **U-16** SITL as a Remote ID source: a bridge that turns a SITL
+      aircraft's MAVLink position into Open Drone ID broadcasts through the
+      simulated receiver path, so one simulated aircraft can appear on the
+      relay, on Remote ID or on both. Exercises track fusion and U-15, and
+      feeds `make demo` (D-01).
+      *Done when:* a SITL aircraft seen on both sources is one track, and
+      disabling either source leaves it visible through the other.
+
 - [ ] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
       from console users, with a registration number, contact and status;
       remote pilots with competency records; UAS with serial, class label
@@ -1240,7 +1262,8 @@ Wave 0   Remove the delivery scope        P-01 → P-04
 Wave S   Stability and security           S-A … S-F in parallel,
                                           then S-09; S-14 optional, last
 Wave M   Monitoring features              M-01, M-02, M-05, M-07, M-09
-Wave U   U-space services (EU model)      U-01 → U-03 → U-12 → U-05 → U-06
+Wave U   U-space services (EU model)      U-15 → U-16 → U-01 → U-02 → U-03
+                                          → U-12 → U-05 → U-06
                                           → U-07 → U-04 → U-13 → U-08
                                           → U-09 → U-11; U-10, U-14 last
 Wave D   Demo readiness                   D-01 → D-04
