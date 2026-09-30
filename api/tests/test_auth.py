@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -15,6 +16,7 @@ import pytest
 from api.auth import (
     AuthError,
     Operator,
+    OperatorStore,
     Role,
     ScryptCost,
     check_password_policy,
@@ -58,6 +60,27 @@ def test_a_hash_records_its_own_cost_so_it_verifies_after_the_default_changes() 
 
     assert stored.startswith("scrypt$11$4$1$")
     assert verify_password("correct horse battery", stored) is True
+
+
+@pytest.mark.parametrize(
+    ("cost", "prefix"),
+    [(FAST, "scrypt$10$8$1$"), (ScryptCost(n_log2=11, r=4), "scrypt$11$4$1$")],
+)
+def test_the_unknown_user_hash_is_at_the_stores_cost(
+    cost: ScryptCost, prefix: str
+) -> None:
+    """An unknown name must cost what a known one does: same scrypt cost.
+    No database is reached by constructing a store."""
+    store = OperatorStore(
+        engine=cast(Any, None),
+        session_ttl_s=60,
+        idle_timeout_s=60,
+        max_failed_logins=3,
+        lockout_s=60,
+        cost=cost,
+    )
+
+    assert store._unknown_user_hash.startswith(prefix)
 
 
 @pytest.mark.parametrize(

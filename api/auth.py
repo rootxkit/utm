@@ -32,10 +32,18 @@ computes a hash, so the response time does not reveal which usernames exist.
 
 Repeated failures lock the account for `lockout_s`; every attempt, failed or
 not, is an `events` row.
+
+scrypt at the default cost takes 32 MiB and tens of milliseconds, so it never
+runs on the event loop (`asyncio.to_thread`) and never while a row lock is
+held; `OperatorStore.login` explains why the lockout stays race-free anyway.
+The HTTP layer also limits sign-in attempts per client address and per
+username (`api/ratelimit.py`), which bounds how much hashing anyone can ask
+for.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -253,10 +261,6 @@ def _token_digest(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
-# A dummy hash to verify against when the username is unknown, so an unknown
-# name takes as long to refuse as a wrong password.
-_UNKNOWN_USER_HASH = hash_password(secrets.token_urlsafe(24))
-
 _OPERATOR_COLUMNS = (
     "id, username, display_name, role, created_at, disabled_at, "
     "password_changed_at, locked_until"
@@ -281,6 +285,14 @@ class OperatorStore:
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(tz=UTC))
     # How often last_seen_at is written. Every request would be a write.
     touch_interval_s: float = 60.0
+    # A dummy hash to verify against when the username is unknown, so an
+    # unknown name takes as long to refuse as a wrong password. At this
+    # store's cost: a cheaper dummy would make unknown names answer faster.
+    _unknown_user_hash: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Once, at construction, so no request pays for it.
+        self._unknown_user_hash = hash_password(secrets.token_urlsafe(24), self.cost)
 
     # --- accounts ---------------------------------------------------------
 
@@ -295,7 +307,7 @@ class OperatorStore:
     ) -> dict[str, Any]:
         name = normalise_username(username)
         check_password_policy(password, username=name)
-        password_hash = hash_password(password, self.cost)
+        password_hash = await asyncio.to_thread(hash_password, password, self.cost)
         try:
             async with self.engine.begin() as connection:
                 row = (
@@ -381,11 +393,12 @@ class OperatorStore:
         if username is None:
             raise AuthError("not_found", f"no operator {operator_id}")
         check_password_policy(password, username=str(username))
+        password_hash = await asyncio.to_thread(hash_password, password, self.cost)
         return await self._update(
             operator_id,
             "password_hash = :hash, password_changed_at = :now, "
             "failed_logins = 0, locked_until = NULL",
-            {"hash": hash_password(password, self.cost), "now": self.clock()},
+            {"hash": password_hash, "now": self.clock()},
             "operator_password_set",
             {},
             actor=actor,
@@ -455,6 +468,37 @@ class OperatorStore:
         now = self.clock()
         name = username.strip().lower()
         refused = AuthError("invalid_credentials", "wrong username or password")
+        # The hash is checked first: off the event loop, with no transaction
+        # open, against the stored hash as read here. Holding `FOR UPDATE`
+        # across a 32 MiB scrypt would queue every attempt on the account
+        # behind it and pin a pooled connection for the whole computation.
+        #
+        # The lockout stays race-free because every decision that counts is
+        # taken again under the row lock, from the locked row:
+        # - disabled and locked are read from the locked row, so an attempt
+        #   hashed while another attempt was locking the account is refused,
+        #   right password or not;
+        # - the failure count is incremented from the locked row's value, so
+        #   concurrent failures serialise on the lock and none is lost;
+        # - the hash that was verified must still be the stored one. If the
+        #   password changed in between, the verdict is about a password that
+        #   no longer exists: the attempt is refused and not counted.
+        # Concurrent attempts may all be hashed at once, but the lock decides
+        # the order they are judged in, and once `max_failed_logins` of them
+        # have failed every later one meets the lock.
+        async with self.engine.connect() as connection:
+            stored_hash = (
+                await connection.execute(
+                    sa.text("SELECT password_hash FROM operators WHERE username = :n"),
+                    {"n": name},
+                )
+            ).scalar_one_or_none()
+        password_ok = await asyncio.to_thread(
+            verify_password,
+            password,
+            self._unknown_user_hash if stored_hash is None else str(stored_hash),
+        )
+
         login: Login | None = None
         # One transaction either way. A refusal is not an exception inside it:
         # the failed attempt and its count must be committed, or the lockout
@@ -471,7 +515,6 @@ class OperatorStore:
                 )
             ).one_or_none()
             if row is None:
-                verify_password(password, _UNKNOWN_USER_HASH)
                 await _audit(
                     connection,
                     SYSTEM,
@@ -487,7 +530,8 @@ class OperatorStore:
                 login = await self._check_and_open(
                     connection,
                     row,
-                    password,
+                    password_ok=password_ok,
+                    hash_changed=row.password_hash != stored_hash,
                     now=now,
                     remote_addr=remote_addr,
                     user_agent=user_agent,
@@ -500,19 +544,25 @@ class OperatorStore:
         self,
         connection: AsyncConnection,
         row: Any,
-        password: str,
         *,
+        password_ok: bool,
+        hash_changed: bool,
         now: datetime,
         remote_addr: str | None,
         user_agent: str | None,
     ) -> Login | None:
+        """Judge an attempt from the locked row. The password was checked
+        before the lock was taken; `login` explains why that is safe."""
         operator_id = row.id
-        password_ok = verify_password(password, row.password_hash)
         reason: str | None = None
         if row.disabled_at is not None:
             reason = "disabled"
         elif row.locked_until is not None and row.locked_until > now:
             reason = "locked"
+        elif hash_changed:
+            # Created or given a new password while this attempt was being
+            # hashed. Not the caller's failure, so not counted.
+            reason = "password_changed_during_login"
         elif not password_ok:
             reason = "wrong_password"
 
