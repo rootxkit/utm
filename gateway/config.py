@@ -71,6 +71,18 @@ class GatewaySettings(
         default=250, ge=1, validation_alias="ARCHIVE_MAX_GIB_PER_STATION"
     )
 
+    # S-07: the retention pass (`gateway/retention.py`) runs inside the
+    # Gateway on this interval. Hourly is plenty: the policy is in days.
+    # The switch exists for an operator who wants sweeps run from elsewhere,
+    # or paused during an investigation; off, nothing is ever deleted, and
+    # the archive is bounded by the disk, which the log says at startup.
+    retention_sweep_enabled: bool = Field(
+        default=True, validation_alias="RETENTION_SWEEP_ENABLED"
+    )
+    retention_sweep_interval_s: float = Field(
+        default=3600.0, gt=0.0, validation_alias="RETENTION_SWEEP_INTERVAL_S"
+    )
+
 
 class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings):
     """Remote ID ingest (P1-15): receiver datagrams in, telemetry out.

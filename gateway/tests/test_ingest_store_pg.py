@@ -13,6 +13,10 @@ epoch of the wrong shape. A fake would agree with whatever the code did.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+import threading
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -20,7 +24,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from gateway.archive import RawArchive
+from gateway.archive import RawArchive, SegmentWrite
 from gateway.ingest_store_pg import EMPTY_WATERMARK, TimescaleIngestStore
 from gateway.relay_messages import Gap
 from gateway.relay_records import Record
@@ -131,7 +135,7 @@ async def test_a_retransmission_is_dropped(
 ) -> None:
     await store.store_records(station, EPOCH, records(0, 50))
 
-    watermark = await store.store_records(station, EPOCH, records(0, 50))
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
 
     assert watermark == 49
     async with store.engine.connect() as connection:
@@ -152,7 +156,7 @@ async def test_a_partially_overlapping_batch_stores_only_the_new_part(
 ) -> None:
     await store.store_records(station, EPOCH, records(0, 50))
 
-    watermark = await store.store_records(station, EPOCH, records(40, 30))
+    watermark = (await store.store_records(station, EPOCH, records(40, 30))).watermark
 
     assert watermark == 69
     stored = store.archive.read_segment(_only_segment_path(store, station))
@@ -226,7 +230,7 @@ async def test_records_after_a_gap_continue_the_watermark(
         station, EPOCH, Gap(epoch=EPOCH, from_seq=50, to_seq=80, reason="queue_cap")
     )
 
-    watermark = await store.store_records(station, EPOCH, records(80, 10))
+    watermark = (await store.store_records(station, EPOCH, records(80, 10))).watermark
 
     assert watermark == 89
     assert await store.resume_from_seq(station, EPOCH) == 90
@@ -268,7 +272,7 @@ async def test_a_sequence_discontinuity_is_archived_but_not_acknowledged(
     """
     await store.store_records(station, EPOCH, records(0, 10))
 
-    watermark = await store.store_records(station, EPOCH, records(50, 5))
+    watermark = (await store.store_records(station, EPOCH, records(50, 5))).watermark
 
     assert watermark == 9
     assert await store.resume_from_seq(station, EPOCH) == 10
@@ -393,3 +397,276 @@ async def test_a_link_state_change_is_recorded(
 async def test_the_empty_watermark_is_minus_one_not_zero() -> None:
     """0 would claim record zero had arrived."""
     assert EMPTY_WATERMARK == -1
+
+
+# --- the archive write stays off the event loop (S-04) ---------------------
+
+
+class ThreadRecordingArchive(RawArchive):
+    """Notes which thread `append` ran on."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root=root)
+        self.append_threads: list[threading.Thread] = []
+
+    def append(
+        self, station_id: str, epoch: str, records: list[Record]
+    ) -> list[SegmentWrite]:
+        self.append_threads.append(threading.current_thread())
+        return super().append(station_id, epoch, records)
+
+
+async def test_the_archive_append_runs_off_the_event_loop_thread(
+    engine: AsyncEngine, archive_root: Path, station: str
+) -> None:
+    """Compression and fsync block; on the loop they stall every station."""
+    archive = ThreadRecordingArchive(archive_root)
+    store = TimescaleIngestStore(engine=engine, archive=archive)
+
+    await store.store_records(station, EPOCH, records(0, 10))
+
+    assert len(archive.append_threads) == 1
+    assert archive.append_threads[0] is not threading.current_thread()
+    # And it still stored: the thread hop must not lose the write.
+    assert await store.resume_from_seq(station, EPOCH) == 10
+
+
+# --- a resend after a crash must not wedge the station (S-05) --------------
+
+
+async def _rewind_watermark(engine: AsyncEngine, station: str, seq: int) -> None:
+    """What a crash between the old two transactions left behind.
+
+    Before S-05 the segment rows and the watermark were committed separately,
+    so a crash after the first left the index full and the watermark short.
+    `_set_watermark` refuses to move backwards, so this goes round it.
+    """
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "UPDATE relay_epochs SET highest_contiguous_seq = :seq "
+                "WHERE station_id = :s AND epoch = :e"
+            ),
+            {"seq": seq, "s": station, "e": EPOCH},
+        )
+
+
+async def _index_rows(engine: AsyncEngine, station: str) -> int:
+    async with engine.connect() as connection:
+        return int(
+            await connection.scalar(
+                sa.text(
+                    "SELECT count(*) FROM archive_segments "
+                    "WHERE station_id = :s AND epoch = :e"
+                ),
+                {"s": station, "e": EPOCH},
+            )
+            or 0
+        )
+
+
+async def test_a_resend_after_a_crash_between_index_and_watermark_recovers(
+    store: TimescaleIngestStore, engine: AsyncEngine, station: str
+) -> None:
+    """The station that was stuck for ever.
+
+    Segments indexed, watermark not advanced, and the relay resending the
+    same batch on every reconnect. Before S-05 the insert raised on
+    `archive_segments_unique`, the session closed, the relay reconnected and
+    resent, and every attempt appended the same bytes to the segment.
+    """
+    await store.store_records(station, EPOCH, records(0, 50))
+    await _rewind_watermark(engine, station, EMPTY_WATERMARK)
+    assert await store.resume_from_seq(station, EPOCH) == 0
+
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
+
+    assert watermark == 49
+    assert await store.resume_from_seq(station, EPOCH) == 50
+    assert await _index_rows(engine, station) == 1
+    # The archive holds each record once: the resend was not appended.
+    stored = store.archive.read_segment(_only_segment_path(store, station))
+    assert [record.seq for record in stored] == list(range(50))
+
+
+async def test_a_resend_recovers_when_only_part_of_it_is_indexed(
+    store: TimescaleIngestStore, engine: AsyncEngine, station: str
+) -> None:
+    """Two batches indexed, the watermark left before the second, one resend."""
+    await store.store_records(station, EPOCH, records(0, 30))
+    await store.store_records(station, EPOCH, records(30, 20))
+    await _rewind_watermark(engine, station, 29)
+
+    watermark = (await store.store_records(station, EPOCH, records(30, 20))).watermark
+
+    assert watermark == 49
+    assert await _index_rows(engine, station) == 2
+    stored = store.archive.read_segment(_only_segment_path(store, station))
+    assert [record.seq for record in stored] == list(range(50))
+
+
+async def test_an_index_conflict_the_precheck_missed_is_not_an_error(
+    engine: AsyncEngine, archive_root: Path, station: str
+) -> None:
+    """The conflict clause itself, with the precheck taken away.
+
+    The precheck skips the append, so on its own it never lets the insert
+    reach the constraint. This exercises the belt with the braces removed: the
+    row exists, the insert must do nothing, and the watermark must still move.
+    """
+
+    class BlindStore(TimescaleIngestStore):
+        async def _indexed_ranges(
+            self, station_id: str, epoch: str, first_seq: int, last_seq: int
+        ) -> set[tuple[str, int, int]]:
+            return set()
+
+    store = BlindStore(engine=engine, archive=RawArchive(root=archive_root))
+    await store.store_records(station, EPOCH, records(0, 50))
+    await _rewind_watermark(engine, station, EMPTY_WATERMARK)
+
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
+
+    assert watermark == 49
+    assert await _index_rows(engine, station) == 1
+
+
+async def test_the_index_and_the_watermark_commit_together(
+    engine: AsyncEngine, archive_root: Path, station: str
+) -> None:
+    """A failed index insert must leave the watermark where it was.
+
+    Separate transactions would recreate the stuck state this section exists
+    to remove. The insert is made to fail by a segment row that violates the
+    `archive_segments_non_empty` check constraint.
+    """
+    from gateway.ingest_store import StoreError
+
+    class BrokenArchive(RawArchive):
+        def append(
+            self, station_id: str, epoch: str, records: list[Record]
+        ) -> list[SegmentWrite]:
+            return [
+                dataclasses.replace(write, record_count=0)
+                for write in super().append(station_id, epoch, records)
+            ]
+
+    store = TimescaleIngestStore(
+        engine=engine, archive=BrokenArchive(root=archive_root)
+    )
+    with pytest.raises(StoreError, match="index archive segments"):
+        await store.store_records(station, EPOCH, records(0, 10))
+
+    assert await store.resume_from_seq(station, EPOCH) == 0
+    assert await _index_rows(engine, station) == 0
+
+
+# --- what the store reports as new (S-05) ----------------------------------
+
+
+async def test_the_store_reports_only_the_new_records(
+    store: TimescaleIngestStore, station: str
+) -> None:
+    """The pipeline behind the store processes `stored`, so it must hold the
+    first copy of everything and no copy of a retransmission."""
+    first = await store.store_records(station, EPOCH, records(0, 50))
+    resent = await store.store_records(station, EPOCH, records(0, 50))
+    overlapping = await store.store_records(station, EPOCH, records(40, 30))
+
+    assert [record.seq for record in first.stored] == list(range(50))
+    assert resent.stored == []
+    assert resent.watermark == 49
+    assert [record.seq for record in overlapping.stored] == list(range(50, 70))
+
+
+# --- two sessions of one station cannot interleave a segment (S-05) --------
+
+
+class SlowArchive(RawArchive):
+    """Widens the window in which a second append could start."""
+
+    def append(
+        self, station_id: str, epoch: str, records: list[Record]
+    ) -> list[SegmentWrite]:
+        time.sleep(0.05)
+        return super().append(station_id, epoch, records)
+
+
+async def test_concurrent_stores_for_one_station_do_not_interleave_the_segment(
+    engine: AsyncEngine, archive_root: Path, station: str
+) -> None:
+    """relay-v1 §10: an old socket still draining buffered batches while the
+    relay has reconnected and is resending the same range. With the append
+    on a worker thread nothing serialised the two writes, so both read the
+    same watermark, both appended, and the hour file interleaved."""
+    store = TimescaleIngestStore(engine=engine, archive=SlowArchive(root=archive_root))
+
+    results = await asyncio.gather(
+        store.store_records(station, EPOCH, records(0, 50)),
+        store.store_records(station, EPOCH, records(0, 50)),
+        store.store_records(station, EPOCH, records(30, 30)),
+    )
+
+    # Every record readable exactly once, and the index agrees.
+    stored = store.archive.read_segment(_only_segment_path(store, station))
+    assert [record.seq for record in stored] == list(range(60))
+    assert await store.resume_from_seq(station, EPOCH) == 60
+    # The three calls between them stored each record once.
+    stored_seqs = sorted(record.seq for result in results for record in result.stored)
+    assert stored_seqs == list(range(60))
+    async with engine.connect() as connection:
+        total = await connection.scalar(
+            sa.text(
+                "SELECT sum(record_count) FROM archive_segments "
+                "WHERE station_id = :s AND epoch = :e"
+            ),
+            {"s": station, "e": EPOCH},
+        )
+    assert total == 60
+
+
+# --- a range retention removed is archived again on resend (S-05) ----------
+
+
+async def test_a_range_deleted_by_retention_is_archived_again_on_resend(
+    store: TimescaleIngestStore, engine: AsyncEngine, station: str
+) -> None:
+    """The precheck must see live rows only. A row marked deleted describes
+    bytes that are gone; treating it as already indexed would skip the
+    append, acknowledge the resend, and leave nothing on disk to read."""
+    await store.store_records(station, EPOCH, records(0, 50))
+    path = _only_segment_path(store, station)
+    # What a retention pass leaves: the row marked, the file gone.
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                "UPDATE archive_segments SET deleted_at = now(), "
+                "deleted_reason = 'age' WHERE station_id = :s"
+            ),
+            {"s": station},
+        )
+    (store.archive.root / path).unlink()
+    await _rewind_watermark(engine, station, EMPTY_WATERMARK)
+
+    watermark = (await store.store_records(station, EPOCH, records(0, 50))).watermark
+
+    assert watermark == 49
+    stored = store.archive.read_segment(path)
+    assert [record.seq for record in stored] == list(range(50))
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                sa.text(
+                    "SELECT deleted_at, deleted_reason, stored_at > now() - "
+                    "interval '1 minute' AS fresh FROM archive_segments "
+                    "WHERE station_id = :s"
+                ),
+                {"s": station},
+            )
+        ).all()
+    # One row, live again, describing the new bytes and aged from now. The
+    # unique constraint still matches the deleted row, so this is the
+    # ON CONFLICT DO UPDATE resurrecting it rather than a second row.
+    assert [(row.deleted_at, row.deleted_reason, row.fresh) for row in rows] == [
+        (None, None, True)
+    ]

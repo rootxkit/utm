@@ -2,10 +2,17 @@
 
 Two rules, in this order:
 
-1. **Age.** Segments older than `telemetry_retention_days` are deleted. That
-   setting is shared with P1-04's `drone_state` retention and must stay shared:
-   the archive must not outlive the telemetry it explains, nor the telemetry
-   the archive. Half a record is worse than none, because it reads as complete.
+1. **Age.** Segments stored longer ago than `telemetry_retention_days` are
+   deleted. That setting is shared with P1-04's `drone_state` retention and
+   must stay shared: the archive must not outlive the telemetry it explains,
+   nor the telemetry the archive. Half a record is worse than none, because
+   it reads as complete.
+
+   Age is measured on `stored_at`, the Gateway's clock, never on the hour
+   the records claim to belong to. `hour_start` comes from `recv_utc_ns`,
+   the ground PC's wall clock, which relay-v1 §9 says may be wrong; keyed on
+   that, a station whose clock was years behind had freshly acknowledged
+   telemetry unlinked at the next sweep.
 
 2. **Size ceiling, per station.** If a station is over its ceiling after the
    age sweep, the oldest whole segments go first, oldest epoch first, until it
@@ -44,9 +51,11 @@ deletion would let a forgotten date destroy evidence.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import contextlib
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import sqlalchemy as sa
 from sqlalchemy.exc import SQLAlchemyError
@@ -84,6 +93,8 @@ _segments = sa.table(
     sa.column("hour_start", sa.DateTime(timezone=True)),
     sa.column("record_count", sa.Integer),
     sa.column("compressed_bytes", sa.BigInteger),
+    # Server time, set by the database when the row was indexed.
+    sa.column("stored_at", sa.DateTime(timezone=True)),
     sa.column("deleted_at", sa.DateTime(timezone=True)),
     sa.column("deleted_reason", sa.Text),
 )
@@ -95,6 +106,115 @@ _events = sa.table(
     sa.column("event_type", sa.Text),
     sa.column("payload", sa.JSON),
 )
+
+
+# How many paths one listing query returns. The index has one row per batch
+# (about 860k per station per day at 100 ms batches), so the listing is
+# aggregated per path in SQL and paged by keyset, never loaded whole.
+LISTING_PAGE: Final = 256
+
+
+@dataclass(frozen=True, slots=True)
+class _PathSummary:
+    """One segment file, as the listing sees it: its live rows aggregated."""
+
+    relative_path: str
+    station_id: str
+    epoch: str
+    hour_start: datetime
+    oldest_stored_at: datetime
+    compressed_bytes: int
+    record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Deletion:
+    """What one `_delete_path` did."""
+
+    rows: int = 0
+    records: int = 0
+    bytes_freed: int = 0
+    existed: bool = True
+    # A session appended to the path between the listing and the lock, so
+    # the file was left alone this pass.
+    skipped_appended: bool = False
+
+
+@dataclass
+class _Tally:
+    rows: int = 0
+    records: int = 0
+    bytes_freed: int = 0
+    held: int = 0
+    missing: int = 0
+    skipped_appended: int = 0
+
+    def add(self, deletion: _Deletion) -> None:
+        if deletion.skipped_appended:
+            self.skipped_appended += 1
+            return
+        self.rows += deletion.rows
+        self.records += deletion.records
+        self.bytes_freed += deletion.bytes_freed
+        if deletion.rows and not deletion.existed:
+            self.missing += 1
+
+
+def listing_query(
+    *,
+    station_id: str | None,
+    stored_before: datetime | None,
+    after: tuple[datetime, str] | None,
+    limit: int,
+) -> sa.Select[tuple[str, str, str, datetime, datetime, int, int]]:
+    """Live segment files, one row per path, oldest stored first.
+
+    Shaped for the two partial indexes of migration 0008, both
+    `WHERE deleted_at IS NULL`. With `stored_before` (the age rule) the
+    candidate rows are `stored_at < cutoff`, which in the steady state is
+    only what has aged past the cutoff since the last pass, served by
+    `archive_segments_live_by_stored_at`; each candidate path is then
+    probed once for a newer live row through
+    `archive_segments_retention_by_path`, so a path with any row inside the
+    window is left whole. Neither touches rows already marked deleted.
+    """
+    oldest = sa.func.min(_segments.c.stored_at).label("oldest_stored_at")
+    query = (
+        sa.select(
+            _segments.c.relative_path,
+            _segments.c.station_id,
+            _segments.c.epoch,
+            sa.func.min(_segments.c.hour_start).label("hour_start"),
+            oldest,
+            sa.func.sum(_segments.c.compressed_bytes).label("compressed_bytes"),
+            sa.func.sum(_segments.c.record_count).label("record_count"),
+        )
+        .where(_segments.c.deleted_at.is_(None))
+        .group_by(_segments.c.relative_path, _segments.c.station_id, _segments.c.epoch)
+        .order_by(oldest, _segments.c.relative_path)
+        .limit(limit)
+    )
+    if station_id is not None:
+        query = query.where(_segments.c.station_id == station_id)
+    if stored_before is not None:
+        # Whole files only: a path with any live row stored inside the
+        # window stays, because deleting the file would take that row's
+        # bytes with it, unmarked.
+        newer = _segments.alias("newer")
+        query = query.where(
+            _segments.c.stored_at < stored_before,
+            ~sa.exists().where(
+                newer.c.relative_path == _segments.c.relative_path,
+                newer.c.deleted_at.is_(None),
+                newer.c.stored_at >= stored_before,
+            ),
+        )
+    if after is not None:
+        query = query.having(
+            sa.tuple_(sa.func.min(_segments.c.stored_at), _segments.c.relative_path)
+            > sa.tuple_(after[0], after[1])
+        )
+    return query
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +247,9 @@ class SweepResult:
     # is tolerated - and a sign the index and the disk disagree at any other
     # time. Never silent: see `_report_missing_files`.
     already_missing: int = 0
+    # Paths a session appended to between the listing and the lock. Left
+    # alone this pass rather than unlinked under a row the listing never saw.
+    skipped_appended: int = 0
 
     @property
     def deleted_total(self) -> int:
@@ -141,6 +264,7 @@ class ArchiveRetention:
     archive: RawArchive
     retention_days: int
     max_bytes_per_station: int
+    listing_page: int = LISTING_PAGE
 
     async def sweep(
         self, *, now: datetime | None = None, only_station: str | None = None
@@ -170,6 +294,7 @@ class ArchiveRetention:
             records_destroyed=by_age.records_destroyed + by_ceiling.records_destroyed,
             skipped_held=by_age.skipped_held + by_ceiling.skipped_held,
             already_missing=by_age.already_missing + by_ceiling.already_missing,
+            skipped_appended=by_age.skipped_appended + by_ceiling.skipped_appended,
         )
         if result.already_missing:
             await self._report_missing_files(result, only_station)
@@ -353,86 +478,125 @@ class ArchiveRetention:
         self, now: datetime, only_station: str | None = None
     ) -> SweepResult:
         cutoff = now - timedelta(days=self.retention_days)
-        candidates = await self._live_segments(
-            older_than=cutoff, station_id=only_station
-        )
-        deleted, reclaimed, records, held, missing = await self._delete_all(
-            candidates, reason="age", now=now
-        )
+        # Everything is judged against the database's clock, which is what
+        # `stored_at` was set from; `now` is only the caller's idea of today.
+        stored_before = min(cutoff, await self._db_now())
+        tally = _Tally()
+        after: tuple[datetime, str] | None = None
+        while True:
+            page = await self._list_paths(
+                station_id=only_station, stored_before=stored_before, after=after
+            )
+            if not page:
+                break
+            for path in page:
+                if await self._is_held(path.station_id, path.epoch, now):
+                    tally.held += 1
+                    continue
+                tally.add(
+                    await self._delete_path(
+                        path, reason="age", stored_before=stored_before
+                    )
+                )
+            after = (page[-1].oldest_stored_at, page[-1].relative_path)
         return SweepResult(
-            deleted_by_age=deleted,
-            bytes_reclaimed=reclaimed,
-            records_destroyed=records,
-            skipped_held=held,
-            already_missing=missing,
+            deleted_by_age=tally.rows,
+            bytes_reclaimed=tally.bytes_freed,
+            records_destroyed=tally.records,
+            skipped_held=tally.held,
+            already_missing=tally.missing,
+            skipped_appended=tally.skipped_appended,
         )
 
     async def _sweep_by_ceiling(
         self, now: datetime, only_station: str | None = None
     ) -> SweepResult:
-        deleted = reclaimed = records = held = missing = 0
+        tally = _Tally()
+        listed_at = await self._db_now()
 
         for station_id, total_bytes in await self._station_sizes(only_station):
-            if total_bytes <= self.max_bytes_per_station:
-                continue
-
             over_by = total_bytes - self.max_bytes_per_station
-            # Oldest first, and because `_live_segments` orders by hour and
-            # then by epoch, oldest epoch first within an hour.
-            for segment in await self._live_segments(station_id=station_id):
-                if over_by <= 0:
-                    break
-                if await self._is_held(segment.station_id, segment.epoch, now):
-                    held += 1
-                    continue
-                freed, count, existed = await self._delete_one(
-                    segment, reason="ceiling"
+            after: tuple[datetime, str] | None = None
+            # Oldest stored first, a page of paths at a time, until the
+            # station is under its ceiling or nothing deletable is left.
+            while over_by > 0:
+                page = await self._list_paths(
+                    station_id=station_id, stored_before=None, after=after
                 )
-                deleted += 1
-                reclaimed += freed
-                records += count
-                missing += 0 if existed else 1
-                over_by -= segment.compressed_bytes
+                if not page:
+                    break
+                for path in page:
+                    if over_by <= 0:
+                        break
+                    if await self._is_held(path.station_id, path.epoch, now):
+                        tally.held += 1
+                        continue
+                    deletion = await self._delete_path(
+                        path, reason="ceiling", stored_before=listed_at
+                    )
+                    tally.add(deletion)
+                    if not deletion.skipped_appended:
+                        over_by -= path.compressed_bytes
+                after = (page[-1].oldest_stored_at, page[-1].relative_path)
 
         return SweepResult(
-            deleted_by_ceiling=deleted,
-            bytes_reclaimed=reclaimed,
-            records_destroyed=records,
-            skipped_held=held,
-            already_missing=missing,
+            deleted_by_ceiling=tally.rows,
+            bytes_reclaimed=tally.bytes_freed,
+            records_destroyed=tally.records,
+            skipped_held=tally.held,
+            already_missing=tally.missing,
+            skipped_appended=tally.skipped_appended,
         )
 
     # --- internals ---------------------------------------------------------
 
-    async def _live_segments(
-        self,
-        *,
-        older_than: datetime | None = None,
-        station_id: str | None = None,
-    ) -> list[sa.Row[tuple[int, str, str, str, datetime, int, int]]]:
-        query = (
-            sa.select(
-                _segments.c.id,
-                _segments.c.station_id,
-                _segments.c.epoch,
-                _segments.c.relative_path,
-                _segments.c.hour_start,
-                _segments.c.record_count,
-                _segments.c.compressed_bytes,
-            )
-            .where(_segments.c.deleted_at.is_(None))
-            .order_by(_segments.c.hour_start, _segments.c.epoch, _segments.c.id)
-        )
-        if older_than is not None:
-            query = query.where(_segments.c.hour_start < older_than)
-        if station_id is not None:
-            query = query.where(_segments.c.station_id == station_id)
-
+    async def _db_now(self) -> datetime:
         try:
             async with self.engine.connect() as connection:
-                return list((await connection.execute(query)).all())
+                moment = await connection.scalar(sa.select(sa.func.now()))
+        except SQLAlchemyError as error:
+            raise StoreError(f"could not read the database clock: {error}") from error
+        assert isinstance(moment, datetime)
+        return moment
+
+    async def _list_paths(
+        self,
+        *,
+        station_id: str | None,
+        stored_before: datetime | None,
+        after: tuple[datetime, str] | None,
+    ) -> list[_PathSummary]:
+        """One page of segment files, oldest stored first.
+
+        Aggregated per path in SQL: whole files are the unit of deletion,
+        and a station writes one row per batch, so listing rows would read
+        hundreds of thousands per day into Python. `stored_before` keeps
+        only files whose every live row is older than it (the age rule);
+        `after` is the keyset of the previous page.
+        """
+        query = listing_query(
+            station_id=station_id,
+            stored_before=stored_before,
+            after=after,
+            limit=self.listing_page,
+        )
+        try:
+            async with self.engine.connect() as connection:
+                rows = (await connection.execute(query)).all()
         except SQLAlchemyError as error:
             raise StoreError(f"could not list segments: {error}") from error
+        return [
+            _PathSummary(
+                relative_path=row.relative_path,
+                station_id=row.station_id,
+                epoch=row.epoch,
+                hour_start=row.hour_start,
+                oldest_stored_at=row.oldest_stored_at,
+                compressed_bytes=int(row.compressed_bytes or 0),
+                record_count=int(row.record_count or 0),
+            )
+            for row in rows
+        ]
 
     async def _station_sizes(
         self, only_station: str | None = None
@@ -469,63 +633,112 @@ class ArchiveRetention:
         # it simply stops exempting, and the ordinary rules resume.
         return held_until is not None and held_until > now
 
-    async def _delete_all(
-        self,
-        segments: list[sa.Row[tuple[int, str, str, str, datetime, int, int]]],
-        *,
-        reason: str,
-        now: datetime,
-    ) -> tuple[int, int, int, int, int]:
-        deleted = reclaimed = records = held = missing = 0
-        for segment in segments:
-            if await self._is_held(segment.station_id, segment.epoch, now):
-                held += 1
-                continue
-            freed, count, existed = await self._delete_one(segment, reason=reason)
-            deleted += 1
-            reclaimed += freed
-            records += count
-            missing += 0 if existed else 1
-        return deleted, reclaimed, records, held, missing
+    async def _delete_path(
+        self, path: _PathSummary, *, reason: str, stored_before: datetime
+    ) -> _Deletion:
+        """Delete one file, mark every live index row of it, record the event.
 
-    async def _delete_one(
-        self,
-        segment: sa.Row[tuple[int, str, str, str, datetime, int, int]],
-        *,
-        reason: str,
-    ) -> tuple[int, int, bool]:
-        """Delete the file, mark the index, record the event. In that order.
+        In that order. File first: a crash after deleting but before marking
+        leaves index rows for bytes that are gone, which the next sweep
+        retries harmlessly. The reverse leaves a file nothing points at,
+        which nothing will ever clean up.
 
-        File first: a crash after deleting but before marking leaves an index
-        row for bytes that are gone, which the next sweep retries harmlessly.
-        The reverse leaves a file nothing points at, which nothing will ever
-        clean up.
+        One file, all its rows at once. A segment has one index row per
+        batch appended to it, so unlinking on the first row and then
+        visiting the rest counted every later row as `already_missing`: each
+        sweep logged "index and disk disagree" and wrote a
+        `retention.missing_files` event for an archive that was fine, and a
+        warning that is always false is one nobody reads.
+
+        The listing is stale by the time the lock is taken - minutes, on a
+        large sweep - and a session may have appended to this path since.
+        That append is a live row the listing never saw, and unlinking the
+        file would take its acknowledged bytes with it. So the path is
+        re-read under the lock, and left alone this pass if any live row was
+        stored at or after `stored_before`; the rows marked are found by
+        path, never by a remembered list of ids.
         """
-        existed = (self.archive.root / segment.relative_path).exists()
-        freed = self.archive.delete_segment(segment.relative_path)
-
-        try:
-            async with self.engine.begin() as connection:
-                await connection.execute(
-                    sa.update(_segments)
-                    .where(_segments.c.id == segment.id)
-                    .values(deleted_at=sa.func.now(), deleted_reason=reason)
+        # Under the station lock, so nothing can be appended to the file
+        # between the re-check and the unlink.
+        async with self.archive.station_lock(path.station_id):
+            live = await self._live_rows(path.relative_path)
+            if not live:
+                return _Deletion()
+            if any(row.stored_at >= stored_before for row in live):
+                _log.info(
+                    "segment appended to since it was listed; kept this pass",
+                    extra={
+                        "station_id": path.station_id,
+                        "relative_path": path.relative_path,
+                        "reason": reason,
+                    },
                 )
-        except SQLAlchemyError as error:
-            raise StoreError(f"could not mark segment deleted: {error}") from error
+                return _Deletion(skipped_appended=True)
 
+            # Off the event loop: a stat and an unlink on a slow or remote
+            # disk are time in which no station is served.
+            existed = await asyncio.to_thread(
+                (self.archive.root / path.relative_path).exists
+            )
+            freed = await asyncio.to_thread(
+                self.archive.delete_segment, path.relative_path
+            )
+
+            try:
+                async with self.engine.begin() as connection:
+                    marked = await connection.execute(
+                        sa.update(_segments)
+                        .where(
+                            _segments.c.relative_path == path.relative_path,
+                            _segments.c.deleted_at.is_(None),
+                            _segments.c.stored_at < stored_before,
+                        )
+                        .values(deleted_at=sa.func.now(), deleted_reason=reason)
+                    )
+            except SQLAlchemyError as error:
+                raise StoreError(f"could not mark segment deleted: {error}") from error
+
+        record_count = sum(row.record_count for row in live)
         await self._record_event(
-            segment.station_id,
-            segment.epoch,
+            path.station_id,
+            path.epoch,
             f"retention.deleted.{reason}",
             {
-                "relative_path": segment.relative_path,
-                "hour_start": segment.hour_start.isoformat(),
-                "record_count": segment.record_count,
+                "relative_path": path.relative_path,
+                "hour_start": path.hour_start.isoformat(),
+                "record_count": record_count,
+                "index_rows": marked.rowcount,
                 "bytes_reclaimed": freed,
             },
         )
-        return freed, segment.record_count, existed
+        return _Deletion(
+            rows=marked.rowcount,
+            records=record_count,
+            bytes_freed=freed,
+            existed=existed,
+        )
+
+    async def _live_rows(
+        self, relative_path: str
+    ) -> list[sa.Row[tuple[int, datetime, int]]]:
+        try:
+            async with self.engine.connect() as connection:
+                return list(
+                    (
+                        await connection.execute(
+                            sa.select(
+                                _segments.c.id,
+                                _segments.c.stored_at,
+                                _segments.c.record_count,
+                            ).where(
+                                _segments.c.relative_path == relative_path,
+                                _segments.c.deleted_at.is_(None),
+                            )
+                        )
+                    ).all()
+                )
+        except SQLAlchemyError as error:
+            raise StoreError(f"could not re-read segment rows: {error}") from error
 
     async def _record_event(
         self,
@@ -546,3 +759,103 @@ class ArchiveRetention:
                 )
         except SQLAlchemyError as error:
             raise StoreError(f"could not record {event_type}: {error}") from error
+
+
+# --- running it ------------------------------------------------------------
+#
+# Everything above had no production caller (S-07). `sweep` and
+# `purge_closed_epochs` were designed, tested against a real database, and
+# never scheduled, so the archive was bounded by policy on paper and by the
+# disk in practice - exactly the failure the module docstring opens with.
+
+
+class Sweeper(Protocol):
+    """What the schedule needs from `ArchiveRetention`."""
+
+    async def sweep(
+        self, *, now: datetime | None = None, only_station: str | None = None
+    ) -> SweepResult: ...
+
+    async def holds_expiring_within(
+        self, days: int = HOLD_WARNING_DAYS, *, now: datetime | None = None
+    ) -> list[Hold]: ...
+
+
+class EpochPurger(Protocol):
+    """What the schedule needs from the ingest store."""
+
+    async def purge_closed_epochs(self) -> int: ...
+
+
+@dataclass
+class RetentionSchedule:
+    """Runs the retention pass on a timer, and keeps running when one fails.
+
+    A pass that fails - the database away for a minute - is logged and
+    retried at the next interval. Nothing here is on the ingest path, and a
+    sweep that stopped for good after one bad pass would return the archive
+    to being bounded by the disk, silently.
+    """
+
+    retention: Sweeper
+    store: EpochPurger
+    interval_s: float
+    # Production sweeps every station. A caller working on one station's
+    # data - a test - must not be able to reach the rest; see `sweep`.
+    only_station: str | None = None
+    passes: int = field(default=0, init=False)
+    failures: int = field(default=0, init=False)
+
+    async def run_until(self, stop: asyncio.Event) -> None:
+        """One pass now, then one per interval, until `stop` is set."""
+        while not stop.is_set():
+            await self.run_once()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), self.interval_s)
+
+    async def run_once(self) -> None:
+        try:
+            result = await self.retention.sweep(only_station=self.only_station)
+            purged = await self.store.purge_closed_epochs()
+            expiring = await self.retention.holds_expiring_within()
+        except Exception as error:
+            # Anything: a StoreError or ArchiveError from the sweep, but
+            # also an OSError from a stat on a disk that has gone away. A
+            # pass that stops the schedule for good returns the archive to
+            # being bounded by the disk, silently, which is the one outcome
+            # this task exists to prevent.
+            self.failures += 1
+            _log.error(
+                "retention pass failed; retrying at the next interval",
+                extra={"error": repr(error), "interval_s": self.interval_s},
+            )
+            return
+        finally:
+            self.passes += 1
+
+        _log.info(
+            "retention pass complete",
+            extra={
+                "deleted_by_age": result.deleted_by_age,
+                "deleted_by_ceiling": result.deleted_by_ceiling,
+                "bytes_reclaimed": result.bytes_reclaimed,
+                "records_destroyed": result.records_destroyed,
+                "skipped_held": result.skipped_held,
+                "already_missing": result.already_missing,
+                "epochs_purged": purged,
+                "station_id": self.only_station,
+            },
+        )
+        for hold in expiring:
+            # The warning that has to arrive before the date, not after it.
+            _log.warning(
+                "retention hold expires soon",
+                extra={
+                    "station_id": hold.station_id,
+                    "epoch": hold.epoch,
+                    "hold_until": hold.hold_until.isoformat(),
+                    "days_remaining": hold.days_remaining(),
+                    "set_by": hold.set_by,
+                    "reason": hold.reason,
+                },
+            )

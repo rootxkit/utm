@@ -41,10 +41,11 @@ disagreement between the two rather than as silently misfiled hours.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -112,6 +113,23 @@ class RawArchive:
 
     root: Path
     compression_level: int = COMPRESSION_LEVEL
+    _station_locks: dict[str, asyncio.Lock] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def station_lock(self, station_id: str) -> asyncio.Lock:
+        """The lock every writer and deleter of one station's tree holds.
+
+        `append` runs on a worker thread now, so nothing serialises it any
+        more: two sessions of one station - an old socket still draining
+        while the relay has reconnected and is resending (relay-v1 §10) -
+        could append the same range to the same hour file from two threads,
+        interleaving bytes and making the rest of the hour unreadable after
+        it had been acknowledged. Retention's unlink raced the same append.
+        The store holds this around append, index and watermark; retention
+        holds it around unlink and mark.
+        """
+        return self._station_locks.setdefault(station_id, asyncio.Lock())
 
     def append(
         self, station_id: str, epoch: str, records: list[Record]
@@ -128,7 +146,7 @@ class RawArchive:
             return []
 
         writes: list[SegmentWrite] = []
-        for hour, group in _group_by_hour(records):
+        for hour, group in group_by_hour(records):
             writes.append(self._append_to_segment(station_id, epoch, hour, group))
         return writes
 
@@ -247,7 +265,8 @@ class RawArchive:
         )
 
 
-def _group_by_hour(records: list[Record]) -> list[tuple[datetime, list[Record]]]:
+def group_by_hour(records: list[Record]) -> list[tuple[datetime, list[Record]]]:
+    """Split records into the hour segments `append` would write them to."""
     groups: list[tuple[datetime, list[Record]]] = []
     for record in records:
         hour = segment_hour(record.recv_utc_ns)

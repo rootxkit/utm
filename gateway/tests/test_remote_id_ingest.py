@@ -412,3 +412,38 @@ async def test_the_broadcast_takes_over_once_the_link_has_been_quiet_long_enough
     now[0] = 5.1
     await service.on_datagram(datagram(pack(basic(), location())), "127.0.0.1")
     assert [subject for subject, _ in bus.sent] == [f"telemetry.{UUID(int=42)}"]
+
+
+# --- the refusal warning is rate limited (S-07) ----------------------------
+
+
+async def test_refusals_from_one_source_are_logged_once_per_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A line per refused datagram is a way to fill the disk from any host
+    that can reach the port. The first is logged; the rest are counted and
+    the next report says how many."""
+    from gateway import remote_id_ingest
+    from gateway.rate_limit import RateLimiter
+
+    warnings: list[tuple[str, Any]] = []
+    monkeypatch.setattr(
+        remote_id_ingest._log,
+        "warning",
+        lambda message, *a, **k: warnings.append((message, k.get("extra"))),
+    )
+    clock = [0.0]
+    service = ingest(FakeBus())
+    service.refusals = RateLimiter(interval_s=60.0, clock=lambda: clock[0])
+
+    for _ in range(500):
+        await service.on_datagram(b"not json", "10.0.0.7")
+    clock[0] += 61.0
+    await service.on_datagram(b"not json", "10.0.0.7")
+
+    assert service.refused == 501
+    refused = [
+        extra for message, extra in warnings if message == "remote id datagram refused"
+    ]
+    assert [extra["suppressed"] for extra in refused] == [0, 499]
+    assert refused[0]["source"] == "10.0.0.7"
