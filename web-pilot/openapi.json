@@ -1283,7 +1283,7 @@
     },
     "/events": {
       "get": {
-        "description": "Filter by entity and time; page with `after_id` = the last `id` seen.",
+        "description": "Filter by entity and time; page with `after_id` = the last `id` seen.\n\n`since` and `until` must carry a zone, as in the replay routes: a\ntime without one is refused with 422, not guessed to be UTC.",
         "operationId": "events_events_get",
         "parameters": [
           {
@@ -1845,7 +1845,7 @@
     },
     "/replay/drones/{drone_id}/flights": {
       "get": {
-        "description": "Armed spans of this aircraft, newest first.",
+        "description": "Armed spans of this aircraft, newest first. A window longer than\nthe configured maximum is refused with 413.",
         "operationId": "flights_replay_drones__drone_id__flights_get",
         "parameters": [
           {
