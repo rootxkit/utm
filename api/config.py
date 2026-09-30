@@ -102,6 +102,11 @@ class ApiSettings(
     login_lockout_s: float = Field(
         default=900.0, gt=0, validation_alias="LOGIN_LOCKOUT_S"
     )
+    # S-15. scrypt computations (32 MiB and a core each) allowed at once;
+    # more sign-ins queue for a slot.
+    password_hash_concurrency: int = Field(
+        default=2, ge=1, validation_alias="PASSWORD_HASH_CONCURRENCY"
+    )
     # S-15. Sign-in attempts allowed per client address and per username
     # within the window, before any password is hashed. Beyond them the
     # API answers 429. Unknown usernames are counted like known ones.

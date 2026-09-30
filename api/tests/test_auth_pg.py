@@ -33,6 +33,7 @@ from api.auth import (
     ScryptCost,
 )
 from api.registry import FleetRegistry
+from api.tests.test_auth import Overlap
 from gateway.binding import BindingResolver
 
 pytestmark = pytest.mark.postgres
@@ -331,6 +332,23 @@ async def test_the_password_is_hashed_off_the_loop_with_the_row_unlocked(
 
     assert probe.on_loop_thread == [False]
     assert probe.row_was_free == [True]
+
+
+async def test_concurrent_sign_ins_hash_at_most_the_limit_at_once(
+    store: OperatorStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through `login`: six at once, `max_concurrent_hashes` (2) hashing."""
+    overlap = Overlap()
+    monkeypatch.setattr(auth_module, "verify_password", overlap)
+
+    results = await asyncio.gather(
+        *(store.login(unique("nobody"), PASSWORD) for _ in range(6)),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, AuthError) for result in results)
+    assert store.max_concurrent_hashes == 2
+    assert overlap.most == 2
 
 
 async def test_a_password_changed_while_hashing_refuses_the_old_one_uncounted(

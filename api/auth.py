@@ -34,7 +34,8 @@ Repeated failures lock the account for `lockout_s`; every attempt, failed or
 not, is an `events` row.
 
 scrypt at the default cost takes 32 MiB and tens of milliseconds, so it never
-runs on the event loop (`asyncio.to_thread`) and never while a row lock is
+runs on the event loop (`asyncio.to_thread`), at most
+`max_concurrent_hashes` at a time, and never while a row lock is
 held; `OperatorStore.login` explains why the lockout stays race-free anyway.
 The HTTP layer also limits sign-in attempts per client address and per
 username (`api/ratelimit.py`), which bounds how much hashing anyone can ask
@@ -285,14 +286,31 @@ class OperatorStore:
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(tz=UTC))
     # How often last_seen_at is written. Every request would be a write.
     touch_interval_s: float = 60.0
+    # How many scrypt computations may run at once. Each takes `cost.maxmem`
+    # / 2 of memory (32 MiB by default) and a core; unbounded, a burst of
+    # sign-ins would use as many as the thread pool has workers. Beyond this
+    # they queue, which makes a burst slower rather than the process larger.
+    max_concurrent_hashes: int = 2
     # A dummy hash to verify against when the username is unknown, so an
     # unknown name takes as long to refuse as a wrong password. At this
     # store's cost: a cheaper dummy would make unknown names answer faster.
     _unknown_user_hash: str = field(init=False, repr=False)
+    _hash_slots: asyncio.Semaphore = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.max_concurrent_hashes < 1:
+            raise ValueError("max_concurrent_hashes must be at least 1")
+        self._hash_slots = asyncio.Semaphore(self.max_concurrent_hashes)
         # Once, at construction, so no request pays for it.
         self._unknown_user_hash = hash_password(secrets.token_urlsafe(24), self.cost)
+
+    async def _hash(self, password: str) -> str:
+        async with self._hash_slots:
+            return await asyncio.to_thread(hash_password, password, self.cost)
+
+    async def _verify(self, password: str, stored: str) -> bool:
+        async with self._hash_slots:
+            return await asyncio.to_thread(verify_password, password, stored)
 
     # --- accounts ---------------------------------------------------------
 
@@ -307,7 +325,7 @@ class OperatorStore:
     ) -> dict[str, Any]:
         name = normalise_username(username)
         check_password_policy(password, username=name)
-        password_hash = await asyncio.to_thread(hash_password, password, self.cost)
+        password_hash = await self._hash(password)
         try:
             async with self.engine.begin() as connection:
                 row = (
@@ -393,7 +411,7 @@ class OperatorStore:
         if username is None:
             raise AuthError("not_found", f"no operator {operator_id}")
         check_password_policy(password, username=str(username))
-        password_hash = await asyncio.to_thread(hash_password, password, self.cost)
+        password_hash = await self._hash(password)
         return await self._update(
             operator_id,
             "password_hash = :hash, password_changed_at = :now, "
@@ -493,8 +511,7 @@ class OperatorStore:
                     {"n": name},
                 )
             ).scalar_one_or_none()
-        password_ok = await asyncio.to_thread(
-            verify_password,
+        password_ok = await self._verify(
             password,
             self._unknown_user_hash if stored_hash is None else str(stored_hash),
         )

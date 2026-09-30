@@ -51,6 +51,7 @@ def build_app(settings: ApiSettings) -> FastAPI:
         idle_timeout_s=settings.session_idle_timeout_s,
         max_failed_logins=settings.login_max_failures,
         lockout_s=settings.login_lockout_s,
+        max_concurrent_hashes=settings.password_hash_concurrency,
     )
     app = create_api_app(
         registry,
