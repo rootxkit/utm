@@ -23,12 +23,13 @@ import secrets
 import sqlite3
 import threading
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
 from agent.framing import RECORD_HEADER_BYTES, Record
 
-__all__ = ["DEFAULT_QUEUE_MAX_BYTES", "DurableQueue"]
+__all__ = ["DEFAULT_QUEUE_MAX_BYTES", "DurableQueue", "QueueStats"]
 
 # 1 GiB. At the ~2.8 KiB/s per aircraft measured in ADR-001, three aircraft
 # fill this in roughly a day and a half of continuous disconnection.
@@ -52,6 +53,16 @@ _EPOCH = "epoch"
 _NEXT_SEQ = "next_seq"
 _DROPPED_INTAKE = "dropped_intake_total"
 _DROPPED_CAP = "dropped_cap_total"
+
+
+@dataclass(frozen=True, slots=True)
+class QueueStats:
+    """The counters `status` reports, as of the last committed change."""
+
+    depth: int
+    total_bytes: int
+    dropped_intake_total: int
+    dropped_cap_total: int
 
 
 class DurableQueue:
@@ -101,6 +112,15 @@ class DurableQueue:
         # disk refuses the write, so a failing disk cannot hide the loss it is
         # causing; the next commit that succeeds persists the total.
         self._dropped_intake: int = self._get_int(_DROPPED_INTAKE)
+        self._dropped_cap: int = self._get_int(_DROPPED_CAP)
+
+        # The counters are also published as an immutable snapshot under a
+        # lock of their own, which is never held across a statement. `status`
+        # reads that, so a status message is never queued behind the writer's
+        # fsync (S-03), and never sees a transaction that has not committed.
+        self._stats_lock = threading.Lock()
+        self._stats = QueueStats(0, 0, 0, 0)
+        self._publish_stats()
 
     # --- metadata ---------------------------------------------------------
 
@@ -145,15 +165,29 @@ class DurableQueue:
 
     # --- state ------------------------------------------------------------
 
+    def _publish_stats(self) -> None:
+        """Snapshot the working counters. Call with `_lock` held."""
+        snapshot = QueueStats(
+            depth=self._depth,
+            total_bytes=self._total_bytes,
+            dropped_intake_total=self._dropped_intake,
+            dropped_cap_total=self._dropped_cap,
+        )
+        with self._stats_lock:
+            self._stats = snapshot
+
+    def stats(self) -> QueueStats:
+        """The latest committed counters. Never waits for a database write."""
+        with self._stats_lock:
+            return self._stats
+
     @property
     def depth(self) -> int:
-        with self._lock:
-            return self._depth
+        return self.stats().depth
 
     @property
     def total_bytes(self) -> int:
-        with self._lock:
-            return self._total_bytes
+        return self.stats().total_bytes
 
     @property
     def next_seq(self) -> int:
@@ -185,13 +219,11 @@ class DurableQueue:
     @property
     def dropped_intake_total(self) -> int:
         """Intake drops reported so far, including any not yet on disk."""
-        with self._lock:
-            return self._dropped_intake
+        return self.stats().dropped_intake_total
 
     @property
     def dropped_cap_total(self) -> int:
-        with self._lock:
-            return self._get_int(_DROPPED_CAP)
+        return self.stats().dropped_cap_total
 
     # --- mutation ---------------------------------------------------------
 
@@ -210,6 +242,7 @@ class DurableQueue:
             return
         with self._lock:
             self._dropped_intake += count
+            self._publish_stats()
             try:
                 self._set_int(_DROPPED_INTAKE, self._dropped_intake)
                 self._connection.commit()
@@ -227,6 +260,7 @@ class DurableQueue:
             return
         with self._lock:
             self._dropped_intake += count
+            self._publish_stats()
 
     def append(self, datagrams: Sequence[tuple[int, bytes]]) -> list[Record]:
         """Assign sequence numbers to (recv_utc_ns, datagram) pairs and store them.
@@ -243,7 +277,11 @@ class DurableQueue:
             return []
 
         with self._lock:
-            depth, total_bytes = self._depth, self._total_bytes
+            depth, total_bytes, dropped_cap = (
+                self._depth,
+                self._total_bytes,
+                self._dropped_cap,
+            )
             try:
                 seq = self._get_int(_NEXT_SEQ)
                 records = [
@@ -267,8 +305,10 @@ class DurableQueue:
                 self._connection.commit()
             except sqlite3.Error:
                 self._depth, self._total_bytes = depth, total_bytes
+                self._dropped_cap = dropped_cap
                 self._rollback_locked()
                 raise
+            self._publish_stats()
 
         return records
 
@@ -296,7 +336,8 @@ class DurableQueue:
             dropped += 1
 
         if dropped:
-            self._set_int(_DROPPED_CAP, self._get_int(_DROPPED_CAP) + dropped)
+            self._dropped_cap += dropped
+            self._set_int(_DROPPED_CAP, self._dropped_cap)
 
     def read_from(self, seq: int, *, max_bytes: int) -> list[Record]:
         """Return stored records from `seq` onward, up to a byte budget.
@@ -364,6 +405,7 @@ class DurableQueue:
             # against records that are still on disk.
             self._depth -= count
             self._total_bytes -= freed
+            self._publish_stats()
         return count
 
     def close(self) -> None:

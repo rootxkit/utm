@@ -326,13 +326,20 @@ class Relay:
         return int((time.monotonic() - last) * 1000)
 
     def _status_message(self) -> dict[str, Any]:
+        """Built from cached counters only; runs on the event loop.
+
+        Nothing here may touch SQLite. The writer holds the queue's lock
+        across a FULL-synchronous commit, and a status queued behind that
+        fsync is a status the Gateway may count as missed (S-03).
+        """
         monotonic_ns, utc_ns = _now_pair()
+        stats = self._queue.stats()
         return {
             "type": "status",
-            "queue_depth": self._queue.depth,
-            "queue_bytes": self._queue.total_bytes,
-            "dropped_intake_total": self._queue.dropped_intake_total,
-            "dropped_cap_total": self._queue.dropped_cap_total,
+            "queue_depth": stats.depth,
+            "queue_bytes": stats.total_bytes,
+            "dropped_intake_total": stats.dropped_intake_total,
+            "dropped_cap_total": stats.dropped_cap_total,
             "last_datagram_age_ms": self._last_datagram_age_ms(),
             "storage_ok": self.storage_ok,
             "uptime_s": int(time.monotonic() - self._started_monotonic),
@@ -341,6 +348,7 @@ class Relay:
         }
 
     def _hello_message(self) -> dict[str, Any]:
+        """Reads SQLite, so it is called off the event loop (S-03)."""
         monotonic_ns, utc_ns = _now_pair()
         return {
             "type": "hello",
@@ -481,15 +489,20 @@ class Relay:
                     raise failure from None
                 raise
 
+    def _held_range(self) -> tuple[int, int]:
+        return self._queue.oldest_seq_held, self._queue.newest_seq_held
+
     async def _handshake(self, connection: ClientConnection) -> int:
-        await connection.send(json.dumps(self._hello_message()))
+        # Both reads query SQLite under the lock the writer holds while it
+        # syncs, so neither may run on the event loop.
+        hello = await asyncio.to_thread(self._hello_message)
+        await connection.send(json.dumps(hello))
         welcome = json.loads(await connection.recv())
         if welcome.get("type") != "welcome":
             raise ProtocolError(f"expected welcome, got {welcome.get('type')!r}")
 
         resume_from = int(welcome["resume_from_seq"])
-        oldest = self._queue.oldest_seq_held
-        newest = self._queue.newest_seq_held
+        oldest, newest = await asyncio.to_thread(self._held_range)
 
         # relay-v1 §11: the server claims records we never sent. Not a gap -
         # the two ends disagree about what they are discussing, and rebasing
