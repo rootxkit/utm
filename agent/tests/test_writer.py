@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from agent.config import RelayConfig
-from agent.queue import DurableQueue
+from agent.queue import DurableQueue, QueuePoisonedError
 from agent.relay import Relay, WriterDiedError
 from agent.udp import ReceiveOnlyUDPSocket
 from tests.ports import free_tcp_port, free_udp_port
@@ -425,3 +425,56 @@ def test_a_poisoned_queue_is_reported_as_storage_not_ok(tmp_path: Path) -> None:
     assert healthy["storage_ok"] is True
     assert durable_queue.poisoned
     assert poisoned["storage_ok"] is False
+
+
+def test_a_poisoned_queue_ends_the_uplink_instead_of_reconnecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every session would fail on the same queue; retrying cannot help."""
+    relay, durable_queue, _ = make_relay(tmp_path)
+    sessions = {"n": 0}
+
+    async def poisoned_session() -> None:
+        sessions["n"] += 1
+        raise QueuePoisonedError("a rollback failed")
+
+    monkeypatch.setattr(relay, "_session", poisoned_session)
+
+    with pytest.raises(QueuePoisonedError):
+        asyncio.run(asyncio.wait_for(relay.run_uplink(), timeout=10.0))
+    durable_queue.close()
+
+    assert sessions["n"] == 1
+
+
+def test_datagrams_intake_hands_off_while_stopping_are_counted(
+    tmp_path: Path,
+) -> None:
+    """Intake notices a stop only at its next receive timeout. Whatever it
+    hands off before then must not vanish uncounted into a queue nobody
+    drains."""
+    relay, durable_queue, config = make_relay(tmp_path)
+    udp = relay.start_intake()
+    send(config, 1)
+    wait_until(lambda: durable_queue.next_seq == 1)
+    fill_disk(durable_queue)
+    send(config, 1, first=1)
+    wait_until(lambda: not relay.storage_ok)
+
+    before_stop = time.monotonic()
+    relay._stop.set()
+    # Intake is blocked in receive, so it still takes this one.
+    send(config, 1, first=2)
+    relay.stop()
+    udp.close()
+
+    last = relay._last_datagram_monotonic
+    # >=, not >: the monotonic clock ticks every ~15 ms on Windows.
+    delivered_after_stop = 1 if last is not None and last >= before_stop else 0
+    reported = durable_queue.dropped_intake_total
+    left_behind = relay._intake.qsize()
+    durable_queue.close()
+
+    # The held batch, plus the late one if intake received it.
+    assert reported == 1 + delivered_after_stop
+    assert left_behind == 0

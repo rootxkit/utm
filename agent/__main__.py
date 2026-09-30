@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from agent.config import load_config, read_token
-from agent.queue import DurableQueue
+from agent.queue import DurableQueue, QueuePoisonedError
 from agent.relay import RELAY_VERSION, Relay, WriterDiedError
 from agent.udp import PortInUseError
 from common.config import ConfigurationError
@@ -87,8 +87,9 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(relay.run_uplink())
     except KeyboardInterrupt:
         bound.info("stopping on interrupt")
-    except WriterDiedError as error:
-        # Nothing received from here on would reach disk. Exiting lets a
+    except (WriterDiedError, QueuePoisonedError) as error:
+        # Nothing received from here on would reach disk, and a poisoned
+        # queue is cured only by a restart. Exiting lets a
         # supervisor, or the pilot, restart the relay; staying up would keep
         # the socket bound and the station looking alive while it drops
         # everything.

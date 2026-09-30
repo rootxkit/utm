@@ -30,7 +30,7 @@ from websockets.asyncio.client import ClientConnection
 
 from agent.config import RelayConfig
 from agent.framing import Record, encode_records
-from agent.queue import DurableQueue
+from agent.queue import DurableQueue, QueuePoisonedError
 from agent.udp import ReceiveOnlyUDPSocket
 from common.logging import BoundLogger, bind, get_logger
 
@@ -52,6 +52,10 @@ BATCH_MAX_BYTES = 64 * 1024
 # The writer's own batching: how many datagrams go into one SQLite commit.
 WRITER_BATCH_MAX_RECORDS = 1000
 WRITER_THREAD_NAME = "relay-writer"
+INTAKE_THREAD_NAME = "relay-intake"
+# How long a stopping writer waits for intake to notice the stop. Intake
+# checks at each receive timeout (ReceiveOnlyUDPSocket defaults to 0.5 s).
+INTAKE_JOIN_TIMEOUT_S = 2.0
 # Retry cadence while the durable queue refuses writes. Short at first, since
 # a transient lock or I/O error usually clears at once; capped so a full disk
 # is retried, and logged, every few seconds rather than in a tight loop.
@@ -228,14 +232,23 @@ class Relay:
                 continue
 
             self._set_storage_ok(False)
+            if self._queue.poisoned:
+                # No retry can succeed: only a restart gives a trustworthy
+                # connection. Raised out of the thread so that the relay
+                # exits instead of retrying forever while looking alive.
+                abandoned = self._abandon(held)
+                self._log.critical(
+                    "durable queue is poisoned; the relay must restart",
+                    extra={"abandoned": abandoned, "error": repr(failure)},
+                )
+                raise QueuePoisonedError(str(failure)) from failure
             if self._stop.is_set():
                 # Shutting down with a disk that refuses writes. The held
                 # batch and whatever is still waiting in intake never got a
                 # sequence number, so they are intake drops by §11's
                 # definition; counting them is all that can still be done.
                 # close() makes a last attempt to persist the count.
-                abandoned = len(held) + self._drain_intake()
-                self._queue.count_intake_drops(abandoned)
+                abandoned = self._abandon(held)
                 self._log.error(
                     "stopping with an unwritable queue; datagrams abandoned",
                     extra={"abandoned": abandoned, "error": repr(failure)},
@@ -252,6 +265,23 @@ class Relay:
             )
             self._wait_counting_drops(backoff_s)
             backoff_s = min(backoff_s * BACKOFF_FACTOR, WRITER_BACKOFF_MAX_S)
+
+    def _abandon(self, held: list[tuple[int, bytes]]) -> int:
+        """Count what the writer will never store as intake drops.
+
+        When stopping, waits for the intake thread first: it only notices the
+        stop at its next receive timeout, and anything it hands off before
+        then would otherwise land in a queue nobody drains, uncounted.
+        """
+        if self._stop.is_set():
+            for thread in self._threads:
+                if thread.name == INTAKE_THREAD_NAME:
+                    thread.join(timeout=INTAKE_JOIN_TIMEOUT_S)
+        abandoned = len(held) + self._drain_intake()
+        self._queue.count_intake_drops(abandoned)
+        # Drops intake made while it was still running.
+        self._transfer_pending_drops()
+        return abandoned
 
     def _drain_intake(self) -> int:
         drained = 0
@@ -304,6 +334,10 @@ class Relay:
     def _run_writer(self) -> None:
         try:
             self._writer_loop()
+        except QueuePoisonedError:
+            # Already logged where it was raised. The thread ends and the
+            # watchdog stops the relay.
+            return
         except BaseException as error:
             # Storage errors are handled inside the loop; reaching here is a
             # bug. Logged in the service's own format rather than as a bare
@@ -358,7 +392,7 @@ class Relay:
             extra={"host": self._config.bind_host, "port": self._config.bind_port},
         )
         for target, name in (
-            (lambda: self._intake_loop(udp), "relay-intake"),
+            (lambda: self._intake_loop(udp), INTAKE_THREAD_NAME),
             (self._run_writer, WRITER_THREAD_NAME),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
@@ -473,7 +507,8 @@ class Relay:
         """Connect, ship, reconnect. Runs until cancelled.
 
         Raises WriterDiedError if the writer thread stops while intake is
-        running; the process must not carry on as if it were healthy.
+        running, or QueuePoisonedError if the queue can no longer be trusted;
+        the process must not carry on as if it were healthy.
         """
         try:
             async with asyncio.TaskGroup() as tasks:
@@ -481,7 +516,7 @@ class Relay:
                 tasks.create_task(self._uplink_loop())
         except BaseExceptionGroup as group:
             failure = _first_exception(group)
-            if isinstance(failure, WriterDiedError):
+            if isinstance(failure, (WriterDiedError, QueuePoisonedError)):
                 self._log.critical(
                     "durable queue writer stopped; shutting the relay down",
                     extra={"error": str(failure)},
@@ -500,7 +535,9 @@ class Relay:
                 # Retrying a rejected credential just floods the log.
                 self._log.error("token rejected by the Gateway; not retrying")
                 raise
-            except WriterDiedError:
+            except (WriterDiedError, QueuePoisonedError):
+                # Reconnecting cannot help either: the sender would fail on
+                # the same queue every time.
                 raise
             except asyncio.CancelledError:
                 raise
