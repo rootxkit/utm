@@ -525,6 +525,7 @@ def test_every_vehicle_has_its_own_transmitter_address() -> None:
     addresses = {bridge.transmitter_for(s) for s in range(1, 300)}
     assert len(addresses) == 299
     assert bridge.transmitter_for(3) == "02:55:16:00:00:03"
+    assert bridge.transmitter_for(3, spoofing=True) != bridge.transmitter_for(3)
 
 
 # --- through the ingest --------------------------------------------------------

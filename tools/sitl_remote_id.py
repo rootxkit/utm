@@ -488,9 +488,16 @@ class FaultyLink:
         return out
 
 
-def transmitter_for(sysid: int) -> str:
-    """A locally administered address per SYSID, stable across runs."""
-    return f"02:55:16:00:{(sysid >> 8) & 0xFF:02x}:{sysid & 0xFF:02x}"
+def transmitter_for(sysid: int, *, spoofing: bool = False) -> str:
+    """A locally administered address per SYSID, stable across runs.
+
+    A spoofer is another radio, so it has another address. It also keeps the
+    ingest, which joins messages by address and remembers an identity for a
+    minute, from attaching the spoofed positions to the honest broadcast of
+    a run just before.
+    """
+    third = 0x17 if spoofing else 0x16
+    return f"02:55:{third:02x}:00:{(sysid >> 8) & 0xFF:02x}:{sysid & 0xFF:02x}"
 
 
 # --- the bridge ---------------------------------------------------------------
@@ -703,7 +710,8 @@ def main(
         )
         if address not in sources:
             sources[address] = connect(address)
-        vehicles.append(Vehicle(module, sources[address], transmitter_for(sysid)))
+        transmitter = transmitter_for(sysid, spoofing=args.spoof_serial is not None)
+        vehicles.append(Vehicle(module, sources[address], transmitter))
         claimed = f" (spoofing {args.spoof_serial})" if args.spoof_serial else ""
         print(f"SYSID {sysid} on {address} -> {serial}{claimed}")
 
