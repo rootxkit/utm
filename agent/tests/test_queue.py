@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from agent.framing import RECORD_HEADER_BYTES
-from agent.queue import DurableQueue
+from agent.queue import DurableQueue, QueuePoisonedError
 
 
 @pytest.fixture
@@ -430,14 +430,22 @@ def free_disk(queue: DurableQueue) -> None:
 class _FailingCommits:
     """A connection whose commit fails, as an fsync on a dying disk would."""
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self, connection: sqlite3.Connection, *, fail_rollback: bool = False
+    ) -> None:
         self._connection = connection
         self.failing = True
+        self.fail_rollback = fail_rollback
 
     def commit(self) -> None:
         if self.failing:
             raise sqlite3.OperationalError("disk I/O error")
         self._connection.commit()
+
+    def rollback(self) -> None:
+        if self.fail_rollback:
+            raise sqlite3.OperationalError("disk I/O error during rollback")
+        self._connection.rollback()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._connection, name)
@@ -574,3 +582,51 @@ def test_a_failed_append_that_evicted_for_the_cap_restores_the_cap_count(
 
     with DurableQueue(queue_path, max_bytes=record_size * 4) as reopened:
         assert reopened.dropped_cap_total == 1
+
+
+def test_a_failed_rollback_poisons_the_queue_against_any_further_use(
+    queue_path: Path,
+) -> None:
+    """Otherwise a later commit could make the failed batch durable after all,
+    beside its retry under different sequence numbers."""
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        failing = _FailingCommits(queue._connection, fail_rollback=True)
+        queue._connection = failing  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+        assert queue.poisoned
+
+        # The disk recovering does not make the connection trustworthy again.
+        failing.failing = False
+        failing.fail_rollback = False
+        with pytest.raises(QueuePoisonedError):
+            queue.append(datagrams(3))
+        with pytest.raises(QueuePoisonedError):
+            queue.read_from(0, max_bytes=1 << 20)
+        with pytest.raises(QueuePoisonedError):
+            queue.acknowledge(4)
+        with pytest.raises(QueuePoisonedError):
+            queue.record_intake_drops(2)
+        # Still counted, and still reported.
+        assert queue.dropped_intake_total == 2
+
+    # Closing discarded the open transaction; only what committed survives.
+    with DurableQueue(queue_path) as reopened:
+        assert not reopened.poisoned
+        assert reopened.depth == 5
+        assert [r.seq for r in reopened.append(datagrams(1))] == [5]
+
+
+def test_a_queue_whose_rollbacks_succeed_is_never_poisoned(queue_path: Path) -> None:
+    with DurableQueue(queue_path) as queue:
+        queue.append(datagrams(5))
+        failing = _FailingCommits(queue._connection)
+        queue._connection = failing  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError):
+            queue.append(datagrams(3))
+        failing.failing = False
+
+        assert not queue.poisoned
+        assert [r.seq for r in queue.append(datagrams(1))] == [5]

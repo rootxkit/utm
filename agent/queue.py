@@ -18,7 +18,6 @@ surfaced as a `gap`.
 
 from __future__ import annotations
 
-import contextlib
 import secrets
 import sqlite3
 import threading
@@ -29,7 +28,12 @@ from types import TracebackType
 
 from agent.framing import RECORD_HEADER_BYTES, Record
 
-__all__ = ["DEFAULT_QUEUE_MAX_BYTES", "DurableQueue", "QueueStats"]
+__all__ = [
+    "DEFAULT_QUEUE_MAX_BYTES",
+    "DurableQueue",
+    "QueuePoisonedError",
+    "QueueStats",
+]
 
 # 1 GiB. At the ~2.8 KiB/s per aircraft measured in ADR-001, three aircraft
 # fill this in roughly a day and a half of continuous disconnection.
@@ -53,6 +57,10 @@ _EPOCH = "epoch"
 _NEXT_SEQ = "next_seq"
 _DROPPED_INTAKE = "dropped_intake_total"
 _DROPPED_CAP = "dropped_cap_total"
+
+
+class QueuePoisonedError(sqlite3.Error):
+    """A rollback failed, so the connection's transaction state is unknown."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +129,8 @@ class DurableQueue:
         self._stats_lock = threading.Lock()
         self._stats = QueueStats(0, 0, 0, 0)
         self._publish_stats()
+        # Set, never cleared, when a rollback fails (see _rollback_locked).
+        self._poisoned = False
 
     # --- metadata ---------------------------------------------------------
 
@@ -243,6 +253,7 @@ class DurableQueue:
         with self._lock:
             self._dropped_intake += count
             self._publish_stats()
+            self._check_usable_locked()
             try:
                 self._set_int(_DROPPED_INTAKE, self._dropped_intake)
                 self._connection.commit()
@@ -277,6 +288,7 @@ class DurableQueue:
             return []
 
         with self._lock:
+            self._check_usable_locked()
             depth, total_bytes, dropped_cap = (
                 self._depth,
                 self._total_bytes,
@@ -313,11 +325,32 @@ class DurableQueue:
         return records
 
     def _rollback_locked(self) -> None:
-        # A failed commit can leave the transaction open, and the next
-        # statement would silently join it. If the rollback fails too there is
-        # nothing better to do than let the original error speak.
-        with contextlib.suppress(sqlite3.Error):
+        """Discard a failed transaction, or poison the connection trying.
+
+        A failed commit can leave the transaction open, and the next statement
+        would silently join it. If the rollback fails too, the transaction's
+        fate is unknown: a later commit on this connection could make the
+        failed batch durable after all, beside its retry under different
+        sequence numbers. So the connection refuses all further use.
+        """
+        try:
             self._connection.rollback()
+        except sqlite3.Error:
+            with self._stats_lock:
+                self._poisoned = True
+
+    def _check_usable_locked(self) -> None:
+        if self.poisoned:
+            raise QueuePoisonedError(
+                "a rollback failed; the durable queue refuses further use "
+                "until the relay is restarted"
+            )
+
+    @property
+    def poisoned(self) -> bool:
+        """True once a rollback has failed. Restarting the relay clears it."""
+        with self._stats_lock:
+            return self._poisoned
 
     def _enforce_cap_locked(self) -> None:
         if self._total_bytes <= self._max_bytes:
@@ -357,6 +390,9 @@ class DurableQueue:
         records: list[Record] = []
         budget = 0
         with self._lock:
+            # A poisoned connection may still see the failed batch in its
+            # open transaction, and those records must never be sent.
+            self._check_usable_locked()
             cursor = self._connection.execute(
                 "SELECT seq, recv_utc_ns, datagram, nbytes FROM records "
                 "WHERE seq >= ? ORDER BY seq LIMIT ?",
@@ -386,6 +422,7 @@ class DurableQueue:
         already passed is harmless and deletes nothing.
         """
         with self._lock:
+            self._check_usable_locked()
             try:
                 rows = self._connection.execute(
                     "SELECT COUNT(*), COALESCE(SUM(nbytes), 0) FROM records "
@@ -410,7 +447,9 @@ class DurableQueue:
 
     def close(self) -> None:
         with self._lock:
-            self._connection.commit()
+            if not self.poisoned:
+                self._connection.commit()
+            # Closing discards whatever a poisoned connection still had open.
             self._connection.close()
 
     def __enter__(self) -> DurableQueue:

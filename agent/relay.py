@@ -279,6 +279,8 @@ class Relay:
     @property
     def storage_ok(self) -> bool:
         """False while the durable queue is refusing writes."""
+        if self._queue.poisoned:
+            return False
         with self._counters_lock:
             return self._storage_ok
 

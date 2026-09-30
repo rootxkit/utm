@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import socket
+import sqlite3
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -247,3 +248,34 @@ def test_no_status_leaves_after_the_writer_has_died(
     durable_queue.close()
 
     assert connection.sent == []
+
+
+class _BrokenRollbacks:
+    """Commit and rollback both fail, so the queue must poison itself."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def rollback(self) -> None:
+        raise sqlite3.OperationalError("disk I/O error during rollback")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def test_a_poisoned_queue_is_reported_as_storage_not_ok(tmp_path: Path) -> None:
+    relay, durable_queue, _ = make_relay(tmp_path)
+    healthy = relay._status_message()
+    real_connection = durable_queue._connection
+    durable_queue._connection = _BrokenRollbacks(real_connection)  # type: ignore[assignment]
+    with pytest.raises(sqlite3.Error):
+        durable_queue.append([(1, b"x")])
+    poisoned = relay._status_message()
+    real_connection.close()
+
+    assert healthy["storage_ok"] is True
+    assert durable_queue.poisoned
+    assert poisoned["storage_ok"] is False
