@@ -22,6 +22,7 @@ from api.live import RedisLiveState
 from api.ratelimit import LoginRateLimiter
 from api.registry import FleetRegistry
 from api.replay import ReplayStore
+from api.uas_registry import UasRegistry
 from common import configure_logging, load_settings
 from common.terrain import Terrain
 from gateway.binding import BindingResolver
@@ -53,8 +54,14 @@ def build_app(settings: ApiSettings) -> FastAPI:
         lockout_s=settings.login_lockout_s,
         max_concurrent_hashes=settings.password_hash_concurrency,
     )
+    uas = UasRegistry(
+        engine=engine,
+        projection=registry.projection,
+        registration_pattern=settings.registration_pattern,
+    )
     app = create_api_app(
         registry,
+        uas=uas,
         auth=operators,
         feed_secret=settings.feed_ticket_secret.get_secret_value().encode("utf-8"),
         feed_ticket_ttl_s=settings.feed_ticket_ttl_s,

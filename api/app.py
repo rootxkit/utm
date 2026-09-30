@@ -28,18 +28,18 @@ from pydantic import BaseModel, Field
 from api.assets import STATIC, mount_map_assets
 from api.auth import Operator, Role
 from api.auth_http import AccountStore, Authenticator, auth_router, require
+from api.http_errors import registry_http as _http
 from api.ratelimit import LoginRateLimiter
 from api.registry import (
     AirframeParams,
-    ConflictError,
     DroneStatus,
     FleetRegistry,
-    NotFoundError,
     PilotStatus,
-    ProjectionIncompleteError,
     RegistryError,
 )
 from api.replay import DroneNotFoundError, ReplayError, ReplayStore, WindowTooLargeError
+from api.uas_registry import UasRegistry
+from api.uas_routes import uas_router
 from api.zones import ZoneReader
 from common.terrain import Terrain
 
@@ -157,21 +157,6 @@ class EventOut(BaseModel):
     payload: dict[str, Any]
 
 
-def _http(error: RegistryError) -> HTTPException:
-    """A stable `code` to branch on and a message for people. Neither ever
-    carries the database's own error text (`api.registry._refused`)."""
-    detail = {"code": error.code, "message": str(error)}
-    if isinstance(error, NotFoundError):
-        return HTTPException(status_code=404, detail=detail)
-    if isinstance(error, ConflictError):
-        return HTTPException(status_code=409, detail=detail)
-    if isinstance(error, ProjectionIncompleteError):
-        # The change was made; its effect on telemetry was not. A retry
-        # completes it, which is what 503 tells a client.
-        return HTTPException(status_code=503, detail=detail)
-    return HTTPException(status_code=400, detail=detail)
-
-
 def _replay_http(error: ReplayError) -> HTTPException:
     if isinstance(error, DroneNotFoundError):
         return HTTPException(status_code=404, detail=str(error))
@@ -202,6 +187,7 @@ def create_api_app(
     console_app_dir: Path | None = None,
     terrain: Terrain | None = None,
     login_limiter: LoginRateLimiter | None = None,
+    uas: UasRegistry | None = None,
 ) -> FastAPI:
     """The API. `auth` is required: there is no way to build it open.
 
@@ -328,6 +314,11 @@ def create_api_app(
             return await registry.retire_drone(drone_id, actor=operator.actor)
         except RegistryError as error:
             raise _http(error) from error
+
+    # --- UAS operator registry (U-01) --------------------------------------------
+
+    # Always routed, so the schema carries them; without `uas` they answer 503.
+    app.include_router(uas_router(uas, auth))
 
     # --- airspace (P6-01) ------------------------------------------------------
 

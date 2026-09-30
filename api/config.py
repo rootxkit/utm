@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 
 from common import NatsSettings, PostgresSettings, RedisSettings, ServiceSettings
 from common.config import Environment, TelemetryDatabaseSettings
 
 # The feed secret that ships in infra/.env.example. Refused outside dev.
 _EXAMPLE_FEED_SECRET_PREFIX = "dev-only-"
+
+# U-01. A country code and letters and digits; see `ApiSettings`.
+DEFAULT_REGISTRATION_PATTERN = r"^[A-Z]{3}[A-Za-z0-9]{8,16}$"
 
 
 class FeedTicketSettings(ServiceSettings):
@@ -167,6 +171,28 @@ class ApiSettings(
     replay_max_flight_window_s: float = Field(
         default=90 * 86400.0, gt=0, validation_alias="REPLAY_MAX_FLIGHT_WINDOW_S"
     )
+    # U-01. What a UAS operator registration number must look like. The EU
+    # number is a three-letter country code and alphanumerics (16 characters
+    # in all, per EASA); Georgia's format is not confirmed, so the default is
+    # loose. Matched against the whole value.
+    uas_operator_registration_pattern: str = Field(
+        default=DEFAULT_REGISTRATION_PATTERN,
+        min_length=1,
+        validation_alias="UAS_OPERATOR_REGISTRATION_PATTERN",
+    )
+
+    @field_validator("uas_operator_registration_pattern")
+    @classmethod
+    def _pattern_compiles(cls, value: str) -> str:
+        try:
+            re.compile(value)
+        except re.error as error:
+            raise ValueError(f"not a regular expression: {error}") from error
+        return value
+
+    @property
+    def registration_pattern(self) -> re.Pattern[str]:
+        return re.compile(self.uas_operator_registration_pattern)
 
 
 class ConsoleSettings(ProxySettings, FeedTicketSettings, NatsSettings):

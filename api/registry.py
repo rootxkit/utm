@@ -94,6 +94,13 @@ class ConflictError(RegistryError):
         super().__init__("conflict", message, code=code)
 
 
+class InvalidError(RegistryError):
+    """A value the registry does not accept, found before any write."""
+
+    def __init__(self, message: str, *, code: str = "invalid_value") -> None:
+        super().__init__("invalid", message, code=code)
+
+
 class ProjectionIncompleteError(RegistryError):
     """The relational change committed; the telemetry projection did not
     follow. Repeating the request finishes it."""
@@ -113,7 +120,7 @@ _CONSTRAINT_REFUSALS = {
 }
 
 
-def _refused(entity: str, name: str, error: IntegrityError) -> ConflictError:
+def refused(entity: str, name: str, error: IntegrityError) -> ConflictError:
     """A stable refusal for the client, and the database's detail in the log."""
     sqlstate = getattr(error.orig, "sqlstate", None)
     code, reason = _CONSTRAINT_REFUSALS.get(
@@ -131,6 +138,34 @@ def _refused(entity: str, name: str, error: IntegrityError) -> ConflictError:
         },
     )
     return ConflictError(f"{entity} {name!r} refused: {reason}", code=code)
+
+
+async def audit(
+    connection: AsyncConnection,
+    entity_type: str,
+    entity_id: UUID,
+    event_type: str,
+    payload: Mapping[str, Any],
+    *,
+    actor: Actor,
+) -> None:
+    """Write one `events` row on `connection`, inside the caller's transaction."""
+    await connection.execute(
+        sa.text(
+            "INSERT INTO events "
+            "(actor_type, actor_id, entity_type, entity_id, event_type, payload) "
+            "VALUES (:actor_type, :actor_id, :entity_type, :entity_id, "
+            "        :event_type, CAST(:payload AS jsonb))"
+        ),
+        {
+            "actor_type": actor.actor_type,
+            "actor_id": actor.actor_id,
+            "entity_type": entity_type,
+            "entity_id": str(entity_id),
+            "event_type": event_type,
+            "payload": json.dumps(payload, default=str),
+        },
+    )
 
 
 class TelemetryProjection(Protocol):
@@ -241,21 +276,8 @@ class FleetRegistry:
         *,
         actor: Actor,
     ) -> None:
-        await connection.execute(
-            sa.text(
-                "INSERT INTO events "
-                "(actor_type, actor_id, entity_type, entity_id, event_type, payload) "
-                "VALUES (:actor_type, :actor_id, :entity_type, :entity_id, "
-                "        :event_type, CAST(:payload AS jsonb))"
-            ),
-            {
-                "actor_type": actor.actor_type,
-                "actor_id": actor.actor_id,
-                "entity_type": entity_type,
-                "entity_id": str(entity_id),
-                "event_type": event_type,
-                "payload": json.dumps(payload, default=str),
-            },
+        await audit(
+            connection, entity_type, entity_id, event_type, payload, actor=actor
         )
 
     async def events(
@@ -345,7 +367,7 @@ class FleetRegistry:
                 )
                 return base
         except IntegrityError as error:
-            raise _refused("base", name, error) from error
+            raise refused("base", name, error) from error
 
     async def list_bases(self) -> list[dict[str, Any]]:
         async with self.engine.connect() as connection:
@@ -387,7 +409,7 @@ class FleetRegistry:
                 )
                 return pilot
         except IntegrityError as error:
-            raise _refused("pilot", name, error) from error
+            raise refused("pilot", name, error) from error
 
     async def list_pilots(self) -> list[dict[str, Any]]:
         async with self.engine.connect() as connection:
@@ -473,7 +495,7 @@ class FleetRegistry:
                     drone["id"], label, serial=drone["serial"]
                 )
         except IntegrityError as error:
-            raise _refused("drone", label, error) from error
+            raise refused("drone", label, error) from error
         _log.info(
             "drone registered", extra={"drone_id": str(drone["id"]), "label": label}
         )
