@@ -44,6 +44,7 @@ def payload(
             "label": f"D{drone_id.int}",
             "ts": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
             "rx_ts": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
+            "captured_at": datetime.fromtimestamp(at_s, tz=UTC).isoformat(),
             "backlog": backlog,
             "station_id": "gs-1",
             "lat_deg": LAT0 + 0.001 * north_m / n1,

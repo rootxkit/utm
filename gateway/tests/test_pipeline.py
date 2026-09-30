@@ -12,7 +12,7 @@ tests - but the pipeline's obligations to the transport above it:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
@@ -120,6 +120,7 @@ class FakePublisher:
         self.unclaimed: list[SourceId] = []
         self.rx_ts: list[datetime | None] = []
         self.backlog: list[bool] = []
+        self.captured_at: list[datetime | None] = []
 
     async def publish_rows(
         self,
@@ -130,6 +131,7 @@ class FakePublisher:
         *,
         rx_ts: datetime | None = None,
         backlog: list[bool] | None = None,
+        captured_at: list[datetime] | None = None,
     ) -> None:
         self.rows.extend(rows)
         self.labels = labels or {}
@@ -137,6 +139,9 @@ class FakePublisher:
         self.firmware = firmware or {}
         self.rx_ts.extend([rx_ts] * len(rows))
         self.backlog.extend(backlog if backlog is not None else [False] * len(rows))
+        self.captured_at.extend(
+            captured_at if captured_at is not None else [None] * len(rows)
+        )
 
     async def publish_unclaimed(
         self, station_id: str, resolution: Resolution, source_id: SourceId
@@ -254,6 +259,62 @@ async def test_records_up_to_newest_seq_held_are_backlog_and_the_rest_live() -> 
 
     assert len(rows) == 6
     assert publisher.backlog == [True, True, True, False, False, False]
+
+
+async def test_rows_in_one_batch_are_placed_by_their_spacing_ending_at_rx_ts() -> None:
+    """S-11. Two positions 5 s apart on the relay's clock, in one frame: the
+    newer lands at `rx_ts`, the older 5 s before it, whatever the relay's
+    clock read (it read noon; the Gateway's read 12:00:30)."""
+    pipeline, _, _, publisher = build()
+    received = datetime(2026, 9, 24, 12, 0, 30, tzinfo=UTC)
+    pipeline.wall = lambda: received
+
+    rows = await pipeline.process(
+        EPOCH,
+        [
+            record(0, heartbeat()),
+            record(1, position()),
+            record(2, position(), offset_ns=5_000_000_000),
+        ],
+    )
+
+    assert len(rows) == 2
+    assert publisher.captured_at == [received - timedelta(seconds=5), received]
+    assert publisher.rx_ts == [received, received]
+    assert pipeline.span_clamped == 0
+
+
+async def test_a_spacing_beyond_the_batch_span_is_clamped_and_counted() -> None:
+    """A station clock that stepped 10 minutes inside one batch would place
+    a row 10 minutes back; it is placed at the 120 s clamp instead."""
+    pipeline, _, _, publisher = build()
+    received = datetime(2026, 9, 24, 12, 0, 30, tzinfo=UTC)
+    pipeline.wall = lambda: received
+
+    await pipeline.process(
+        EPOCH,
+        [
+            record(0, heartbeat()),
+            record(1, position()),
+            record(2, position(), offset_ns=600_000_000_000),
+        ],
+    )
+
+    assert publisher.captured_at == [received - timedelta(seconds=120), received]
+    assert pipeline.span_clamped == 1
+
+
+async def test_every_record_is_backlog_while_the_session_is_draining() -> None:
+    """S-11. Captured during the session (seq past `newest_seq_held`), but
+    the relay is still working off its queue: stale on arrival, so backlog.
+    The same batch with the drain over is live."""
+    pipeline, _, _, publisher = build()
+    batch = [record(0, heartbeat())] + [record(seq, position()) for seq in (5, 6)]
+
+    await pipeline.process(EPOCH, batch, newest_seq_held=3, draining=True)
+    await pipeline.process(EPOCH, batch, newest_seq_held=3, draining=False)
+
+    assert publisher.backlog == [True, True, False, False]
 
 
 async def test_messages_that_are_not_on_the_hot_path_emit_no_row() -> None:

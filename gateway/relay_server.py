@@ -63,6 +63,19 @@ STATION_REPORT_INTERVAL_S: Final = 1.0
 # protocol-conformance failure is once the connection is already open.
 _CLOSE_PROTOCOL_ERROR: Final = 1008
 
+# S-11. A data frame at least this large means the relay is draining a
+# queue: relay-v1 §6 flushes a batch at 100 ms or 64 KiB, whichever is first,
+# and 100 ms of live traffic is under 1 KiB for three aircraft at §10's
+# 8.4 KiB/s (about 8 KiB even for thirty), so half the size bound is only
+# reached when far more than 100 ms of records were waiting.
+DRAIN_FRAME_BYTES: Final = 32 * 1024
+# S-11. A reported `status.queue_depth` (§8: records awaiting
+# acknowledgement) above this means the same. Live depth is about one
+# acknowledgement interval of records, roughly 250 for three aircraft at
+# 84 Hz; a thousand is four intervals behind, and a drain after even a 30 s
+# outage holds several thousand.
+DRAIN_QUEUE_DEPTH: Final = 1000
+
 _AUTHORIZATION_SCHEME: Final = "Bearer "
 
 # protocol §2 and §14: the path carries the major version. A relay speaking
@@ -88,12 +101,16 @@ class RecordProcessor(Protocol):
         records: list[Record],
         *,
         newest_seq_held: int = -1,
+        draining: bool = False,
     ) -> None:
         """`newest_seq_held` is what the delivering session's `hello`
         declared (relay-v1 §5): records with a seq at or below it were on
         the relay's disk before this connection, so they are backlog; those
         past it were captured while the connection was up. -1 (the
-        default, for callers without a session) makes every record live."""
+        default, for callers without a session) makes every record live.
+        `draining` says the session is still working off a queue (see
+        `_Session.draining`): records captured meanwhile are also stale by
+        the time they arrive, and are backlog too."""
         ...
 
 
@@ -155,6 +172,9 @@ class RelayServer:
     port: int = 8081
 
     ack_interval_s: float = ACK_INTERVAL_S
+    # S-11. Records awaiting acknowledgement above which a session counts
+    # as draining (see `_Session.draining`).
+    drain_queue_depth: int = DRAIN_QUEUE_DEPTH
     station_report_interval_s: float = STATION_REPORT_INTERVAL_S
     unreachable_after_s: float = 3.0
     radio_silent_after_ms: int = 3_000
@@ -406,6 +426,17 @@ class _Session:
     # What `hello` declared as the newest record on the relay's disk. A gap
     # cannot end beyond it: the records past it were never assigned.
     newest_seq_held: int = -1
+    # S-11. Whether the relay is still working off a queue. While it is,
+    # records captured during this session reach here seconds to minutes
+    # late (relay-v1 §10: drain barely exceeds intake), and must not be
+    # taken as the present. Two clock-free signals say so: a frame near the
+    # 64 KiB size bound, which §6 only produces when there is more than
+    # 100 ms of records waiting, and a `status.queue_depth` (§8, records
+    # awaiting acknowledgement) above `RelayServer.drain_queue_depth`. It
+    # ends when a frame arrives well under the bound and the last reported
+    # depth is back under the threshold.
+    draining: bool = False
+    _last_queue_depth: int | None = None
 
     def __post_init__(self) -> None:
         # The highest seq durably stored for this epoch, cumulative. -1 means
@@ -475,6 +506,7 @@ class _Session:
             records = decode_records(frame)
         if not records:
             return
+        self._note_frame_size(len(frame))
         with timings.measure("store"):
             stored = await self.server.store.store_records(
                 self.station_id, self.epoch, records
@@ -500,16 +532,53 @@ class _Session:
                     self.epoch,
                     stored.stored,
                     newest_seq_held=self.newest_seq_held,
+                    draining=self.draining,
                 )
         timings.count("batches", 1)
         timings.count("records", len(stored.stored))
         timings.report_if_due()
+
+    def _note_frame_size(self, frame_bytes: int) -> None:
+        """Update `draining` from a data frame's size (§6). A frame at or
+        above `DRAIN_FRAME_BYTES` starts a drain; one under it ends the
+        drain only once the reported queue depth is under the threshold
+        too, so a relay that sends small frames while still deep in its
+        queue stays flagged."""
+        if frame_bytes >= DRAIN_FRAME_BYTES:
+            if not self.draining:
+                self.log.info(
+                    "relay is draining a queue; its records are backlog",
+                    extra={"frame_bytes": frame_bytes},
+                )
+            self.draining = True
+        elif self.draining and (
+            self._last_queue_depth is None
+            or self._last_queue_depth <= self.server.drain_queue_depth
+        ):
+            self.log.info(
+                "relay has drained its queue; its records are live",
+                extra={"queue_depth": self._last_queue_depth},
+            )
+            self.draining = False
+
+    def _note_queue_depth(self, queue_depth: int) -> None:
+        """Update `draining` from a `status` (§8). A deep queue starts a
+        drain; a shallow one does not end it by itself, since the frames in
+        flight were read while it was deep."""
+        self._last_queue_depth = queue_depth
+        if queue_depth > self.server.drain_queue_depth and not self.draining:
+            self.log.info(
+                "relay reports a deep queue; its records are backlog",
+                extra={"queue_depth": queue_depth},
+            )
+            self.draining = True
 
     async def _handle_control(self, payload: str) -> None:
         message = parse_control_message(payload)
         now_s = time.monotonic()
 
         if isinstance(message, Status):
+            self._note_queue_depth(message.queue_depth)
             if self.superseded:
                 # The tracker is shared and belongs to the current session.
                 # A status from a superseded socket would move its baseline

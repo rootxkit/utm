@@ -28,18 +28,22 @@ the Gateway's own receive time, since the broadcast's `seconds_after_hour`
 is decoded but not yet carried, so a Remote ID position is stamped when it
 reached the Gateway, not when the aircraft measured it. `rx_ts` is when the
 Gateway received the batch, on the Gateway's clock: one clock for every
-station. A track is placed at `rx_ts`, so two aircraft on two stations are
-compared at one instant without guessing either station's skew, and a
-pair's CPA is computed at the later of the two with the older track
-advanced along its velocity (`cpa.advance`): a neighbour's 5 s old sample,
-used as if current, is 75 m wrong at 15 m/s against a 60 m threshold. A
-neighbour older than `neighbour_max_age_s` is not advanced at all, and the
-pair is not evaluated by that message: neither refreshed nor shown clear,
-since silence is not evidence.
+station. `captured_at` is where the Gateway placed the row on that clock:
+`rx_ts` less how far behind its batch's newest record it was captured, so a
+draining relay's 8 s frame does not land as one instant. A track is placed
+at `captured_at`, so two aircraft on two stations are compared at one
+instant without guessing either station's skew, and a pair's CPA is
+computed at the later of the two with the older track advanced along its
+velocity (`cpa.advance`): a neighbour's 5 s old sample, used as if current,
+is 75 m wrong at 15 m/s against a 60 m threshold. A neighbour older than
+`neighbour_max_age_s` is not advanced at all, and the pair is not evaluated
+by that message: neither refreshed nor shown clear, since silence is not
+evidence.
 
 Whether a message is a replayed backlog is the Gateway's verdict, not an
 estimate: `backlog` is true for records that were queued on the relay before
-the session that delivered them (`newest_seq_held`, relay-v1 §5). Those are
+the session that delivered them (`newest_seq_held`, relay-v1 §5), and for
+records that arrived while the relay was still draining a queue. Those are
 counted and not evaluated: they must not raise an alert about where an
 aircraft was minutes ago. Nothing here infers a backlog from `ts`, so a
 station clock that is wrong by any amount, or a Gateway that is behind
@@ -202,6 +206,15 @@ def received_at_s(message: dict[str, Any]) -> float | None:
     return time_field_s(message, "rx_ts")
 
 
+def placed_at_s(message: dict[str, Any]) -> float | None:
+    """Where the Gateway placed the row in time (`captured_at`: `rx_ts` less
+    how far behind its batch's newest record it was captured, so rows from
+    one large frame are not all "now"); `rx_ts` when the message has no
+    finer placement; None when it has neither."""
+    placed = time_field_s(message, "captured_at")
+    return received_at_s(message) if placed is None else placed
+
+
 def is_backlog(message: dict[str, Any]) -> bool:
     """The Gateway's verdict that the record was queued before the session
     that delivered it (`gateway/README.md`). Absent means live."""
@@ -226,7 +239,7 @@ def track_from_telemetry(
     for name, value in values.items():
         if not math.isfinite(value):
             raise ValueError(f"{name} is not finite: {value}")
-    received = received_at_s(message)
+    received = placed_at_s(message)
     return Track(
         drone_id=UUID(str(message["drone_id"])),
         lat_deg=values["lat_deg"],
@@ -483,7 +496,10 @@ class AirspaceMonitor:
         rejections, so a backlog of thousands is one line, not thousands;
         the totals go in the service's status line.
         """
-        delay_s = now_s - track.captured_at_s
+        # Lateness is judged on the batch's receive time, not on where the
+        # row was placed within the batch.
+        received = received_at_s(message)
+        delay_s = now_s - (track.captured_at_s if received is None else received)
         last = self._last_by_source_s.get((track.drone_id, track.source))
         if is_backlog(message):
             reason = "backlog"

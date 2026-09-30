@@ -43,6 +43,7 @@ def message(
     rx_at_s: float | None = None,
     backlog: bool = False,
     with_rx: bool = True,
+    captured_at_s: float | None = None,
 ) -> dict[str, Any]:
     """A message as the Gateway publishes it: captured at `at_s` (epoch
     seconds) on `station`'s clock (`ts`), received by the Gateway at
@@ -58,6 +59,11 @@ def message(
         **(
             {"rx_ts": datetime.fromtimestamp(rx_s, tz=UTC).isoformat()}
             if with_rx
+            else {}
+        ),
+        **(
+            {"captured_at": datetime.fromtimestamp(captured_at_s, tz=UTC).isoformat()}
+            if captured_at_s is not None
             else {}
         ),
         "backlog": backlog,
@@ -522,19 +528,43 @@ def test_review_scenario_3_one_future_stamped_ts_changes_nothing_after_it() -> N
 
 def test_a_gateway_that_is_behind_yields_late_alerts_not_none() -> None:
     """ADR-002: the Gateway is 47.6 s behind the relay, so `ts` is 47.6 s
-    older than `rx_ts`. The track is placed at `rx_ts` and alerts."""
+    older than `rx_ts`, and one large frame carries both aircraft: A's
+    sample captured 5 s before B's, under one `rx_ts`. Each is placed at
+    its `captured_at`, so A is advanced 5 s and the pair alerts at 25 s,
+    not at the 27.5 s that treating the frame as one instant would give."""
     monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
     lag_s = 47.6
-    for wall_s in (100.0, 101.0):
-        monitor.observe(
-            message(A, 10 * (wall_s - 100), vn=10, at_s=wall_s - lag_s, rx_at_s=wall_s),
-            now_s=wall_s,
-        )
+    rx_s = 101.0
+    monitor.observe(
+        message(A, 0, vn=10, at_s=96.0 - lag_s, rx_at_s=rx_s, captured_at_s=96.0),
+        now_s=rx_s,
+    )
     raised = monitor.observe(
-        message(B, 510, vn=-10, at_s=101.0 - lag_s, rx_at_s=101.0), now_s=101.0
+        message(B, 550, vn=-10, at_s=101.0 - lag_s, rx_at_s=rx_s, captured_at_s=101.0),
+        now_s=rx_s,
     ).raised
     assert [alert.kind for alert in raised] == [AlertKind.CONFLICT]
+    assert raised[0].detail["t_cpa_s"] == 25.0
+    assert raised[0].detail["d_horizontal_now_m"] == 500.0
     assert monitor.rejected == 0
+
+
+def test_placement_prefers_captured_at_and_lateness_uses_rx_ts() -> None:
+    """A row placed 8 s behind its batch's `rx_ts` is not late: the batch
+    reached us at once. The late window judges `rx_ts`; the position sits
+    at `captured_at`."""
+    monitor = AirspaceMonitor(policy=POLICY, live_max_age_s=10.0)
+    monitor.observe(
+        message(A, 0, at_s=100.0, rx_at_s=108.0, captured_at_s=100.0), now_s=108.5
+    )
+    held = monitor.index.track(A)
+    assert held is not None and held.captured_at_s == 100.0
+    assert monitor.rejected_late == 0
+    # The same row reaching us 11 s after its batch was received is late.
+    monitor.observe(
+        message(A, 0, at_s=101.0, rx_at_s=109.0, captured_at_s=101.0), now_s=120.0
+    )
+    assert monitor.rejected_late == 1
 
 
 @pytest.mark.parametrize(("behind_s", "alerts"), [(9.0, 1), (10.5, 0)])

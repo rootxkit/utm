@@ -938,6 +938,7 @@ class RecordingProcessor:
     # What each batch's session declared in `hello`, so the pipeline can
     # tell backlog from live (S-11).
     newest_seq_held: list[int] = field(default_factory=list)
+    draining: list[bool] = field(default_factory=list)
 
     async def process(
         self,
@@ -946,9 +947,97 @@ class RecordingProcessor:
         records: list[Record],
         *,
         newest_seq_held: int = -1,
+        draining: bool = False,
     ) -> None:
         self.batches.append([record.seq for record in records])
         self.newest_seq_held.append(newest_seq_held)
+        self.draining.append(draining)
+
+
+def big_batch(first_seq: int, count: int) -> bytes:
+    """A frame at the relay's size bound: `count` records of 1 KiB, as a
+    draining relay sends them (relay-v1 §6)."""
+    return encode_records(
+        [
+            RelayRecord(
+                seq=first_seq + n,
+                recv_utc_ns=1_758_412_800_000_000_000 + n,
+                datagram=bytes([n % 256]) * 1024,
+            )
+            for n in range(count)
+        ]
+    )
+
+
+async def drain_and_settle(connection: Any, last_seq: int) -> None:
+    ack = await read_until(connection, "ack")
+    while ack["seq"] < last_seq:
+        ack = await read_until(connection, "ack")
+
+
+async def test_records_are_backlog_while_the_relay_drains_and_live_after() -> None:
+    """S-11. Frames at the size bound mean the relay has more than 100 ms
+    of records waiting (§6): the session is draining, and the records are
+    stale on arrival. The first small frame after a `status` showing the
+    queue back under the threshold ends it."""
+    processor = RecordingProcessor()
+    async with (
+        running(
+            processor=processor, ack_interval_s=0.05, drain_queue_depth=100
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+        await connection.send(big_batch(0, 60))  # 60 KiB: draining
+        await connection.send(big_batch(60, 60))
+        await connection.send(status(queue_depth=5000))
+        await connection.send(batch(120, 5))  # small, but the queue is deep
+        await connection.send(status(queue_depth=20))
+        await connection.send(batch(125, 5))  # small and shallow: live
+        await connection.send(batch(130, 5))
+        await drain_and_settle(connection, 134)
+
+    assert [b[0] for b in processor.batches] == [0, 60, 120, 125, 130]
+    assert processor.draining == [True, True, True, False, False]
+
+
+async def test_a_deep_queue_alone_marks_the_session_draining() -> None:
+    """§8: `queue_depth` is records awaiting acknowledgement. A relay that
+    reports thousands is behind whatever its frame sizes say."""
+    processor = RecordingProcessor()
+    async with (
+        running(
+            processor=processor, ack_interval_s=0.05, drain_queue_depth=100
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+        await connection.send(batch(0, 5))
+        await connection.send(status(queue_depth=101))
+        await connection.send(batch(5, 5))
+        await connection.send(status(queue_depth=100))
+        await connection.send(batch(10, 5))
+        await drain_and_settle(connection, 14)
+
+    assert processor.draining == [False, True, False]
+
+
+async def test_a_live_session_with_small_frames_is_never_flagged() -> None:
+    """The presence pair's absence: 100 ms frames and a shallow queue."""
+    processor = RecordingProcessor()
+    async with (
+        running(
+            processor=processor, ack_interval_s=0.05, drain_queue_depth=100
+        ) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+        for first_seq in range(0, 50, 10):
+            await connection.send(batch(first_seq, 10))
+            await connection.send(status(queue_depth=10))
+        await drain_and_settle(connection, 49)
+
+    assert processor.draining == [False] * 5
 
 
 async def test_each_batch_is_processed_with_its_sessions_newest_seq_held() -> None:

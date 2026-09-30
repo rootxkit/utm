@@ -27,11 +27,15 @@ arrived. What `ts` is depends on the path:
   a Gateway follow-up.
 
 Neither clock is trusted for placing an aircraft in time. Every message also
-carries `rx_ts`, when the Gateway received the batch on its own clock, and
-`backlog`, the Gateway's verdict that the record was queued on the relay
-before the session that delivered it (`gateway/README.md`, relay-v1 §5). A
-track is placed at `rx_ts`: one clock for every station, so two aircraft on
-two ground stations are compared at one instant with no skew to guess. A
+carries `rx_ts`, when the Gateway received the batch on its own clock;
+`captured_at`, where the Gateway placed the row on that clock (behind
+`rx_ts` by its spacing from the batch's newest record, so a draining
+relay's frame is not one instant); and `backlog`, the Gateway's verdict
+that the record is not the present, either queued on the relay before the
+session that delivered it or delivered while the relay was still draining
+(`gateway/README.md`, relay-v1 §5, §6, §8). A track is placed at
+`captured_at`: one clock for every station, so two aircraft on two ground
+stations are compared at one instant with no skew to guess. A
 message flagged `backlog` is counted and not evaluated for live alerts. A
 station clock that is wrong by any amount costs no alerts, and a Gateway
 that is behind yields late alerts placed at `rx_ts`, not none.

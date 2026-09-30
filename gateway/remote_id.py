@@ -188,6 +188,7 @@ class RemoteIdTracker:
             # here (S-11).
             "ts": frame.received_at.isoformat(),
             "rx_ts": frame.received_at.isoformat(),
+            "captured_at": frame.received_at.isoformat(),
             "backlog": False,
             "station_id": frame.receiver_id,
             "lat_deg": location.lat_deg,
