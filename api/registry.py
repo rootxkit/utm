@@ -71,11 +71,13 @@ class PilotStatus(StrEnum):
 
 
 class RegistryError(RuntimeError):
-    """A change the registry refused. `kind` says why, for the HTTP layer."""
+    """A change the registry refused. `kind` picks the HTTP status; `code`
+    is a stable, more specific reason a client may branch on."""
 
-    def __init__(self, kind: str, message: str) -> None:
+    def __init__(self, kind: str, message: str, *, code: str | None = None) -> None:
         super().__init__(message)
         self.kind = kind
+        self.code = code or kind
 
 
 class NotFoundError(RegistryError):
@@ -84,8 +86,39 @@ class NotFoundError(RegistryError):
 
 
 class ConflictError(RegistryError):
-    def __init__(self, message: str) -> None:
-        super().__init__("conflict", message)
+    def __init__(self, message: str, *, code: str = "conflict") -> None:
+        super().__init__("conflict", message, code=code)
+
+
+# What a refusal by a database constraint is called, by SQLSTATE. The
+# database's own message names tables, columns and constraints and can quote
+# other rows' values, so it is logged and never returned.
+_CONSTRAINT_REFUSALS = {
+    "23505": ("duplicate", "it duplicates an existing record"),
+    "23503": ("unknown_reference", "it refers to a record that does not exist"),
+    "23514": ("invalid_value", "a value is outside what the registry accepts"),
+    "23502": ("invalid_value", "a required value is missing"),
+}
+
+
+def _refused(entity: str, name: str, error: IntegrityError) -> ConflictError:
+    """A stable refusal for the client, and the database's detail in the log."""
+    sqlstate = getattr(error.orig, "sqlstate", None)
+    code, reason = _CONSTRAINT_REFUSALS.get(
+        str(sqlstate), ("integrity", "it conflicts with the registry")
+    )
+    _log.warning(
+        "registry change refused by a database constraint",
+        extra={
+            "entity_type": entity,
+            "code": code,
+            "sqlstate": sqlstate,
+            "error": str(error.orig),
+            # asyncpg's DETAIL line: which key, with its value.
+            "detail": getattr(error.orig, "detail", None),
+        },
+    )
+    return ConflictError(f"{entity} {name!r} refused: {reason}", code=code)
 
 
 class TelemetryProjection(Protocol):
@@ -294,7 +327,7 @@ class FleetRegistry:
                 )
                 return base
         except IntegrityError as error:
-            raise ConflictError(f"base {name!r} refused: {error.orig}") from error
+            raise _refused("base", name, error) from error
 
     async def list_bases(self) -> list[dict[str, Any]]:
         async with self.engine.connect() as connection:
@@ -336,7 +369,7 @@ class FleetRegistry:
                 )
                 return pilot
         except IntegrityError as error:
-            raise ConflictError(f"pilot {name!r} refused: {error.orig}") from error
+            raise _refused("pilot", name, error) from error
 
     async def list_pilots(self) -> list[dict[str, Any]]:
         async with self.engine.connect() as connection:
@@ -422,7 +455,7 @@ class FleetRegistry:
                     drone["id"], label, serial=drone["serial"]
                 )
         except IntegrityError as error:
-            raise ConflictError(f"drone {label!r} refused: {error.orig}") from error
+            raise _refused("drone", label, error) from error
         _log.info(
             "drone registered", extra={"drone_id": str(drone["id"]), "label": label}
         )

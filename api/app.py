@@ -157,11 +157,14 @@ class EventOut(BaseModel):
 
 
 def _http(error: RegistryError) -> HTTPException:
+    """A stable `code` to branch on and a message for people. Neither ever
+    carries the database's own error text (`api.registry._refused`)."""
+    detail = {"code": error.code, "message": str(error)}
     if isinstance(error, NotFoundError):
-        return HTTPException(status_code=404, detail=str(error))
+        return HTTPException(status_code=404, detail=detail)
     if isinstance(error, ConflictError):
-        return HTTPException(status_code=409, detail=str(error))
-    return HTTPException(status_code=400, detail=str(error))
+        return HTTPException(status_code=409, detail=detail)
+    return HTTPException(status_code=400, detail=detail)
 
 
 def _replay_http(error: ReplayError) -> HTTPException:

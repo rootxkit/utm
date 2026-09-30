@@ -182,6 +182,34 @@ async def test_a_duplicate_label_is_refused_and_projects_nothing(
         "/drones", json={"serial": unique("SN"), "label": first["label"]}
     )
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "duplicate"
+
+
+async def test_a_refusal_says_why_without_the_databases_words(
+    client: AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """S-16. The database's message names tables, constraints and other rows'
+    values; the client gets a stable code, and the log gets the detail."""
+    first = await a_drone(client)
+    label = unique("TEST")
+
+    with caplog.at_level("WARNING", logger="api.registry"):
+        response = await client.post(
+            "/drones", json={"serial": first["serial"], "label": label}
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "duplicate",
+        "message": f"drone {label!r} refused: it duplicates an existing record",
+    }
+    text = response.text.lower()
+    for leaked in ("drones_", "constraint", "key (", "unique", first["serial"].lower()):
+        assert leaked not in text, leaked
+    logged = [r for r in caplog.records if getattr(r, "code", None) == "duplicate"]
+    assert logged, "the database's reason was not logged"
+    assert "drones_serial_key" in logged[-1].__dict__["error"]
+    assert first["serial"] in logged[-1].__dict__["detail"]
 
 
 async def test_retiring_closes_bindings_and_marks_the_projection(
@@ -318,6 +346,8 @@ async def test_a_drone_at_an_unknown_base_is_refused(client: AsyncClient) -> Non
         },
     )
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "unknown_reference"
+    assert "home_base_id" not in response.text
 
 
 async def test_a_pilot_status_changes_and_is_validated(client: AsyncClient) -> None:
