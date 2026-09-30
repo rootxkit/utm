@@ -3,9 +3,10 @@
 Subscribes to the Gateway's `telemetry.*`, feeds `AirspaceMonitor`, and for
 each alert raised or cleared:
 
-- publishes `alert.<key>` with `state` "raised" or "cleared", which the console
-  shows (P6-03), and republishes each active alert every tick with `state`
-  "active", so the numbers a console shows are current;
+- publishes `alert.<key>` with `state` "raised" or "cleared" (a clear also
+  says why: `reason` "resolved" or "stale"), which the console shows (P6-03),
+  and republishes each active alert every tick with `state` "active", so the
+  numbers a console shows are current;
 - appends an `events` row in the relational database, so an incident can be
   reconstructed from the audit log (P2-06) and not only from whoever was
   watching.
@@ -25,7 +26,7 @@ from typing import Any, Protocol
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from airspace.monitor import AirspaceMonitor, Alert, Change
+from airspace.monitor import AirspaceMonitor, Alert, Change, ClearReason
 from common import get_logger
 
 _log = get_logger(__name__)
@@ -39,7 +40,9 @@ class Bus(Protocol):
 
 
 class AuditLog(Protocol):
-    async def record(self, alert: Alert, state: str) -> None: ...
+    async def record(
+        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+    ) -> None: ...
 
 
 def alert_subject(alert: Alert) -> str:
@@ -47,8 +50,15 @@ def alert_subject(alert: Alert) -> str:
     return f"{ALERT_SUBJECT}.{alert.key}"
 
 
-def encode_alert(alert: Alert, state: str) -> bytes:
-    return json.dumps({"state": state, **alert.as_dict()}).encode("utf-8")
+def encode_alert(
+    alert: Alert, state: str, *, reason: ClearReason | None = None
+) -> bytes:
+    """The bus payload. `reason` is present only when `state` is "cleared":
+    "resolved" or "stale" (`airspace.monitor.ClearReason`)."""
+    body: dict[str, Any] = {"state": state}
+    if reason is not None:
+        body["reason"] = reason.value
+    return json.dumps({**body, **alert.as_dict()}).encode("utf-8")
 
 
 @dataclass
@@ -57,7 +67,12 @@ class EventsAuditLog:
 
     engine: AsyncEngine
 
-    async def record(self, alert: Alert, state: str) -> None:
+    async def record(
+        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+    ) -> None:
+        payload = alert.as_dict()
+        if reason is not None:
+            payload["reason"] = reason.value
         async with self.engine.begin() as connection:
             for drone_id in alert.drone_ids:
                 await connection.execute(
@@ -71,7 +86,7 @@ class EventsAuditLog:
                         "actor": ACTOR_TYPE,
                         "drone_id": str(drone_id),
                         "event_type": f"airspace_alert_{state}",
-                        "payload": json.dumps(alert.as_dict()),
+                        "payload": json.dumps(payload),
                     },
                 )
 
@@ -107,15 +122,19 @@ class AirspaceService:
             )
 
     async def _emit(self, change: Change) -> None:
-        for state, alerts in (("raised", change.raised), ("cleared", change.cleared)):
-            for alert in alerts:
-                await self._send(alert, state)
+        for alert in change.raised:
+            await self._send(alert, "raised")
+        for cleared in change.cleared:
+            await self._send(cleared.alert, "cleared", reason=cleared.reason)
 
-    async def _send(self, alert: Alert, state: str) -> None:
+    async def _send(
+        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+    ) -> None:
         _log.info(
             "airspace alert",
             extra={
                 "state": state,
+                "reason": None if reason is None else reason.value,
                 "key": alert.key,
                 "kind": alert.kind.value,
                 "severity": alert.severity.value,
@@ -124,10 +143,12 @@ class AirspaceService:
         )
         await _guard(
             "publish",
-            self.bus.publish(alert_subject(alert), encode_alert(alert, state)),
+            self.bus.publish(
+                alert_subject(alert), encode_alert(alert, state, reason=reason)
+            ),
         )
         if self.audit is not None:
-            await _guard("audit", self.audit.record(alert, state))
+            await _guard("audit", self.audit.record(alert, state, reason=reason))
 
 
 async def _guard(what: str, action: Awaitable[None]) -> None:

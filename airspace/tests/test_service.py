@@ -11,7 +11,7 @@ from uuid import UUID
 import pytest
 
 from airspace.cpa import SeparationPolicy, local_offset_m
-from airspace.monitor import AirspaceMonitor, Alert
+from airspace.monitor import AirspaceMonitor, Alert, ClearReason
 from airspace.service import AirspaceService
 
 A = UUID(int=1)
@@ -59,10 +59,12 @@ class RecordingAudit:
         self.rows: list[tuple[str, str]] = []
         self.fail = fail
 
-    async def record(self, alert: Alert, state: str) -> None:
+    async def record(
+        self, alert: Alert, state: str, *, reason: ClearReason | None = None
+    ) -> None:
         if self.fail:
             raise ConnectionError("database is gone")
-        self.rows.append((alert.key, state))
+        self.rows.append((alert.key, state if reason is None else f"{state}:{reason}"))
 
 
 class Clock:
@@ -104,9 +106,9 @@ async def test_a_conflict_is_published_and_audited_once() -> None:
     assert audit.rows == [(body["key"], "raised")]
 
 
-async def test_the_tick_clears_what_went_silent() -> None:
-    bus = RecordingBus()
-    svc, clock = service(bus)
+async def test_the_tick_clears_what_went_silent_and_says_so() -> None:
+    bus, audit = RecordingBus(), RecordingAudit()
+    svc, clock = service(bus, audit)
     await svc.on_telemetry(payload(A, 0, 10))
     await svc.on_telemetry(payload(B, 500, -10))
 
@@ -114,6 +116,23 @@ async def test_the_tick_clears_what_went_silent() -> None:
     await svc.on_tick()
 
     assert [body["state"] for _, body in bus.sent] == ["raised", "cleared"]
+    assert "reason" not in bus.sent[0][1]
+    assert bus.sent[1][1]["reason"] == "stale"
+    key = bus.sent[0][1]["key"]
+    assert audit.rows == [(key, "raised"), (key, "cleared:stale")]
+
+
+async def test_a_clear_shown_by_telemetry_is_published_as_resolved() -> None:
+    bus = RecordingBus()
+    svc, clock = service(bus)
+    await svc.on_telemetry(payload(A, 0, 10))
+    await svc.on_telemetry(payload(B, 500, -10))
+    for at_s in (1.0, 3.0, 5.0):
+        clock.now_s = at_s
+        await svc.on_telemetry(payload(B, 500 + 10 * at_s, 10, at_s=at_s))
+
+    assert [body["state"] for _, body in bus.sent] == ["raised", "cleared"]
+    assert bus.sent[1][1]["reason"] == "resolved"
 
 
 async def test_a_bus_failure_does_not_stop_the_audit_or_the_monitor() -> None:

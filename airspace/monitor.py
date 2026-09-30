@@ -42,7 +42,9 @@ kind of alert people learn to scroll past.
 
 Silence is not evidence. A pair whose telemetry stops is not shown to be
 clear of each other, so its alert stays until the aircraft are dropped as
-stale, and is cleared then as "no longer tracked", not as "resolved".
+stale, and is cleared then with the reason `stale` ("no longer tracked"),
+not `resolved`. Every clear carries its reason (`Cleared.reason`), and the
+service publishes and audits it.
 
 ## Height above ground (P5-19)
 
@@ -121,10 +123,23 @@ class Alert:
         }
 
 
+class ClearReason(StrEnum):
+    # Telemetry showed the condition false for longer than `clear_after_s`.
+    RESOLVED = "resolved"
+    # An aircraft involved is no longer tracked; nothing showed it clear.
+    STALE = "stale"
+
+
+@dataclass(frozen=True, slots=True)
+class Cleared:
+    alert: Alert
+    reason: ClearReason
+
+
 @dataclass(frozen=True, slots=True)
 class Change:
     raised: list[Alert]
-    cleared: list[Alert]
+    cleared: list[Cleared]
 
 
 def captured_at_s(message: dict[str, Any]) -> float:
@@ -438,14 +453,14 @@ class AirspaceMonitor:
 
     # --- clearing --------------------------------------------------------------
 
-    def _expire(self, now_s: float) -> list[Alert]:
+    def _expire(self, now_s: float) -> list[Cleared]:
         for drone_id, seen_s in list(self._last_seen_s.items()):
             if now_s - seen_s > self.stale_after_s:
                 self.index.remove(drone_id)
                 del self._last_seen_s[drone_id]
 
         tracked = set(self._last_seen_s)
-        cleared: list[Alert] = []
+        cleared: list[Cleared] = []
         for key, alert in list(self._active.items()):
             gone = not all(drone_id in tracked for drone_id in alert.drone_ids)
             shown_false_for_s = (
@@ -453,7 +468,9 @@ class AirspaceMonitor:
             )
             resolved = shown_false_for_s > self.clear_after_s
             if gone or resolved:
-                cleared.append(alert)
+                # Evidence outranks silence when both hold at once.
+                reason = ClearReason.RESOLVED if resolved else ClearReason.STALE
+                cleared.append(Cleared(alert=alert, reason=reason))
                 del self._active[key]
                 self._last_true_s.pop(key, None)
                 self._last_false_s.pop(key, None)

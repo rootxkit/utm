@@ -106,7 +106,7 @@ def test_it_clears_once_below_the_limit_for_longer_than_the_hysteresis() -> None
     assert m.observe(message(A, 0, alt_amsl_m=600.0, at_s=1.0), now_s=1.0).cleared == []
     assert m.observe(message(A, 0, alt_amsl_m=600.0, at_s=3.0), now_s=3.0).cleared == []
     cleared = m.observe(message(A, 0, alt_amsl_m=600.0, at_s=4.5), now_s=4.5).cleared
-    assert [alert.key for alert in cleared] == [height_key(A)]
+    assert [c.alert.key for c in cleared] == [height_key(A)]
 
 
 def test_unknown_ground_is_not_evaluated_rather_than_taken_as_zero() -> None:
@@ -209,7 +209,7 @@ def test_a_failing_check_does_not_clear_the_alert_it_could_not_evaluate() -> Non
             == []
         )
     cleared = m.observe(message(A, 0, alt_amsl_m=600.0, at_s=9.5), now_s=9.5).cleared
-    assert [alert.key for alert in cleared] == [height_key(A)]
+    assert [c.alert.key for c in cleared] == [height_key(A)]
 
 
 def test_a_remote_id_aircraft_declared_airborne_is_evaluated() -> None:

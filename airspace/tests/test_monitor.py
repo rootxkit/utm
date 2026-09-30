@@ -11,7 +11,13 @@ from uuid import UUID
 import pytest
 
 from airspace.cpa import SeparationPolicy, local_offset_m
-from airspace.monitor import AirspaceMonitor, AlertKind, Severity, conflict_key
+from airspace.monitor import (
+    AirspaceMonitor,
+    AlertKind,
+    ClearReason,
+    Severity,
+    conflict_key,
+)
 from airspace.zones import zone_from_geojson
 
 A = UUID(int=1)
@@ -97,7 +103,9 @@ def test_a_resolved_conflict_clears_only_after_the_hysteresis() -> None:
     at_4 = monitor.observe(message(B, 520, vn=10, at_s=3.5), now_s=3.5)
 
     assert at_1.cleared == [] and at_3.cleared == []
-    assert [alert.key for alert in at_4.cleared] == [conflict_key(A, B)]
+    assert [(c.alert.key, c.reason) for c in at_4.cleared] == [
+        (conflict_key(A, B), ClearReason.RESOLVED)
+    ]
     assert monitor.active == []
 
 
@@ -128,7 +136,9 @@ def test_disarming_clears_the_conflict() -> None:
     monitor = AirspaceMonitor(policy=POLICY)
     head_on(monitor, now_s=0.0)
     change = monitor.observe(message(B, 500, armed=False, at_s=1.0), now_s=1.0)
-    assert [alert.key for alert in change.cleared] == [conflict_key(A, B)]
+    assert [(c.alert.key, c.reason) for c in change.cleared] == [
+        (conflict_key(A, B), ClearReason.STALE)
+    ]
 
 
 def test_an_aircraft_that_goes_silent_is_dropped_and_its_alerts_cleared() -> None:
@@ -138,7 +148,9 @@ def test_an_aircraft_that_goes_silent_is_dropped_and_its_alerts_cleared() -> Non
 
     assert monitor.tick(now_s=10.0).cleared == []
     cleared = monitor.tick(now_s=16.0).cleared
-    assert [alert.key for alert in cleared] == [conflict_key(A, B)]
+    assert [(c.alert.key, c.reason) for c in cleared] == [
+        (conflict_key(A, B), ClearReason.STALE)
+    ]
     assert len(monitor.index) == 0
 
 
