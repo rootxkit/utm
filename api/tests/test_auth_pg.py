@@ -8,7 +8,9 @@ because the database is shared across the session.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+import threading
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -16,8 +18,10 @@ from uuid import UUID, uuid4
 import pytest
 import sqlalchemy as sa
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from api import auth as auth_module
 from api.actors import SYSTEM
 from api.app import create_api_app
 from api.auth import (
@@ -29,6 +33,7 @@ from api.auth import (
     ScryptCost,
 )
 from api.registry import FleetRegistry
+from api.tests.test_auth import Overlap
 from gateway.binding import BindingResolver
 
 pytestmark = pytest.mark.postgres
@@ -242,6 +247,165 @@ async def test_the_lock_lifts_after_the_lockout(
     assert await store.session(login.token) is not None
 
 
+# --- S-15: hashing off the event loop and outside the row lock -------------------
+
+
+class HashProbe:
+    """Wraps `verify_password`; while it runs, asks the database from the
+    event loop whether the account's row is locked."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        engine: AsyncEngine,
+        username: str,
+        during: Callable[[], Coroutine[Any, Any, None]] | None = None,
+    ) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.engine = engine
+        self.username = username
+        self.during = during
+        self.on_loop_thread: list[bool] = []
+        self.row_was_free: list[bool] = []
+        real = auth_module.verify_password
+
+        def probe(password: str, stored: str) -> bool:
+            self.on_loop_thread.append(threading.get_ident() == self.loop_thread_id)
+            self.row_was_free.append(
+                asyncio.run_coroutine_threadsafe(self._row_is_free(), self.loop).result(
+                    timeout=10
+                )
+            )
+            if self.during is not None:
+                asyncio.run_coroutine_threadsafe(self.during(), self.loop).result(
+                    timeout=10
+                )
+            return real(password, stored)
+
+        self.loop_thread_id = threading.get_ident()
+        monkeypatch.setattr(auth_module, "verify_password", probe)
+
+    async def _row_is_free(self) -> bool:
+        return await row_is_free(self.engine, self.username)
+
+
+async def row_is_free(engine: AsyncEngine, username: str) -> bool:
+    async with engine.begin() as connection:
+        try:
+            await connection.execute(
+                sa.text(
+                    "SELECT 1 FROM operators WHERE username = :n FOR UPDATE NOWAIT"
+                ),
+                {"n": username},
+            )
+        except DBAPIError:
+            return False
+    return True
+
+
+async def test_the_lock_probe_sees_a_locked_row(
+    store: OperatorStore, relational_engine: AsyncEngine
+) -> None:
+    """The paired presence for the test below: the probe can say "locked"."""
+    created = await make(store)
+    async with relational_engine.begin() as holder:
+        await holder.execute(
+            sa.text("SELECT 1 FROM operators WHERE username = :n FOR UPDATE"),
+            {"n": created["username"]},
+        )
+        assert await row_is_free(relational_engine, created["username"]) is False
+    assert await row_is_free(relational_engine, created["username"]) is True
+
+
+@pytest.mark.parametrize("known", [True, False], ids=["known", "unknown"])
+async def test_the_password_is_hashed_off_the_loop_with_the_row_unlocked(
+    store: OperatorStore,
+    relational_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    known: bool,
+) -> None:
+    username = (await make(store))["username"] if known else unique("nobody")
+    probe = HashProbe(monkeypatch, relational_engine, username)
+
+    with pytest.raises(AuthError):
+        await store.login(username, "not the password at all")
+
+    assert probe.on_loop_thread == [False]
+    assert probe.row_was_free == [True]
+
+
+async def test_concurrent_sign_ins_hash_at_most_the_limit_at_once(
+    store: OperatorStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through `login`: six at once, `max_concurrent_hashes` (2) hashing."""
+    overlap = Overlap()
+    monkeypatch.setattr(auth_module, "verify_password", overlap)
+
+    results = await asyncio.gather(
+        *(store.login(unique("nobody"), PASSWORD) for _ in range(6)),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, AuthError) for result in results)
+    assert store.max_concurrent_hashes == 2
+    assert overlap.most == 2
+
+
+async def test_a_password_changed_while_hashing_refuses_the_old_one_uncounted(
+    store: OperatorStore,
+    relational_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verdict was about a hash that is no longer stored."""
+    created = await make(store)
+
+    async def change_password() -> None:
+        await store.set_password(created["id"], "a brand new password", actor=SYSTEM)
+
+    HashProbe(monkeypatch, relational_engine, created["username"], change_password)
+
+    with pytest.raises(AuthError):
+        await store.login(created["username"], PASSWORD)
+
+    event, payload = (await events_for(relational_engine, created["id"]))[-1]
+    assert event == "login_failed"
+    assert payload["reason"] == "password_changed_during_login"
+    async with relational_engine.connect() as connection:
+        failures: int = (
+            await connection.execute(
+                sa.text("SELECT failed_logins FROM operators WHERE id = :id"),
+                {"id": created["id"]},
+            )
+        ).scalar_one()
+    assert failures == 0
+
+
+async def test_concurrent_wrong_passwords_all_count_and_lock_the_account(
+    store: OperatorStore, relational_engine: AsyncEngine
+) -> None:
+    """Hashed in parallel, judged one at a time under the lock: none is lost."""
+    created = await make(store)
+
+    results = await asyncio.gather(
+        *(store.login(created["username"], "wrong wrong wrong") for _ in range(3)),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, AuthError) for result in results)
+    reasons = [
+        payload["reason"]
+        for event, payload in await events_for(relational_engine, created["id"])
+        if event == "login_failed"
+    ]
+    assert sorted(reasons) == [
+        "wrong_password",
+        "wrong_password",
+        "wrong_password_now_locked",
+    ]
+    with pytest.raises(AuthError):
+        await store.login(created["username"], PASSWORD)
+
+
 # --- sessions ---------------------------------------------------------------------
 
 
@@ -338,6 +502,11 @@ async def http(
 class _NoLive:
     async def get(self, drone_id: UUID) -> dict[str, Any] | None:
         return None
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        return dict.fromkeys(drone_ids)
 
 
 async def test_a_change_through_the_api_names_the_operator_who_made_it(

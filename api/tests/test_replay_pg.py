@@ -12,9 +12,9 @@ across the session.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -51,6 +51,11 @@ def ns(when: datetime) -> int:
 class NoLive:
     async def get(self, drone_id: UUID) -> dict[str, Any] | None:
         return None
+
+    async def get_many(
+        self, drone_ids: Sequence[UUID]
+    ) -> dict[UUID, dict[str, Any] | None]:
+        return dict.fromkeys(drone_ids)
 
 
 def store_for(
@@ -461,6 +466,43 @@ async def test_flights_are_armed_spans_split_by_long_silence(
         (at(600).isoformat(), at(620).isoformat()),
         (at(0).isoformat(), at(30).isoformat()),
     ]
+
+
+async def test_a_flight_window_over_the_maximum_is_refused_and_one_at_it_is_not(
+    relational_engine: AsyncEngine, engine: AsyncEngine
+) -> None:
+    """S-16. As with `max_samples`: refused with 413, never scanned."""
+    station = f"replay-{uuid4().hex[:8]}"
+    drone_id = await add_drone(engine, "R-9")
+    await add_samples(engine, drone_id, every(0, 10), station=station)
+    store = store_for(engine, relational_engine)
+    store.max_flight_window_s = 1000.0
+    app = create_api_app(
+        cast(FleetRegistry, cast(Any, None)), replay=store, **api_kwargs()
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=VIEWER_HEADERS,
+    ) as http:
+        path = f"/replay/drones/{drone_id}/flights"
+        at_limit = await http.get(
+            path, params={"since": at(-500).isoformat(), "until": at(500).isoformat()}
+        )
+        over = await http.get(
+            path, params={"since": at(-501).isoformat(), "until": at(500).isoformat()}
+        )
+        backwards = await http.get(
+            path, params={"since": at(500).isoformat(), "until": at(-500).isoformat()}
+        )
+        # No `since`: the default look-back is clipped to the maximum.
+        defaulted = await http.get(path, params={"until": at(500).isoformat()})
+
+    assert at_limit.status_code == 200, at_limit.text
+    assert [f["start"] for f in at_limit.json()] == [at(0).isoformat()]
+    assert over.status_code == 413
+    assert backwards.status_code == 422
+    assert defaulted.status_code == 200, defaulted.text
 
 
 # --- Remote ID aircraft (P1-15) -------------------------------------------------

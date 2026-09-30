@@ -38,6 +38,7 @@ from api.auth import (
     issue_feed_ticket,
     wall_clock_s,
 )
+from api.ratelimit import LoginRateLimiter, retry_after_header
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -187,8 +188,10 @@ def auth_router(
     feed_secret: bytes,
     feed_ticket_ttl_s: float,
     cookie_secure: bool,
+    login_limiter: LoginRateLimiter | None = None,
 ) -> APIRouter:
     router = APIRouter()
+    limiter = login_limiter if login_limiter is not None else LoginRateLimiter()
     viewer = require(store, Role.VIEWER)
     admin = require(store, Role.ADMIN)
 
@@ -213,11 +216,22 @@ def auth_router(
     async def login(
         body: LoginIn, request: Request, response: Response
     ) -> dict[str, Any]:
+        # The peer as uvicorn reports it, which honours X-Forwarded-For only
+        # from a trusted proxy (`api.config.ProxySettings`). Never the header.
+        remote_addr = request.client.host if request.client else None
+        # Before the store, so a refused attempt costs no hash and no row.
+        wait_s = limiter.attempt(address=remote_addr, username=body.username)
+        if wait_s is not None:
+            raise HTTPException(
+                status_code=429,
+                detail="too many sign-in attempts; try again later",
+                headers={"Retry-After": retry_after_header(wait_s)},
+            )
         try:
             result = await store.login(
                 body.username,
                 body.password,
-                remote_addr=request.client.host if request.client else None,
+                remote_addr=remote_addr,
                 user_agent=request.headers.get("user-agent"),
             )
         except AuthError as error:

@@ -6,15 +6,21 @@ refuses everything cannot pass (CLAUDE.md, "test presence, not only absence").
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import threading
+import time
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 
+from api import auth as auth_module
 from api.auth import (
     AuthError,
     Operator,
+    OperatorStore,
     Role,
     ScryptCost,
     check_password_policy,
@@ -58,6 +64,82 @@ def test_a_hash_records_its_own_cost_so_it_verifies_after_the_default_changes() 
 
     assert stored.startswith("scrypt$11$4$1$")
     assert verify_password("correct horse battery", stored) is True
+
+
+@pytest.mark.parametrize(
+    ("cost", "prefix"),
+    [(FAST, "scrypt$10$8$1$"), (ScryptCost(n_log2=11, r=4), "scrypt$11$4$1$")],
+)
+def test_the_unknown_user_hash_is_at_the_stores_cost(
+    cost: ScryptCost, prefix: str
+) -> None:
+    """An unknown name must cost what a known one does: same scrypt cost.
+    No database is reached by constructing a store."""
+    store = OperatorStore(
+        engine=cast(Any, None),
+        session_ttl_s=60,
+        idle_timeout_s=60,
+        max_failed_logins=3,
+        lockout_s=60,
+        cost=cost,
+    )
+
+    assert store._unknown_user_hash.startswith(prefix)
+
+
+class Overlap:
+    """Stands in for a hash: sleeps, and records how many ran at once."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.running = 0
+        self.most = 0
+
+    def __call__(self, *_: Any) -> Any:
+        with self.lock:
+            self.running += 1
+            self.most = max(self.most, self.running)
+        time.sleep(0.05)
+        with self.lock:
+            self.running -= 1
+        return "scrypt$stub"
+
+
+def a_store(**overrides: Any) -> OperatorStore:
+    settings: dict[str, Any] = {
+        "engine": cast(Any, None),
+        "session_ttl_s": 60,
+        "idle_timeout_s": 60,
+        "max_failed_logins": 3,
+        "lockout_s": 60,
+        "cost": FAST,
+        **overrides,
+    }
+    return OperatorStore(**settings)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3])
+async def test_no_more_hashes_run_at_once_than_the_limit(
+    monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    """Hashing and verifying share the limit, and reach it: with eight
+    waiting, exactly `limit` run together."""
+    store = a_store(max_concurrent_hashes=limit)
+    overlap = Overlap()
+    monkeypatch.setattr(auth_module, "hash_password", overlap)
+    monkeypatch.setattr(auth_module, "verify_password", overlap)
+
+    await asyncio.gather(
+        *(store._hash("p") for _ in range(4)),
+        *(store._verify("p", "stored") for _ in range(4)),
+    )
+
+    assert overlap.most == limit
+
+
+def test_a_limit_below_one_is_refused() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        a_store(max_concurrent_hashes=0)
 
 
 @pytest.mark.parametrize(

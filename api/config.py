@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from pydantic import Field, SecretStr, model_validator
 
@@ -42,7 +42,32 @@ class FeedTicketSettings(ServiceSettings):
         return self
 
 
+class ProxySettings(ServiceSettings):
+    """S-15. Which peers may say who the client is.
+
+    uvicorn replaces the client address with the one in `X-Forwarded-For`
+    only when the connection comes from one of these, so the sign-in limit
+    per address counts real clients behind the TLS front (P0-09) and a
+    client that reaches the service directly cannot pick its own address.
+    Comma-separated IPs or networks, or `*`. The default is uvicorn's own.
+    """
+
+    forwarded_allow_ips: str = Field(
+        default="127.0.0.1", min_length=1, validation_alias="FORWARDED_ALLOW_IPS"
+    )
+
+    def uvicorn_proxy_options(self) -> dict[str, Any]:
+        """What `uvicorn.run` / `uvicorn.Config` is given, and nothing else
+        decides it: uvicorn also reads FORWARDED_ALLOW_IPS from the
+        environment itself, and passing the value keeps one source."""
+        return {
+            "proxy_headers": True,
+            "forwarded_allow_ips": self.forwarded_allow_ips,
+        }
+
+
 class ApiSettings(
+    ProxySettings,
     FeedTicketSettings,
     PostgresSettings,
     TelemetryDatabaseSettings,
@@ -76,6 +101,23 @@ class ApiSettings(
     )
     login_lockout_s: float = Field(
         default=900.0, gt=0, validation_alias="LOGIN_LOCKOUT_S"
+    )
+    # S-15. scrypt computations (32 MiB and a core each) allowed at once;
+    # more sign-ins queue for a slot.
+    password_hash_concurrency: int = Field(
+        default=2, ge=1, validation_alias="PASSWORD_HASH_CONCURRENCY"
+    )
+    # S-15. Sign-in attempts allowed per client address and per username
+    # within the window, before any password is hashed. Beyond them the
+    # API answers 429. Unknown usernames are counted like known ones.
+    login_rate_window_s: float = Field(
+        default=300.0, gt=0, validation_alias="LOGIN_RATE_WINDOW_S"
+    )
+    login_rate_max_per_address: int = Field(
+        default=20, ge=1, validation_alias="LOGIN_RATE_MAX_PER_ADDRESS"
+    )
+    login_rate_max_per_username: int = Field(
+        default=10, ge=1, validation_alias="LOGIN_RATE_MAX_PER_USERNAME"
     )
     # Secure cookies are sent only over HTTPS. Off only for plain-HTTP
     # development on this machine.
@@ -120,9 +162,14 @@ class ApiSettings(
     replay_max_samples: int = Field(
         default=100_000, gt=0, validation_alias="REPLAY_MAX_SAMPLES"
     )
+    # S-16. The longest window the flight list scans; a longer one is
+    # refused, as a replay over `replay_max_samples` is. 90 days.
+    replay_max_flight_window_s: float = Field(
+        default=90 * 86400.0, gt=0, validation_alias="REPLAY_MAX_FLIGHT_WINDOW_S"
+    )
 
 
-class ConsoleSettings(FeedTicketSettings, NatsSettings):
+class ConsoleSettings(ProxySettings, FeedTicketSettings, NatsSettings):
     """The P1-08 console feed.
 
     Only the bus, deliberately. The console is a NATS subscriber and must not
@@ -143,3 +190,17 @@ class ConsoleSettings(FeedTicketSettings, NatsSettings):
     basemap_dir: Path = Field(
         default=Path("local/basemap"), validation_alias="BASEMAP_DIR"
     )
+    # S-16. Comma-separated page origins on other hosts that may open the
+    # feed, e.g. `https://ops.example.ge`. Pages on the feed's own host are
+    # always allowed (`api.telemetry_ws.origin_allowed`); empty adds none.
+    console_allowed_origins: str = Field(
+        default="", validation_alias="CONSOLE_ALLOWED_ORIGINS"
+    )
+
+    @property
+    def allowed_origins(self) -> tuple[str, ...]:
+        return tuple(
+            origin.strip()
+            for origin in self.console_allowed_origins.split(",")
+            if origin.strip()
+        )

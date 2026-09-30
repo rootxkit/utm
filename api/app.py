@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field
 from api.assets import STATIC, mount_map_assets
 from api.auth import Operator, Role
 from api.auth_http import AccountStore, Authenticator, auth_router, require
+from api.ratelimit import LoginRateLimiter
 from api.registry import (
     AirframeParams,
     ConflictError,
@@ -35,6 +36,7 @@ from api.registry import (
     FleetRegistry,
     NotFoundError,
     PilotStatus,
+    ProjectionIncompleteError,
     RegistryError,
 )
 from api.replay import DroneNotFoundError, ReplayError, ReplayStore, WindowTooLargeError
@@ -156,11 +158,18 @@ class EventOut(BaseModel):
 
 
 def _http(error: RegistryError) -> HTTPException:
+    """A stable `code` to branch on and a message for people. Neither ever
+    carries the database's own error text (`api.registry._refused`)."""
+    detail = {"code": error.code, "message": str(error)}
     if isinstance(error, NotFoundError):
-        return HTTPException(status_code=404, detail=str(error))
+        return HTTPException(status_code=404, detail=detail)
     if isinstance(error, ConflictError):
-        return HTTPException(status_code=409, detail=str(error))
-    return HTTPException(status_code=400, detail=str(error))
+        return HTTPException(status_code=409, detail=detail)
+    if isinstance(error, ProjectionIncompleteError):
+        # The change was made; its effect on telemetry was not. A retry
+        # completes it, which is what 503 tells a client.
+        return HTTPException(status_code=503, detail=detail)
+    return HTTPException(status_code=400, detail=detail)
 
 
 def _replay_http(error: ReplayError) -> HTTPException:
@@ -192,6 +201,7 @@ def create_api_app(
     console_feed_url: str | None = None,
     console_app_dir: Path | None = None,
     terrain: Terrain | None = None,
+    login_limiter: LoginRateLimiter | None = None,
 ) -> FastAPI:
     """The API. `auth` is required: there is no way to build it open.
 
@@ -208,6 +218,7 @@ def create_api_app(
             feed_secret=feed_secret,
             feed_ticket_ttl_s=feed_ticket_ttl_s,
             cookie_secure=cookie_secure,
+            login_limiter=login_limiter,
         )
     )
 
@@ -366,12 +377,16 @@ def create_api_app(
         after_id: int | None = None,
         limit: int = Query(default=500, ge=1, le=MAX_EVENTS_PER_PAGE),
     ) -> list[dict[str, Any]]:
-        """Filter by entity and time; page with `after_id` = the last `id` seen."""
+        """Filter by entity and time; page with `after_id` = the last `id` seen.
+
+        `since` and `until` must carry a zone, as in the replay routes: a
+        time without one is refused with 422, not guessed to be UTC.
+        """
         return await registry.events(
             entity_type=entity_type,
             entity_id=entity_id,
-            since=since,
-            until=until,
+            since=_utc(since) if since is not None else None,
+            until=_utc(until) if until is not None else None,
             after_id=after_id,
             limit=limit,
         )
@@ -435,9 +450,14 @@ def _add_replay_routes(app: FastAPI, replay: ReplayStore, auth: Authenticator) -
         until: datetime | None = None,
         limit: int = Query(default=50, ge=1, le=MAX_FLIGHTS_PER_PAGE),
     ) -> list[dict[str, Any]]:
-        """Armed spans of this aircraft, newest first."""
+        """Armed spans of this aircraft, newest first. A window longer than
+        the configured maximum is refused with 413."""
         end = _utc(until) if until is not None else datetime.now(tz=UTC)
-        start = _utc(since) if since is not None else end - DEFAULT_FLIGHT_LOOKBACK
+        # The default look-back never exceeds the maximum it would be refused by.
+        lookback = min(
+            DEFAULT_FLIGHT_LOOKBACK, timedelta(seconds=replay.max_flight_window_s)
+        )
+        start = _utc(since) if since is not None else end - lookback
         try:
             return await replay.flights(drone_id, since=start, until=end, limit=limit)
         except ReplayError as error:
