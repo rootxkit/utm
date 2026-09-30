@@ -1,4 +1,4 @@
-# The courier services, one image, several commands (docker-compose.prod.yml).
+# The UTM services, one image, several commands (docker-compose.prod.yml).
 # P0-09.
 #
 # Stage 1 builds the operator console; stage 2 is Python with the project's
@@ -22,7 +22,6 @@ COPY common/ common/
 COPY agent/ agent/
 COPY gateway/ gateway/
 COPY api/ api/
-COPY dispatch/ dispatch/
 COPY airspace/ airspace/
 RUN pip install . && rm -rf build *.egg-info
 COPY tools/ tools/

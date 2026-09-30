@@ -122,7 +122,7 @@ class ServiceSettings(Settings):
 
 
 class PostgresSettings(Settings):
-    """Relational state: orders, drones, missions, airspace."""
+    """Relational state: registry, airspace zones, audit log."""
 
     database_url: PostgresDsn = Field(validation_alias="DATABASE_URL")
 

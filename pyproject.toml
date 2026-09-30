@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "courier"
 version = "0.1.0"
-description = "Drone courier platform: dispatch, airspace deconfliction and telemetry"
+description = "National drone-flight monitoring: telemetry, Remote ID, airspace alerts"
 requires-python = ">=3.12"
 dependencies = [
     # Environment configuration is validated at startup rather than read
@@ -67,7 +67,7 @@ sitl = [
 [tool.setuptools]
 # Each service is a top-level package rather than a src/ layout, so the
 # directory names in CLAUDE.md and the import names are the same thing.
-packages = ["common", "agent", "gateway", "api", "dispatch", "airspace"]
+packages = ["common", "agent", "gateway", "api", "airspace"]
 
 # --- ruff -------------------------------------------------------------------
 
@@ -118,16 +118,16 @@ docstring-code-format = true
 
 [tool.mypy]
 python_version = "3.12"
-files = ["common", "agent", "gateway", "api", "dispatch", "airspace", "tools"]
+files = ["common", "agent", "gateway", "api", "airspace", "tools"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 no_implicit_reexport = true
 show_error_codes = true
 
-# gateway, dispatch and airspace are safety-relevant: a type error there is a
-# build failure, not a warning. common is included because those three import
-# it, so a loose type in common defeats the point of checking them strictly.
+# gateway and airspace are safety-relevant: a type error there is a build
+# failure, not a warning. common is included because both import it, so a
+# loose type in common defeats the point of checking them strictly.
 #
 # `strict = true` is NOT used here. In mypy it is a global flag, and setting it
 # inside a per-module override silently turns strict on for every module —
@@ -147,7 +147,6 @@ ignore_missing_imports = true
 module = [
     "common.*",
     "gateway.*",
-    "dispatch.*",
     "airspace.*",
     "tools.*",
     "agent.*",
@@ -173,7 +172,6 @@ testpaths = [
     "agent",
     "gateway",
     "api",
-    "dispatch",
     "airspace",
     "tools",
 ]
@@ -206,7 +204,7 @@ filterwarnings = ["error"]
 # rejected with a WebSocket close. Line coverage would have called all of those
 # covered. An unexecuted branch arc is the signal that catches them.
 branch = true
-source = ["common", "gateway", "dispatch", "airspace", "tools", "agent"]
+source = ["common", "gateway", "airspace", "tools", "agent"]
 # Measuring the tests themselves inflates the total towards 100% and hides the
 # code that matters: a test file is, by construction, almost fully executed.
 #
@@ -263,6 +261,6 @@ exclude_also = [
 # no gate.
 #
 # agent/ and tools/mavlink_probe.py are gated separately and more tightly by
-# `make cover`; see the Makefile. TASKS.md's 80% for gateway, dispatch and
-# airspace applies once those modules have behaviour (P1-02).
+# `make cover`; see the Makefile. TASKS.md's 80% for gateway and airspace
+# applies once those modules have behaviour (P1-02).
 fail_under = 75

@@ -1,4 +1,4 @@
-"""drone_state hypertable: the live telemetry the console and dispatch read
+"""drone_state hypertable: the live telemetry the console and airspace read
 
 Revision ID: 0004_drone_state
 Revises: 0003_source_bindings
