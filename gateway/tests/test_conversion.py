@@ -364,7 +364,7 @@ def test_battery_temperature_converts_and_has_its_own_sentinel() -> None:
 def test_percent_and_energy_are_kept_separate() -> None:
     """CLAUDE.md: "battery percent 0-100 and watt-hours separately".
 
-    Percent is what a pilot reads; energy is what P4-03's reserve check needs,
+    Percent is what a pilot reads; energy is what an endurance estimate needs,
     and percent depends on a discharge curve the autopilot chose.
     """
     battery = battery_from_battery_status(battery_status())

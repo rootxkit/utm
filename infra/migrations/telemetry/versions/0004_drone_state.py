@@ -82,7 +82,7 @@ def upgrade() -> None:
         sa.Column("vz_ms", sa.Double(), nullable=True),
         # Percent and energy are separate quantities, not two views of one
         # (CLAUDE.md). Percent depends on a discharge curve the autopilot
-        # chose; watt-hours are what P4-03's reserve check needs.
+        # chose; watt-hours are what an endurance estimate needs.
         sa.Column("batt_pct", sa.Double(), nullable=True),
         sa.Column("batt_voltage_v", sa.Double(), nullable=True),
         sa.Column("batt_consumed_wh", sa.Double(), nullable=True),
