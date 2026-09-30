@@ -12,8 +12,8 @@ in `config.py`, and gets a validated, frozen object or a refusal to start:
 from common import NatsSettings, PostgresSettings, RedisSettings, ServiceSettings
 
 
-class DispatchSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSettings):
-    service_name: str = "dispatch"
+class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSettings):
+    service_name: str = "airspace"
 ```
 
 No service reads `os.environ`. A value read directly is a value that was never
@@ -22,8 +22,8 @@ before the process starts — which, for a service supervising aircraft, is the
 difference between a failed deploy and a surprise in flight.
 `tests/test_no_direct_environ.py` enforces this.
 
-What does **not** belong here: scoring weights, separation minima, altitude
-bands, battery thresholds, geofences. Those are operational parameters that
+What does **not** belong here: separation minima, height limits, battery
+thresholds, geofences. Those are operational parameters that
 operators change without a deploy, so they live in the database where a change
 is audited. Startup configuration is infrastructure — where the database is,
 what to log, which port to bind.
@@ -36,8 +36,8 @@ interpolated into the message:
 ```python
 from common import bind, get_logger
 
-log = bind(get_logger(__name__), drone_id=drone_id, mission_id=mission_id)
-log.warning("battery below reserve", extra={"batt_pct": 22.5})
+log = bind(get_logger(__name__), drone_id=drone_id, station_id=station_id)
+log.warning("height limit exceeded", extra={"height_agl_m": 124.5})
 ```
 
 `print()` is banned repository-wide by ruff (T20). Timestamps are UTC-aware,
@@ -51,7 +51,7 @@ first, logging installed before anything else runs:
 ```python
 from common.startup import start_service
 
-settings, log = start_service(DispatchSettings)
+settings, log = start_service(AirspaceSettings)
 ```
 
 ## Height references

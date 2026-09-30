@@ -45,8 +45,8 @@ jobs:
       - name: ruff format
         run: ruff format --check .
 
-      # gateway, dispatch and airspace are safety-relevant, so a type error
-      # here is a build failure rather than a warning.
+      # gateway and airspace are safety-relevant, so a type error here is a
+      # build failure rather than a warning.
       - name: mypy
         run: mypy
 

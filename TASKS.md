@@ -104,8 +104,8 @@ Goal: telemetry from many vehicles reaches the database and a browser map.
       (Help → About; the window says "Daily"); radio-port rates, which on this
       aircraft go through a SIYI MK15 whose QGC runs on the controller itself,
       so they are measured once forwarding from the controller reaches a relay
-      (see P1-01); `MISSION_ITEM_REACHED` to be confirmed on the first mission
-      run.
+      (see P1-01). `MISSION_ITEM_REACHED` no longer needs confirming: it
+      served progress inference, which left with the delivery scope.
 
 - [~] **P1-01** Ground relay process: read UDP 14445, authenticate, forward to
       Gateway over TLS WebSocket, disk-backed queue that replays after an
@@ -294,8 +294,8 @@ Goal: telemetry from many vehicles reaches the database and a browser map.
       - lossy phase: 20.16%.
       The longest heartbeat gap rose from 1.05 s to 3.98 s. See
       `docs/runbooks/p1-09-link-quality.md`.
-      *Round-trip latency is moved to P3B-02.* It needs something sent and
-      answered, and Stage 0 sends nothing.
+      *Round-trip latency is dropped.* It needs something sent and answered,
+      and the system never sends anything to an aircraft.
 
 - [x] **P1-10** Ingest capacity: measure intake and drain separately, find the
       bottleneck, and turn relay-v1 §10 into measured numbers.
@@ -342,8 +342,6 @@ Goal: telemetry from many vehicles reaches the database and a browser map.
       A relay attached *before* QGC connects does see the reply, because QGC
       requests the version at every connect. That is Stage-0 compatible: the
       Gateway records what it observes and asks for nothing.
-      Also serves P10-05 maintenance tracking, which needs firmware per
-      airframe over time rather than a current value.
       *Done when:* connecting QGC to an aircraft results in a recorded flight
       software version for that `drone_id`, and a vehicle that never offers one
       is visibly unknown rather than silently absent.
@@ -468,31 +466,19 @@ Goal: telemetry from many vehicles reaches the database and a browser map.
 
 ---
 
-## Phase 2 — Data model and order lifecycle (1-1.5 weeks)
+## Phase 2 — Data model and registry (1-1.5 weeks)
 
-Goal: orders exist, move through states, and are fully auditable.
+Goal: operators and aircraft are registered, and every change is auditable.
 
 - [~] **P2-01** Alembic migrations for the full schema in
-      `docs/ARCHITECTURE.md` §4, with GiST indexes on all geometry.
+      `docs/ARCHITECTURE.md` §5, with GiST indexes on all geometry.
       *Done when:* `make migrate` runs clean up and down.
       *Partial* 2026-09-28: the relational tree exists with `bases`,
       `pilots`, `drones`, `airspace_zones` and `events` (GiST on every
       geometry; `events` append-only by trigger), and runs up, down and up in
-      CI (`make migrate-relational`). `orders` and `missions` are held back
-      until the business direction is decided (courier or monitoring).
-
-- [ ] **P2-02** Seed data: 3 bases, 10 drones, 3 pilots, realistic Tbilisi
-      coordinates and airframe parameters.
-      *Done when:* `make seed` produces a usable dataset.
-
-- [ ] **P2-03** Order state machine with an explicit transition table; illegal
-      transitions raise, every transition appends to `events`.
-      *Done when:* a unit test proves every illegal transition is rejected.
-
-- [ ] **P2-04** Order CRUD API: create, read, cancel, list with filters.
-      OpenAPI schema generated.
-      *Done when:* an order runs through all states via API calls and `events`
-      holds the complete trail.
+      CI (`make migrate-relational`). The delivery tables were dropped from
+      the design with the delivery scope (P-01); incidents (M-02) are the
+      next table.
 
 - [x] **P2-05** Drone and pilot registry API, including status transitions
       (`IDLE`, `ASSIGNED`, `IN_FLIGHT`, `CHARGING`, `MAINTENANCE`, `OFFLINE`).
@@ -511,24 +497,23 @@ Goal: orders exist, move through states, and are fully auditable.
       without anyone touching that database by hand.
       *Closed* 2026-09-28 (`python -m api`). Status is derived on every read:
       MAINTENANCE when set by a person, OFFLINE without live telemetry,
-      IN_FLIGHT when armed, IDLE otherwise. ASSIGNED needs missions and
-      CHARGING a charging signal; neither exists, so neither is produced
-      yet. Registering writes `known_drones` in the same transaction and a
-      test binds the new drone; retiring closes its bindings. Checked live
-      on the development machine against both databases.
+      IN_FLIGHT when armed, IDLE otherwise. ASSIGNED needed missions,
+      which are out of scope, and CHARGING a charging signal, which does not
+      exist, so neither is produced. Registering writes `known_drones` in
+      the same transaction and a test binds the new drone; retiring closes
+      its bindings. Checked live on the development machine against both
+      databases.
       **The API has no operator authentication** - nothing in this file
       provides it - so it binds to loopback and must not be exposed.
 
 - [~] **P2-06** Append-only audit log with a query API filtered by entity and
       time range.
-      *Done when:* an auditor can reconstruct an order's full history.
+      *Done when:* an auditor can reconstruct a drone's, a zone's or an
+      operator account's full history.
       *Partial* 2026-09-28: `events` refuses UPDATE, DELETE and TRUNCATE in
       the database; every registry change writes its row in the same
       transaction; `GET /events` filters by entity and time and pages by id.
-      A drone's history is reconstructed in a test. Orders do not exist yet.
-
-- [ ] **P2-07** Pricing calculation: distance, weight, priority tier.
-      *Done when:* quote endpoint returns price and ETA before order creation.
+      A drone's history is reconstructed in a test.
 
 - [ ] **P2-08** Registration check against the civil aviation authority's
       register (uas.gov.ge): an aircraft whose broadcast or declared
@@ -540,170 +525,29 @@ Goal: orders exist, move through states, and are fully auditable.
 
 ---
 
-## Phase 3 — Mission planning and pilot handoff (1.5-2 weeks)
+## Phase 5 — Airspace monitoring (3-4 weeks) — CRITICAL PATH
 
-At this stage the server plans and validates; the pilot uploads through QGC.
-Everything here is reusable unchanged once a command channel exists — only the
-transport changes.
+This is the phase where a missed alert means a collision nobody was warned
+about. Budget the most time here.
 
-- [ ] **P3-01** Mission generator: pickup/dropoff coordinates → waypoint list
-      (takeoff, climb to assigned altitude layer, cruise, loiter, land or
-      hover-release, servo action, return leg). Pure function, no I/O.
-      *Done when:* generated missions satisfy ArduPilot constraints and the
-      generator is fully unit-tested without a vehicle.
-
-- [ ] **P3-02** QGC `.plan` export: correct JSON structure (`fileType: "Plan"`,
-      `mission`, `geoFence`, `rallyPoints`), schema-versioned.
-      *Done when:* the exported file opens in QGC with no warnings and uploads
-      to a SITL vehicle successfully.
-
-- [ ] **P3-03** Geofence included in the export as a polygon matching the
-      approved corridor, plus rally points at the nearest bases.
-      *Done when:* a SITL vehicle flown outside the fence triggers FC-level RTL
-      with no server involvement.
-
-- [ ] **P3-04** Mission validation before release to the pilot: altitude band,
-      leg lengths, turn angles, total energy, no-fly intersection, corridor
-      reservation held.
-      *Done when:* an invalid mission is rejected with a specific named reason,
-      never a generic failure.
-
-- [ ] **P3-05** Pilot handoff flow in the console: assigned mission appears,
-      pilot downloads `.plan`, marks "uploaded", marks "launched". Each step
-      timestamped in `events`.
-      *Done when:* the full handoff is auditable end to end.
-
-- [ ] **P3-06** Progress inference from telemetry: `MISSION_CURRENT`,
-      `MISSION_ITEM_REACHED`, mode and arm state, proximity to waypoints. Drives
-      the order state machine for reversible transitions only.
-      *Done when:* a SITL flight advances the order through its states with no
-      manual input, and the two irreversible steps (payload release, delivery
-      complete) still require pilot confirmation.
-
-- [ ] **P3-07** Deviation monitoring: compare actual track against the approved
-      mission continuously. Alert on >50 m lateral deviation, altitude outside
-      the approved band, or unexpected mode change.
-      *Done when:* deliberately flying a SITL vehicle off-route raises an alert
-      within 5 s.
-
-- [ ] **P3-08** Mission reconciliation: detect when the vehicle is flying
-      something other than what the server planned (pilot loaded the wrong file,
-      or edited it in QGC).
-      *Done when:* a modified mission is detected and flagged, not silently
-      tracked as if it were the original.
-
-- [ ] **P3-09** End-to-end manual-loop SITL run: order created → drone assigned →
-      corridor reserved → `.plan` generated → loaded in QGC → flown → order
-      completed.
-      *Done when:* the loop completes 20 consecutive times and every run is
-      fully reconstructable from `events` alone.
-
----
-
-## Phase 3B — Direct command channel (DEFERRED)
-
-Unblocked by swapping QGC forwarding for `mavlink-router` on the ground PC.
-Still requires nothing on the aircraft. Do this when the manual handoff becomes
-the bottleneck — not before.
-
-- [ ] **P3B-01** `mavlink-router` configuration replacing QGC forwarding, with
-      QGC still attached as one of the endpoints.
-- [ ] **P3B-02** Bidirectional Gateway: per-vehicle command queue, send + await
-      ACK, 3 retries with backoff, terminal failure as an alert. Never a silent
-      success.
-      Also measures round-trip latency per vehicle, moved here from P1-09:
-      the first point at which the Gateway sends anything to time.
-- [ ] **P3B-03** Idempotency keys on every command; duplicate submission is a
-      no-op.
-- [ ] **P3B-04** Mission upload via the MAVLink mission protocol with read-back
-      verification.
-- [ ] **P3B-05** Flight mode control and arm/disarm, with pre-arm failures
-      surfaced as human-readable causes.
-- [ ] **P3B-06** Payload actuation via `DO_SET_SERVO` confirmed by servo output
-      telemetry.
-- [ ] **P3B-07** Automatic execution of deconfliction resolutions (tightens the
-      P5 alert threshold from 60 s back to 30 s).
-- [ ] **P3B-08** Fully autonomous SITL delivery: one API call, no human in the
-      loop, 20 consecutive successes.
-
----
-
-## Phase 4 — Dispatch (1.5-2 weeks)
-
-- [ ] **P4-01** Eligibility filters as a single testable function.
-      *Done when:* each filter has a test that isolates it.
-
-- [ ] **P4-02** PostGIS nearest-drone query using the KNN operator (`<->`) with
-      a partial index on idle drones.
-      *Done when:* `EXPLAIN ANALYZE` shows index usage and sub-10 ms at 100
-      drones.
-
-- [ ] **P4-03** Energy budget calculation per `ARCHITECTURE.md` §6, including
-      the return-to-base leg and the 35% reserve.
-      *Done when:* tests cover wind penalty, payload penalty, and the boundary
-      case where a drone is rejected by 1 Wh.
-
-- [ ] **P4-04** Wind data integration and `wind_factor` derivation from
-      forecast at route altitude.
-      *Done when:* headwind on the outbound leg measurably reduces eligibility.
-
-- [ ] **P4-05** Scoring function with config-driven weights.
-      *Done when:* weights are changeable without redeploy and the chosen drone
-      changes accordingly.
-
-- [ ] **P4-06** Batch assignment on a 5 s tick using
-      `scipy.optimize.linear_sum_assignment`.
-      *Done when:* a benchmark shows batch beating greedy on average wait time
-      for a 30-order burst.
-
-- [ ] **P4-07** Reassignment on failure: drone goes offline or battery drops
-      mid-mission → order re-enters the pool, customer is notified. At this
-      stage reassignment is a pilot-facing recommendation, not an automatic
-      recall.
-      *Done when:* killing a SITL drone mid-flight surfaces a reassignment
-      proposal within 30 s.
-
-- [ ] **P4-08** Dispatch simulation harness: 10 drones, 30 orders, measured
-      average ETA, utilisation, and rejection reasons.
-      *Done when:* the report is generated automatically and committed as a
-      baseline.
-
----
-
-## Phase 5 — Airspace and deconfliction (3-4 weeks) — CRITICAL PATH
-
-This is the phase where a bug means physical damage. Budget the most time here.
-
-**Order, decided with the owner on 2026-09-29.** The tactical layer - what
-applies to every aircraft in the air, ours or not - is finished first:
-P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
-(P5-00 to P5-05) follows. It is recorded here so the reasoning survives:
-
-- *Strategic, for the owner's own fleet.* The courier aircraft fly missions
-  only, so their routes are generated by the system, not drawn by a pilot:
-  build a route, check its 4D corridor against every other reserved one,
-  and pick a conflict-free one by the `ARCHITECTURE.md` §7.1 ladder -
-  another altitude layer, then a departure delay, then a reroute. A delay
-  is often cheaper than a detour in battery. P5-00 (terrain) is its
-  prerequisite, because the layers are AMSL and ground clearance needs
-  terrain.
-- *Tactical, for every aircraft.* Planning cannot cover wind, a failsafe
-  RTL, a mission changed by hand, or aircraft whose plans are unknown
-  (monitored third parties). In flight, a conflict is an alarm at the
-  control centre **and** a message to the pilot's phone (P5-16), carrying
-  the prescribed action rather than only "danger": the aircraft are on
-  missions, so a pilot has to intervene by hand.
+**Only the tactical layer remains.** On 2026-09-29 the owner put the tactical
+layer - what applies to every aircraft in the air, whoever flies it - first:
+P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer (route
+generation and 4D corridor reservation, P5-01 to P5-05) served the owner's own
+delivery fleet and was removed with it (P-02). The system watches aircraft
+whose plans it does not know, so a conflict is found in flight: an alarm at
+the control centre **and** a message to the operator's phone (P5-16),
+carrying the advised action rather than only "danger". The system itself
+never commands an aircraft.
 
 - [x] **P5-00** Terrain elevation source: ground elevation AMSL for a given
       position, so that AGL becomes derivable at all.
-      **A prerequisite for P5-01 and P5-03, not an optional extra.** There is
-      currently no source for height above ground anywhere in the system:
-      `GLOBAL_POSITION_INT.relative_alt` is "Altitude above home", and
-      `GPS_RAW_INT.alt` and `VFR_HUD.alt` are MSL. `ARCHITECTURE.md` §7's
-      altitude layers are therefore written in AMSL against a reference
-      elevation, and the terrain bound that makes them safe
-      (`max_terrain_rise_m = lowest_layer_offset_m - minimum_clearance_m`)
-      cannot be checked without this.
+      **A prerequisite for the height limit (P5-19), not an optional extra.**
+      There is currently no source for height above ground anywhere in the
+      system: `GLOBAL_POSITION_INT.relative_alt` is "Altitude above home", and
+      `GPS_RAW_INT.alt` and `VFR_HUD.alt` are MSL. Separation is therefore
+      judged in AMSL, and a limit on height above the ground cannot be checked
+      without this.
       Candidate sources, to be evaluated rather than assumed:
       - **A DEM** — SRTM (~30 m postings, void-filled variants vary) or
         Copernicus DEM (~30 m, generally better in mountainous terrain, which
@@ -767,29 +611,6 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
       assumption. Any use of `TERRAIN_REPORT` must treat `loaded == 0` as "no
       answer", never as zero.
 
-- [ ] **P5-01** Corridor generation: route → buffered polygon + altitude band +
-      time window, stored as a reservation.
-      *Done when:* corridors are visible as polygons on the pilot map.
-
-- [ ] **P5-02** Strategic conflict query: spatial ∩ temporal ∩ altitude overlap.
-      *Done when:* two crossing missions at the same altitude and time are
-      rejected; the same routes 10 minutes apart are accepted.
-
-- [ ] **P5-03** Semicircular altitude rule assignment by track angle.
-      Bands are **AMSL**, offset from an operating area's reference elevation
-      (`ARCHITECTURE.md` §7.1). AGL bands would not guarantee separation: two
-      aircraft 15 m apart in AGL over terrain differing by 15 m are at the same
-      height. Needs P5-00 to check the terrain bound.
-      *Done when:* reciprocal routes are automatically assigned different bands.
-
-- [ ] **P5-04** Conflict resolution ladder: altitude change → departure delay →
-      reroute, attempted in that order.
-      *Done when:* a scenario with 5 competing missions resolves all of them.
-
-- [ ] **P5-05** No-fly and restricted zone enforcement at planning time.
-      *Done when:* a route through a no-fly polygon is rejected with the zone
-      named in the error.
-
 - [x] **P5-06** Neighbour lookup on each telemetry tick, 800 m radius.
       *Done when:* lookup stays under 5 ms at 100 airborne drones.
       *Closed* 2026-09-29. A latitude-longitude grid with cells at least the
@@ -797,49 +618,42 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
       300 scattered aircraft, and a test asserts the slowest of 100 lookups
       at 100 drones is under 5 ms. The radius comes from `airspace_policy`.
 
-- [x] **P5-07** CPA computation per `ARCHITECTURE.md` §7.2.
+- [x] **P5-07** CPA computation per `ARCHITECTURE.md` §6.2.
       *Done when:* unit tests cover head-on, crossing, overtaking, parallel, and
       the zero-relative-velocity degenerate case.
       *Closed* 2026-09-29. All five, plus diverging pairs (judged on where
       they are now), vertical separation evaluated at the CPA time, and a
       climb that closes it. Thresholds live in `airspace_policy` (relational,
-      seeded with §7.2's Stage 0 values). `python -m airspace` raises a
+      seeded with §6.2's Stage 0 values). `python -m airspace` raises a
       critical alert per conflicting pair of armed aircraft, publishes it and
       writes it to `events`. Watched live with two SITL aircraft: raised when
       hovering 25 m apart, cleared when they separated, raised 57 s before a
       head-on pass (CPA 2.8 m), cleared as they diverged. See
       `docs/runbooks/p5-airspace-monitor.md`.
 
-- [ ] **P5-08** Deterministic resolution by drone ID with commanded descent or
-      loiter, logged on both vehicles.
+- [ ] **P5-08** Deterministic advisory resolution by drone ID (descend or
+      loiter), recorded in `events` against both aircraft. Advice to the
+      operators, never a command to the aircraft.
       *Done when:* the same conflict evaluated twice produces the identical
       resolution.
 
-- [ ] **P5-09** Resolution delivery as a pilot instruction: critical alert
+- [ ] **P5-09** Resolution delivery as an operator instruction: critical alert
       naming both aircraft, time to closest approach, and the prescribed action.
       Threshold widened to `t_cpa < 60 s` for human reaction time. Compliance
       tracked by watching the resulting telemetry.
-      *Done when:* both pilots involved in a conflict receive compatible
+      *Done when:* both operators involved in a conflict receive compatible
       instructions derived from the same deterministic rule, and failure to
       comply within 20 s escalates.
 
-- [ ] **P5-10** *(deferred to Stage 2)* Onboard peer broadcast (LoRa or
-      ESP-NOW): 1 Hz position packet, acted on without server involvement.
-      Requires an onboard computer — see P8-01.
-
-- [ ] **P5-11** ArduPilot `AVOID_*` and `FENCE_*` parameter profile applied and
-      verified at vehicle registration. At Stage 0 this is the only automatic
-      avoidance that exists, so it carries more weight than it will later.
-      *Done when:* parameter drift from the profile raises an alert.
-
-- [ ] **P5-12** Scenario framework: YAML defining drones, orders, wind, and
-      expected outcome; runs in CI.
+- [ ] **P5-12** Scenario framework: YAML defining drones, their flight paths,
+      wind, and expected outcome; runs in CI.
       *Done when:* `make scenario FILE=crossing_10.yml` produces a pass/fail
       report.
 
-- [ ] **P5-13** **Soak test.** 15 SITL drones, 50 orders, one city square, 2
-      hours continuous, with scripted pilot compliance (instruction followed
-      after a simulated 10-20 s human delay).
+- [ ] **P5-13** **Soak test.** 15 SITL drones on scripted flight paths, one
+      city square, 2 hours continuous, with scripted operator compliance
+      (instruction followed after a simulated 10-20 s human delay). D-02 runs
+      the same load on staging.
       *Done when:* zero separation violations under 30 m, and the log shows how
       many conflicts were detected, how each was resolved, and what the worst
       observed separation was.
@@ -847,22 +661,23 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
 - [ ] **P5-14** Pilot-delay sensitivity study: rerun the soak scenario with
       simulated reaction delays of 5, 15, 30, and 60 s.
       *Done when:* the report states the maximum tolerable human delay. This
-      number determines whether Stage 0 can safely run more than two aircraft
-      at once — it is a go/no-go input, not a nice-to-have.
+      number determines whether the alert lead time (`t_cpa < 60 s`) leaves a
+      notified operator enough time to act — it is a go/no-go input, not a
+      nice-to-have.
 
 - [x] **P5-15** In-flight zone incursion alerts: an armed aircraft inside a
       `no_fly` (critical) or `restricted` (warning) zone, within its AMSL
-      band, is alerted as it happens. P5-05 checks routes before release;
-      this watches where aircraft actually are, which a monitoring operator
-      needs whether or not a flight was planned here.
+      band, is alerted as it happens. It watches where aircraft actually
+      are, which a monitoring operator needs whether or not a flight was
+      planned here.
       *Done when:* an aircraft flown into a zone raises an alert naming the
       zone, and leaving it clears the alert.
       *Closed* 2026-09-29, added with the owner's agreement to build the
       monitoring core. Watched live: both SITL aircraft raised and cleared a
       warning on entering and leaving a restricted test zone.
 
-- [ ] **P5-16** Pilot notification: a critical airspace alert, with its
-      prescribed action (P5-09), reaches the pilot of each aircraft
+- [ ] **P5-16** Operator notification: a critical airspace alert, with its
+      advised action (P5-09), reaches the pilot of each aircraft
       involved on their phone, not only the control centre's console.
       Needs which pilot flies which aircraft and how to reach them. The
       channel is open: SMS is universal but can take 5-30 s or more to
@@ -920,9 +735,9 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
 
 ---
 
-## Phase 6 — Pilot console (2 weeks)
+## Phase 6 — Operator console (2 weeks)
 
-- [~] **P6-01** Map view: all active drones, routes, corridors, zones, bases.
+- [~] **P6-01** Map view: all active drones, zones, bases.
       Layer toggles.
       *Partial* 2026-09-29: `web-pilot/`, served by the API at `/app`. The
       self-hosted basemap, zones (corridors among them) and bases re-read
@@ -930,14 +745,13 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
       aircraft of each conflict, toggles for zones, bases and labels.
       Checked against two SITL aircraft flying the head-on and zone-entry
       scenario: both drawn, the zone warning and the critical conflict shown
-      and drawn, acknowledged, in `en` and `ka`. Routes wait for missions
-      (P3). There are no frontend tests yet.
-- [~] **P6-02** Per-drone detail panel: full telemetry, mission progress,
-      battery trend, link quality.
+      and drawn, acknowledged, in `en` and `ka`. There are no frontend tests
+      yet (S-19).
+- [~] **P6-02** Per-drone detail panel: full telemetry, battery trend, link
+      quality.
       *Partial* 2026-09-29: everything the feed carries, battery and
       altitude trends since the console opened, link loss and heartbeat
       gap, firmware, the aircraft's alerts, and a link to its replay.
-      Mission progress waits for missions (P3).
 - [~] **P6-03** Alert system with severity levels, audible cue for critical,
       acknowledge flow.
       *Partial* 2026-09-29: the console shows airspace alerts with severity,
@@ -953,16 +767,11 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
       reading "telemetry lost" there is false, and a pilot who learns the
       alerts overstate things will discount the one that does not. Reserve
       loss wording for a reported `gap` or a drop counter that moved.
-- [ ] **P6-04** Takeover: switch to GUIDED/LOITER, virtual joystick, altitude
-      and heading control. Confirmation required for any armed-state change.
-- [ ] **P6-05** WebRTC video feed (deferred until onboard computer exists —
-      depends on P8).
-- [ ] **P6-06** Pilot assignment view: which pilot supervises which drones,
-      enforced concurrency limit.
-- [ ] **P6-07** Intervention audit: every pilot action recorded with ID and
+- [ ] **P6-07** Operator action audit: every console action (acknowledging an
+      alert, changing the registry) recorded with the operator's ID and a
       timestamp.
-      *Phase done when:* a pilot can pause a SITL mission, fly manually, and
-      resume, with the full sequence in the audit log.
+      *Done when:* an acknowledgement made in one console is in `events` and
+      shown as acknowledged in every other console.
 
 - [x] **P6-08** Operator authentication and roles for the API and the console:
       named accounts, no shared login; roles `viewer` (see everything),
@@ -986,69 +795,34 @@ P5-08, P5-09, P5-16, P5-12, then P5-13 and P5-14. The strategic layer
 
 ---
 
-## Phase 7 — Failsafe matrix (1.5 weeks, parallel with Phase 6)
+## Phase 7 — Link failure behaviour, monitoring side (1 week)
 
-Each row is a task and a SITL test. None may be skipped.
+Goal: every way a data source can fail is visible to the supervisor, and none
+of them is mistaken for a quiet sky. The flight controller's own failsafes are
+the operator's responsibility and are not tested here.
 
-- [ ] **P7-01** Relay or server link loss >30 s → flight unaffected, tracking
-      degrades gracefully, pilot and customer both informed.
-- [ ] **P7-02** Telemetry/RC link loss → ArduPilot `FS_OPTIONS` behaviour
-      verified.
-- [ ] **P7-03** Battery below 25% → pilot alert with nearest base named and
-      distance shown; order marked for reassignment.
-- [ ] **P7-04** Battery below 15% → critical alert; ArduPilot battery failsafe
-      parameters verified to act independently of the pilot.
-- [ ] **P7-05** GPS fix loss → LOITER, alert, land after 20 s.
-- [ ] **P7-06** Geofence breach → FC-level RTL.
-- [ ] **P7-07** Wind above threshold → new departures blocked, airborne recalled.
-- [ ] **P7-08** Server outage → flight entirely unaffected; verify no code path
-      makes the aircraft depend on the server being reachable.
-- [ ] **P7-11** Ground PC or QGC crash mid-flight → FC failsafe behaviour
-      verified. This is the most serious Stage 0 failure mode; `FS_OPTIONS` must
-      be correct and tested before any flight with a real payload.
-- [ ] **P7-09** Payload release failure → do not proceed, return with payload,
-      alert.
-- [ ] **P7-10** EKF variance / compass error → abort to nearest base.
-      *Phase done when:* every row has an automated SITL test in CI.
-
----
-
-## Phase 8 — Payload and delivery confirmation (1.5-2 weeks)
-
-- [ ] **P8-01** Onboard computer bring-up: RPi Zero 2 W + LTE HAT, WireGuard,
-      agent as a systemd service, boots and connects unattended.
-- [ ] **P8-02** Store-and-forward telemetry buffering across link dropouts.
-- [ ] **P8-03** Release mechanism driver (servo latch or winch) with position
-      feedback.
-- [ ] **P8-04** Weight sensor on the latch confirming the payload actually left.
-- [ ] **P8-05** Recipient PIN verification in the customer app.
-- [ ] **P8-06** Photo capture at the drop point, uploaded and attached to the
-      order.
-- [ ] **P8-07** Precision landing markers (if base landing accuracy demands it).
-
----
-
-## Phase 9 — Customer app (2-3 weeks)
-
-- [ ] **P9-01** Auth: phone number + OTP.
-- [ ] **P9-02** Order creation: map pin selection, address search, weight and
-      dimensions.
-- [ ] **P9-03** Quote screen: price and ETA before committing.
-- [ ] **P9-04** Live tracking: drone position, progress, updated ETA.
-- [ ] **P9-05** Delivery confirmation: PIN display, photo receipt.
-- [ ] **P9-06** Order history and rating.
-- [ ] **P9-07** Push notifications for each state transition.
-- [ ] **P9-08** i18n: `ka` and `en` complete.
+- [ ] **P7-01** Relay or server link loss >30 s: the station shows
+      `unreachable`, the affected aircraft are marked stale rather than
+      dropped, the backlog replays on reconnect, and the gap is recorded with
+      its wall-clock window.
+      *Done when:* a SITL run with the relay's uplink cut for 60 s shows all
+      four in the console and in replay.
+- [ ] **P7-11** Ground PC or QGC crash mid-flight: the station and its
+      aircraft go stale with the cause visible, and a relay restart is
+      detected even when the Gateway was unreachable for longer than the old
+      uptime.
+      *Done when:* killing QGC and then the relay in SITL shows both
+      transitions, and restarting them resumes the same tracks.
 
 ---
 
 ## Phase 10 — Operations (1.5 weeks)
 
-- [ ] **P10-01** Prometheus metrics: fleet availability, mission success rate,
-      average ETA, battery health, conflict rate.
-- [ ] **P10-02** Grafana dashboards: fleet overview, per-drone health,
-      dispatch performance.
-- [ ] **P10-03** **Flight replay**: any past mission replayed on the map with
+- [ ] **P10-01** Prometheus metrics: tracked aircraft by source, ingest rates,
+      station states, alert and conflict rate.
+- [ ] **P10-02** Grafana dashboards: airspace overview, per-drone health,
+      ingest and alert performance.
+- [ ] **P10-03** **Flight replay**: any past flight replayed on the map with
       telemetry scrubbing. Essential for incident review — do not defer this.
       **Render gaps explicitly.** Telemetry can be missing for reasons the
       system already knows about — a relay `gap` from queue cap, an intake
@@ -1068,56 +842,305 @@ Each row is a task and a SITL test. None may be skipped.
       Procedure A.
 - [ ] **P10-04** Automatic `.bin` dataflash log retrieval and archival after
       each flight.
-- [ ] **P10-05** Maintenance tracking: flight hours, battery cycles, propeller
-      and motor service intervals.
-- [ ] **P10-06** Billing and invoicing.
-- [ ] **P10-07** Admin panel: fleet management, zone editing, pricing config.
 
 ---
 
-## Phase 11 — Field testing and regulation (starts during Phase 3, not at the end)
+## Phase 11 — Regulation (in parallel, not at the end)
 
-- [ ] **P11-01** Contact the civil aviation authority. Establish what BVLOS
-      commercial delivery requires and whether 1:1 pilot-to-drone is mandated.
-      **Do this before Phase 5 is written** — the answer changes the dispatch
-      design and the unit economics.
+- [ ] **P11-01** Contact the civil aviation authority. Establish what a
+      national monitoring system must receive and show, in which formats the
+      authority publishes zones and the register, and who operates the system.
+      **Do this before wave M is built** — the answer shapes M-03 and M-04.
 - [ ] **P11-02** Remote ID requirements and hardware selection.
-- [ ] **P11-03** Insurance and operational authorisation.
-- [ ] **P11-04** Single drone, VLOS, empty field: 20 consecutive successful
-      autonomous missions.
-- [ ] **P11-05** Two drones, deliberately crossing routes, VLOS, deconfliction
-      observed and logged.
-- [ ] **P11-06** Three drones, real payload, real addresses, pilot supervision.
-- [ ] **P11-07** Operations manual and pilot training material.
+
+---
+
+## Wave 0 — Remove the delivery scope
+
+- [x] **P-01** Delete `dispatch/` and `app-customer/` and every build, CI and
+      test reference to them.
+- [x] **P-02** Rewrite this file for flight monitoring: delivery tasks
+      removed, waves S, M and D added.
+- [x] **P-03** README, `CLAUDE.md`, `docs/ARCHITECTURE.md` and module docs
+      describe a monitor that never commands an aircraft.
+- [x] **P-04** No code comment cites a removed task.
+      *Done when:* a grep for the delivery scope finds only `courier_*`
+      identifiers, which S-14 renames.
+
+---
+
+## Wave S — Stability and security (parallel, six streams)
+
+Files are divided between the streams so that no two touch the same file.
+S-09 changes relay-v1 and needs both `agent/` and `gateway/`, so it follows
+S-A and S-B rather than running beside them. S-14 is optional and last.
+
+### S-A: `agent/` (relay)
+
+- [ ] **S-01** `read_from` reads up to the byte budget (`LIMIT` or an
+      iterator) instead of loading the whole backlog (`agent/queue.py:258`).
+      *Done when:* a test with a backlog far larger than the budget shows
+      memory bounded by the budget, and the records returned are the oldest,
+      oldest first.
+
+- [ ] **S-02** An error in the writer thread is logged, retried with backoff,
+      and raises a health flag carried in `status`, so the Gateway does not
+      show the station as healthy (`agent/relay.py:152`). `__main__` checks
+      that the thread is alive.
+      *Done when:* a simulated disk error makes `status` report degradation
+      (the presence test), and a writer that recovers clears it.
+
+- [ ] **S-03** SQLite calls leave the event loop and run in `to_thread`
+      (`agent/relay.py:197-209`).
+      *Done when:* no SQLite call runs on the event loop thread, checked by a
+      test.
+
+### S-B: `gateway/`
+
+- [ ] **S-04** Archive compression and fsync run in `to_thread`
+      (`gateway/ingest_store_pg.py:301`).
+      *Done when:* a slow disk no longer stalls other stations' sessions,
+      shown by a test.
+
+- [ ] **S-05** Only new records enter the pipeline, never duplicates
+      (`gateway/relay_server.py:381`). Drain no longer waits on the pipeline:
+      it hands off through a bounded queue.
+      *Done when:* a replayed batch publishes nothing twice, and a stalled
+      pipeline does not stop acknowledgements until the queue is full.
+
+- [ ] **S-06** A `StoreError` in the reporter task does not kill a station's
+      reporting (`gateway/relay_server.py:455-476`).
+      *Done when:* a test injects the error and the station keeps reporting.
+
+- [ ] **S-07** Bounds everywhere: `StationLinkTracker.losses`, eviction in
+      `RateLimiter`, a semaphore on Remote ID tasks, and an O(1) `_forget`.
+      *Done when:* each structure has a test that drives it past its bound.
+
+- [ ] **S-08** An empty or duplicated token in the token file is a startup
+      error. One station has one session, and the disconnect of an old
+      session does not disturb the new one.
+      *Done when:* each case has a test, including a reconnect racing the old
+      session's teardown.
+
+- [ ] **S-09** A gap inside a live session (a cap drop) at protocol level:
+      the relay sends `gap` and the Gateway moves its watermark. This changes
+      the relay-v1 spec and needs `agent/` and `gateway/` together, so it
+      runs **after S-A and S-B**, on its own.
+      *Done when:* relay-v1 documents it, and a cap drop during a session
+      appears at the Gateway as a recorded gap with the watermark past it.
+
+- [ ] **S-10** Remote ID spoofing: an unverified Remote ID broadcast is never
+      published on a registered aircraft's `telemetry.{id}` subject.
+      *Done when:* a broadcast carrying a registered serial, without that
+      aircraft's verification, is shown as a separate unverified track.
+
+### S-C: `airspace/` and `common/terrain.py`
+
+- [ ] **S-11** `Track` carries a timestamp. CPA extrapolates the neighbour's
+      position to the current time, and a neighbour older than a
+      configurable limit is left out.
+      *Done when:* tests show a stale neighbour excluded and a slightly old
+      one extrapolated, not taken as current.
+
+- [ ] **S-12** Checks are isolated from each other: an error in
+      `_check_height` must not lose the conflict and zone alerts
+      (`airspace/monitor.py:188`). Non-finite coordinates are rejected.
+      *Done when:* a test makes the height check raise and the other alerts
+      still arrive, and a NaN position raises no alert and is logged.
+
+- [ ] **S-13** The policy is reloaded periodically, and the death of the
+      ticker is logged. Audit and database writes leave the hot path through
+      a bounded queue. Terrain reads run in `to_thread` behind an LRU cache.
+      *Done when:* a policy change takes effect without a restart, and a slow
+      database does not delay alerts, both shown by tests.
+
+### S-D: `api/`
+
+- [ ] **S-15** scrypt runs in `to_thread`. Login is rate-limited by IP and by
+      username. The dummy hash uses `self.cost`. The hash is computed outside
+      `FOR UPDATE`.
+      *Done when:* tests cover the rate limit on both keys and the timing of
+      a login for an unknown user matches a known one.
+
+- [ ] **S-16** `/events` takes `since` and `until` in UTC. HTTP error details
+      no longer expose `IntegrityError`. `retire_drone` runs its operations
+      in the correct sequence. WebSocket connections check `Origin`.
+      *Done when:* each has a test, including a refused foreign origin.
+
+- [ ] **S-17** `api/` joins the mypy strict list, with a coverage threshold.
+      *Done when:* `pyproject.toml`, `CLAUDE.md` and `tests/test_layout.py`
+      agree, and CI enforces the threshold.
+
+### S-E: `web-pilot/`
+
+- [ ] **S-18** The feed reducer has a `default` branch, `JSON.parse` is
+      guarded, and reconnect uses exponential backoff with jitter, with no
+      tight loop on close code 4401.
+      *Done when:* a malformed message and a 4401 close are both handled
+      without a crash or a reconnect storm.
+
+- [ ] **S-19** vitest, with tests for the feed reducer and reconnect. CI runs
+      `npm test`.
+      *Done when:* the tests run in CI and fail on a broken reducer.
+
+### S-F: `infra/` and CI
+
+- [ ] **S-20** The SITL job also runs on push to `main`, and deploy depends
+      on it.
+      *Done when:* a red SITL job on `main` blocks the deploy.
+
+- [ ] **S-21** Images are tagged with the commit SHA. `deploy.sh` rolls back
+      to the previous tag on failure, and retries.
+      *Done when:* a deliberately broken deploy on staging returns to the
+      previous tag by itself.
+
+- [ ] **S-22** Development compose ports bind to `127.0.0.1`. A
+      `.dockerignore`. The Node version in the Dockerfile matches CI (22).
+      Base images pinned by digest. A dependency layer cache in the
+      Dockerfile.
+      *Done when:* nothing in the dev stack listens beyond loopback, and a
+      source-only change rebuilds without reinstalling dependencies.
+
+- [ ] **S-23** Backups cover the `archive` volume, the tokens and an
+      encrypted copy of `.env`, with an offsite copy (destination to be named
+      by the owner: DO Spaces, S3 or other). `restore_check` fails on a zero
+      count.
+      *Done when:* a restore from the offsite copy into a scratch environment
+      succeeds, and an empty restore makes `restore_check` fail.
+
+- [ ] **S-14** *(optional, last)* Rename the `courier_*` databases, users,
+      volumes and environment names, with a migration runbook. Until then
+      they stay as they are, because staging depends on them.
+      *Done when:* staging runs under the new names with its data intact, by
+      following the runbook.
+
+---
+
+## Wave M — Monitoring features for the ministry
+
+Sequenced by value to the demonstration. Each is its own branch.
+
+- [ ] **M-01** Finish Remote ID (P1-15): verified and unverified tracks told
+      apart in the console by colour and legend, receiver state shown, and
+      Remote ID tracks included in the CPA and zone checks.
+      *Done when:* a simulated unverified broadcast is drawn distinctly,
+      named in the legend, and raises a zone alert.
+
+- [ ] **M-02** Violations and incidents: an unregistered drone, a zone entry,
+      the height limit and a dangerous approach each become an **incident**,
+      with time, drone and serial, operator, a track excerpt and a status
+      (new, reviewed, closed). A table in the relational database.
+      *Done when:* each violation type opens an incident in a SITL run, and
+      an operator can move it through its statuses with each change in
+      `events`.
+
+- [ ] **M-03** Registry (P2-08): third-party operators and drones by serial
+      number. A Remote ID serial is matched against the registry, and an
+      `unregistered` warning is raised when it is absent.
+      *Done when:* a broadcast with an unknown serial raises `unregistered`,
+      and registering that serial clears it.
+
+- [ ] **M-04** Official zones (P5-18, ED-269): import and validation, with
+      checks. This was unfinished work in progress and is completed here.
+      *Done when:* P5-18's criterion is met and an invalid file is refused
+      with a named reason.
+
+- [ ] **M-05** Flight segmentation: a flight is take-off to landing, derived
+      from telemetry. A list of flights with filters (date, operator, drone,
+      region) and a link to replay (P10-03).
+      *Done when:* a SITL session with two take-offs lists two flights, each
+      opening its own replay.
+
+- [ ] **M-06** A read-only `regulator` role: sees everything, changes
+      nothing. The audit log records who viewed and who exported what.
+      *Done when:* every changing route refuses the role, and a view and an
+      export by it appear in `events`.
+
+- [ ] **M-07** Reports: an incident report (PDF), CSV export of flights and
+      violations, and a statistics dashboard (flights per day, violations by
+      type and region).
+      *Done when:* each report is produced from a SITL run's data and its
+      figures match the database.
+
+- [ ] **M-08** ADS-B (P1-16): manned aircraft on the map, and an alert when a
+      drone approaches one.
+      *Done when:* P1-16's criterion is met in the console.
+
+- [ ] **M-09** Georgian as the primary UI language: terminology reviewed, map
+      legend, and a printable view where needed.
+      *Done when:* a Georgian-speaking reviewer signs off the console and
+      reports in `ka`.
+
+---
+
+## Wave D — Demo readiness
+
+- [ ] **D-01** Demo scenario: N drones in SITL, a simulated Remote ID
+      receiver, and planned violations (zone, height, approach, unregistered
+      drone), started by one command (`make demo`).
+      *Done when:* `make demo` on a clean checkout produces every planned
+      violation on the console.
+
+- [ ] **D-02** Soak test on staging: 15+ drones for 2 hours, checking memory,
+      latency and missed alerts.
+      *Done when:* the report gives memory over time, alert latency and a
+      count of missed alerts, and the last is zero.
+
+- [ ] **D-03** Staging check: HTTPS, a real test of restoring a backup, and a
+      minimum of monitoring (Prometheus and Grafana, P10-01 and P10-02).
+      *Done when:* each item is demonstrated and recorded in the staging
+      runbook.
+
+- [ ] **D-04** Presentation script: the steps, what is shown, and what
+      happens if something fails (fallback: replay from a recording).
+      *Done when:* a full rehearsal follows the script, including one
+      deliberate fallback.
 
 ---
 
 ## Sequencing
 
 ```
-Stage 0 — QGC forwarding, pilot in the loop, nothing on the aircraft
-  Technical MVP     P0 → P1 → P2 → P3         4-5 weeks
-  Working system    P4 → P5 → P6 → P7         8-10 weeks
+Wave 0   Remove the delivery scope        P-01 → P-04
+Wave S   Stability and security           S-A … S-F in parallel,
+                                          then S-09; S-14 optional, last
+Wave M   Monitoring features              M-01 → M-09, by demo value
+Wave D   Demo readiness                   D-01 → D-04
 
-Stage 1 — mavlink-router, server commands, still nothing on the aircraft
-  Automation        P3B                       2 weeks
-
-Stage 2 — onboard computer
-  Product           P8 → P9 → P10             5-7 weeks
-
-Regulation          P11 in parallel from P3 onward
+Open tasks in Phases 1-10 are taken up where a wave needs them.
+Regulation (P11) runs in parallel throughout.
 ```
 
-Roughly 5-6 months for one developer. Phases 1, 2, 6 and 9 are conventional work
-and go fast with Claude Code. Phase 5 is the critical path.
+The presentation date is not yet known, so the priority is stability first,
+then readiness to demonstrate, then new features, and the system must be
+demonstrable at the end of every wave. Once a date is set, Wave D moves
+ahead of whatever remains of Wave M.
 
-**What Stage 0 buys.** The server cannot touch the aircraft, so no server bug
-can cause a crash. Dispatch, corridor reservation, conflict detection, deviation
-monitoring and the pilot console are all fully exercised and fully testable
-before anything gains the ability to send a command. When P3B lands, it swaps
-the transport under code that has already been proven.
+**Working rules.** One task is one agent, in its own git worktree and on its
+own branch (`fix/S-03-airspace-stale-track`, `feat/M-02-violations`).
+Parallel agents in one wave never touch the same file. The main session
+reviews each diff and runs ruff, mypy and pytest locally; a branch is pushed
+only with the owner's consent, and the owner opens the pull request and
+merges. CI runs on `main` and the deploy is automatic.
 
-**What Stage 0 costs.** Single base, pilot tied to the ground station, 2-3
-aircraft per radio net, and every deconfliction resolution routed through human
-reaction time. P5-14 measures whether that last one is acceptable; if the
-tolerable delay turns out to be short, P3B moves up the schedule.
+**What receive-only buys.** The system cannot touch an aircraft, so no bug in
+it can cause a crash. That was the Stage 0 guarantee; it is now permanent.
+Conflict detection, zone and height alerts and the console are exercised
+end to end against SITL with no path by which any of them could reach a
+flight controller.
+
+**What it costs.** Every resolution goes through a human: the system alerts,
+the operator acts. P5-14 measures whether the alert lead time is long enough
+for that.
+
+---
+
+## Open questions
+
+1. The offsite destination for backups (S-23).
+2. The format in which the authority provides zones and the register: its
+   own data, an ED-269 file, or manual entry (M-03, M-04).
+3. Whether a real Remote ID or ADS-B receiver is available for the
+   demonstration, or everything is simulated (M-01, M-08, D-01).
+4. Installing `gh` on the development machine so pull requests can be opened
+   directly.

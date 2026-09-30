@@ -2,7 +2,7 @@
 
 This is the Stage 0 safety guarantee at its first link: the server cannot
 affect flight because the component nearest the aircraft is physically unable
-to speak to it (`relay-v1.md` §1, `ARCHITECTURE.md` §3).
+to speak to it (`relay-v1.md` §1, `ARCHITECTURE.md` §4).
 
 Two tests, deliberately. One checks the object, one checks the source. The
 object test would pass if someone reached into the private socket; the source

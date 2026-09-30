@@ -23,7 +23,7 @@ alongside the range. It is created by `infra/initdb/timescale/01-extensions.sql`
 
 ## Why `known_drones` exists
 
-The fleet registry lives in the *relational* database (`ARCHITECTURE.md` §4),
+The fleet registry lives in the *relational* database (`ARCHITECTURE.md` §5),
 and the Gateway never connects to it. A foreign key cannot cross databases, so
 a binding to a drone that does not exist could only be caught by application
 code - which is exactly what "a constraint violation, not a silent skip" rules
@@ -59,7 +59,7 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.create_table(
         "known_drones",
-        # UUID because ARCHITECTURE.md §4's deconfliction resolution is ordered
+        # UUID because ARCHITECTURE.md §6.2's deconfliction advice is ordered
         # by drone_id ("lower drone_id maintains course"), so the identity has
         # to be totally ordered, and because the relational registry generates
         # them with uuid-ossp.

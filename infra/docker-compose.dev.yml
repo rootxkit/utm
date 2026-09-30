@@ -6,7 +6,7 @@
 #
 # Telemetry is a separate database from the start. It has a different write
 # pattern (high-rate append-only), a different retention policy, and losing it
-# must never take orders and missions with it.
+# must never take the registry and audit log with it.
 #
 # Everything is parameterised through the environment; copy infra/.env.example
 # to .env at the repository root. The defaults below are development-only.

@@ -6,9 +6,8 @@ Create Date: 2026-09-28
 
 P1-11. `AUTOPILOT_VERSION` as the Gateway observed it, one row each time a
 drone's reported firmware **changes**. The table is a history, not a current
-value. P10-05 maintenance tracking needs to know what an airframe ran on a
-given date, and an incident investigation needs to know what it ran in a
-given flight.
+value. An incident investigation needs to know what an airframe ran in a
+given flight, not only what it runs now.
 
 The Gateway observes the message and never requests it. Stage 0 is
 receive-only, and QGC requests the version on every connect, so a relay

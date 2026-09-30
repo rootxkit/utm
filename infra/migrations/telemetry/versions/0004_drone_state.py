@@ -1,10 +1,10 @@
-"""drone_state hypertable: the live telemetry the console and dispatch read
+"""drone_state hypertable: the live telemetry the console and airspace read
 
 Revision ID: 0004_drone_state
 Revises: 0003_source_bindings
 Create Date: 2026-09-23
 
-`ARCHITECTURE.md` §4. One row per vehicle per telemetry tick, in SI, with a
+`ARCHITECTURE.md` §5. One row per vehicle per telemetry tick, in SI, with a
 `drone_id` resolved through `source_bindings` at the record's own timestamp.
 
 ## Altitudes
@@ -82,7 +82,7 @@ def upgrade() -> None:
         sa.Column("vz_ms", sa.Double(), nullable=True),
         # Percent and energy are separate quantities, not two views of one
         # (CLAUDE.md). Percent depends on a discharge curve the autopilot
-        # chose; watt-hours are what P4-03's reserve check needs.
+        # chose; watt-hours are what an endurance estimate needs.
         sa.Column("batt_pct", sa.Double(), nullable=True),
         sa.Column("batt_voltage_v", sa.Double(), nullable=True),
         sa.Column("batt_consumed_wh", sa.Double(), nullable=True),

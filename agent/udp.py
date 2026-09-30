@@ -1,14 +1,14 @@
 """The UDP intake socket — receive only.
 
-At Stage 0 the server cannot affect flight. `ARCHITECTURE.md` §3 rests on that,
+At Stage 0 the server cannot affect flight. `ARCHITECTURE.md` §4 rests on that,
 and `relay-v1.md` §1 states it as an absolute rule. This module is where it is
 enforced: the socket object is private, and this class exposes no method that
 can transmit.
 
 That is deliberately stronger than "we do not call send". A capability no code
 can express cannot be reached by accident, by a refactor, or by someone who has
-not read the architecture. When a command path is eventually built it arrives
-through `mavlink-router` as a separate component (P3B-01), not through here.
+not read the architecture. No command path is planned, here or anywhere
+else: the system never commands an aircraft.
 """
 
 from __future__ import annotations

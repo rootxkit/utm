@@ -76,7 +76,7 @@ def test_unserialisable_values_do_not_lose_the_line() -> None:
 
 def test_exception_is_rendered_into_the_record() -> None:
     try:
-        raise ValueError("mission upload failed")
+        raise ValueError("zone import failed")
     except ValueError:
         import sys
 
@@ -84,26 +84,26 @@ def test_exception_is_rendered_into_the_record() -> None:
         record.exc_info = sys.exc_info()
         payload = json.loads(JsonFormatter(service="gateway").format(record))
 
-    assert "ValueError: mission upload failed" in payload["exception"]
+    assert "ValueError: zone import failed" in payload["exception"]
 
 
 def test_configure_logging_writes_json_to_stdout(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    configure_logging(service="dispatch", level="INFO")
-    get_logger("dispatch.assign").info("assigned", extra={"order_id": "o-9"})
+    configure_logging(service="airspace", level="INFO")
+    get_logger("airspace.monitor").info("alert raised", extra={"drone_id": "d-9"})
 
     payload = _emit(capsys)
-    assert payload["service"] == "dispatch"
-    assert payload["message"] == "assigned"
-    assert payload["order_id"] == "o-9"
+    assert payload["service"] == "airspace"
+    assert payload["message"] == "alert raised"
+    assert payload["drone_id"] == "d-9"
 
 
 def test_configure_logging_is_idempotent(capsys: pytest.CaptureFixture[str]) -> None:
     """A second call must not double every line."""
-    configure_logging(service="dispatch", level="INFO")
-    configure_logging(service="dispatch", level="INFO")
-    get_logger("dispatch.assign").info("once")
+    configure_logging(service="airspace", level="INFO")
+    configure_logging(service="airspace", level="INFO")
+    get_logger("airspace.monitor").info("once")
 
     _emit(capsys)  # asserts exactly one line
 

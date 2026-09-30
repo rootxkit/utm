@@ -21,7 +21,7 @@ A = UUID(int=1)
 B = UUID(int=2)
 LAT0 = 41.7151
 LON0 = 44.8271
-# Stage 0 values from ARCHITECTURE.md §7.2, as the migration seeds them.
+# Stage 0 values from ARCHITECTURE.md §6.2, as the migration seeds them.
 POLICY = SeparationPolicy(
     t_cpa_max_s=60, d_horizontal_min_m=60, d_vertical_min_m=20, neighbour_radius_m=800
 )

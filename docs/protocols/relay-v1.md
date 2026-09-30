@@ -33,12 +33,11 @@ this is where that guarantee is enforced physically rather than promised.
 Nothing in this protocol carries a message travelling towards a vehicle.
 
 This prohibition is absolute and is **not** a placeholder for a future command
-path. When a command channel arrives it does not come through here: P3B-01
-replaces QGC forwarding with `mavlink-router`, and commands become a separate
-component with its own review (`ARCHITECTURE.md` §2, Stage 1). Adding a send
-path to this socket would therefore require a protocol version bump and a
-deliberate re-examination of the Stage 0 safety argument — which is exactly the
-friction that should stand in the way. A capability that no code can express is
+path. The system never commands an aircraft (`ARCHITECTURE.md` §3), so no
+command channel is planned, here or anywhere else. Adding a send path to this
+socket would require a protocol version bump and a deliberate re-examination of
+the Stage 0 safety argument — which is exactly the friction that should stand
+in the way. A capability that no code can express is
 worth more than one that merely nobody currently calls.
 
 ## 2. Transport
@@ -247,7 +246,7 @@ The two drop counters are separate because they are different failures with
 different remedies, and because only one of them is visible as a `gap` — see
 §11.
 
-**`last_datagram_age_ms` is the field that matters.** `ARCHITECTURE.md` §3
+**`last_datagram_age_ms` is the field that matters.** `ARCHITECTURE.md` §4
 separates two failure domains that a naive implementation renders identically:
 
 | Situation | Symptom without `status` | Symptom with `status` |

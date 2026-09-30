@@ -1,8 +1,9 @@
 """Is an aircraft inside a no-fly or restricted zone? In flight, not at planning.
 
-P5-05 checks a *route* against zones before release. This checks where an
-aircraft *is*, on every telemetry tick: the monitoring half, which is what a
-supervisor watching the air needs whether or not anyone planned the flight.
+No route is checked against zones before a flight; the system never sees
+one. This checks where an aircraft *is*, on every telemetry tick, which is
+what a supervisor watching the air needs whether or not anyone planned the
+flight.
 
 Zones come from `airspace_zones` in the relational database (P2-01): a WGS84
 polygon and an optional AMSL altitude band. A missing bound is unbounded, so a

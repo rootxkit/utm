@@ -10,11 +10,11 @@ from common import NatsSettings, PostgresSettings, RedisSettings, ServiceSetting
 
 
 class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSettings):
-    """Everything corridor reservation and deconfliction need to start.
+    """Everything the airspace monitor needs to start.
 
-    Separation minima, altitude bands and alert thresholds are not here. They
+    Separation minima, height limits and alert thresholds are not here. They
     are airspace policy, they are edited by operators, and they belong in the
-    database where a change is audited (P5-01, P5-03).
+    database where a change is audited (P5-07, P5-19).
     """
 
     service_name: str = "airspace"

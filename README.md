@@ -1,13 +1,21 @@
-# courier
+# UTM
 
-Drone courier platform. A fleet of ArduPilot multirotors flies autonomous
-delivery missions, dispatched by a central backend, supervised by human pilots,
-with airspace deconfliction between aircraft.
+National drone-flight monitoring system. It observes every drone in the
+airspace it can hear and shows them on one map, with zones, violations, alerts,
+flight history and replay, for a control centre and the regulator.
 
-At the current stage (Stage 0) the server is an **observer and a planner, never
-a controller**: it ingests telemetry, plans and validates missions, reserves
-airspace corridors and raises alerts, but every command to an aircraft is issued
-by a human pilot through QGroundControl. See `docs/ARCHITECTURE.md` §2.
+Data sources (`docs/ARCHITECTURE.md` §2):
+
+- **Operator relays** — MAVLink forwarded by QGroundControl to a relay on the
+  operator's ground station, and on to the Gateway over TLS.
+- **Remote ID receivers** — broadcast Remote ID, shown as unverified.
+- **ADS-B** — manned aircraft (planned, P1-16).
+- **Registry** — operators, drones and their serial numbers.
+
+The system is an **observer, never a controller**, permanently: it ingests
+telemetry, checks it against zones, height limits and other traffic, and raises
+alerts, but it never sends anything to an aircraft. Every command is the
+operator's, through QGroundControl. See `docs/ARCHITECTURE.md` §3.
 
 - System design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - Work breakdown and task IDs: [`TASKS.md`](TASKS.md)
@@ -16,14 +24,13 @@ by a human pilot through QGroundControl. See `docs/ARCHITECTURE.md` §2.
 ## Layout
 
 ```
-agent/         On-vehicle / ground-relay MAVLink agent (Python)
-gateway/       MAVLink ingest + command dispatch service
-api/           Core REST/WS API: orders, drones, pilots, billing
-dispatch/      Assignment engine (filters, scoring, batch assignment)
-airspace/      Corridor reservation, CPA, deconfliction
+agent/         Ground-relay MAVLink agent, receive only (Python)
+gateway/       MAVLink and Remote ID ingest, receive only
+api/           Core REST/WS API: registry, zones, audit log, replay, console feed
+airspace/      Airspace monitor: CPA, zone incursions, height limit
 common/        Shared logging and configuration library
-web-pilot/     Pilot / operator console (React)
-app-customer/  Customer mobile app (React Native)
+web-pilot/     Operator console (React)
+tools/         Operator diagnostics and measurement scripts
 infra/         docker-compose, migrations, CI, deployment
 sim/           SITL launch scripts and scenario definitions
 docs/          Architecture, runbooks, decision records

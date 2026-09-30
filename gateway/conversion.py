@@ -102,7 +102,7 @@ class BatteryState:
     """Battery, with percent and energy kept separate.
 
     CLAUDE.md: "battery percent 0-100 and watt-hours separately". A percentage
-    is what a pilot reads; energy is what P4-03's reserve check needs, and the
+    is what a pilot reads; energy is what an endurance estimate needs, and the
     two are not interchangeable because percent depends on a curve the
     autopilot chose.
     """
@@ -250,7 +250,7 @@ def battery_from_sys_status(message: Any) -> BatteryState:
 
 
 def battery_from_battery_status(message: Any) -> BatteryState:
-    """BATTERY_STATUS -> SI, including the energy P4-03 budgets against."""
+    """BATTERY_STATUS -> SI, including the energy consumed."""
     energy_j = to_si(message, "energy_consumed")
     return BatteryState(
         remaining_pct=to_si(message, "battery_remaining"),

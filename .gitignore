@@ -71,7 +71,6 @@ web-pilot/dist/
 web-pilot/.vite/
 # Generated from web-pilot/openapi.json at build time; never hand-written.
 web-pilot/src/api/schema.d.ts
-app-customer/.expo/
 
 # Editors and OS
 .idea/

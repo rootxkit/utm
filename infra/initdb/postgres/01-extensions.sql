@@ -6,7 +6,7 @@
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS postgis_topology;
 
--- Used by the dispatch scoring and audit queries.
+-- Used by the airspace and audit queries.
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 

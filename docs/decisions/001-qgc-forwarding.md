@@ -222,7 +222,7 @@ QGC finish its initial parameter download, and leave it idle on the flight view
 for a couple of minutes — then re-run. That is what the 2026-09-28 run did.
 
 **This does not block anything.** The plan treats the channel as telemetry-only
-by design, and every safety argument in `ARCHITECTURE.md` §3 depends on the
+by design, and every safety argument in `ARCHITECTURE.md` §4 depends on the
 server *not* being able to reach the aircraft. A positive result here would not
 change what we build; it would only inform P3B timing. Even if the channel
 turned out to be bidirectional, it is undocumented and varies by QGC build, so

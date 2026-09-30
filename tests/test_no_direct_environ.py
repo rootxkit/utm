@@ -19,7 +19,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-SERVICE_PACKAGES = ("agent", "gateway", "api", "dispatch", "airspace")
+SERVICE_PACKAGES = ("agent", "gateway", "api", "airspace")
 
 # common.config is the one place allowed to reach the environment, and it does
 # so through pydantic-settings rather than os.environ. Tests may set up their

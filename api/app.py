@@ -1,8 +1,5 @@
 """The core API: the fleet registry and its audit log. P2-05, P2-06.
 
-Orders and pricing (P2-03, P2-04, P2-07) are not here: they are the courier
-business, and that decision is open (2026-09-28).
-
 **Every route needs a signed-in operator** (P6-08, `api/auth_http.py`):
 reading needs `viewer`, changing the registry needs `admin`. Every change is
 recorded in `events` against the operator who made it. The API still binds

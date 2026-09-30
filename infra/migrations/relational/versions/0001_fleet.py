@@ -4,18 +4,17 @@ Revision ID: 0001_fleet
 Revises:
 Create Date: 2026-09-28
 
-P2-01, the fleet part of `ARCHITECTURE.md` §4. `orders` and `missions` are
-deliberately not here yet: they are the courier business, and whether the
-platform is a courier is an open business decision (2026-09-28). Everything
-here is needed whatever it becomes.
+P2-01, the fleet part of `ARCHITECTURE.md` §5. The delivery tables of the
+earlier design were never created here, and have since left the design
+(P-01).
 
-## Departures from §4, each on purpose
+## Departures from §5, each on purpose
 
 - **`drones.status` is not a column.** P2-05 requires status to be derived
   from telemetry freshness, not set by hand, so a stored status could only
   ever disagree with the truth. What a person does set is stored instead:
-  `in_maintenance` and `retired_at`. §4's partial index on `status = 'IDLE'`
-  goes with it, and returns if P4 dispatch needs a materialised status.
+  `in_maintenance` and `retired_at`. The design's partial index on
+  `status = 'IDLE'` goes with it.
 - **`drones.sysid` is not a column.** Which SYSID an airframe transmits as, on
   which station, from when, is `source_bindings` in the telemetry database
   (P1-06). A second copy here would be a second answer.
@@ -134,8 +133,8 @@ def upgrade() -> None:
         sa.Column("label", sa.Text(), nullable=False, unique=True),
         sa.Column("model", sa.Text(), nullable=True),
         # Airframe parameters. Nullable: a monitored aircraft may have none on
-        # record, and dispatch (P4) must refuse such a drone rather than
-        # assume a value. Positive when present.
+        # record, and nothing may assume a value for one. Positive when
+        # present.
         sa.Column("max_payload_g", sa.Integer(), nullable=True),
         sa.Column("max_range_m", sa.Float(), nullable=True),
         sa.Column("battery_capacity_wh", sa.Float(), nullable=True),

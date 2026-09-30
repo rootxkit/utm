@@ -40,6 +40,6 @@ takes medians per phase.
 
 ## Not measured: round-trip latency
 
-A round trip needs something sent to the aircraft and answered. Stage 0 is
+A round trip needs something sent to the aircraft and answered. The system is
 receive-only, so RTT is not reported, rather than estimated in a way nothing
-could check. It is moved to P3B-02, where the Gateway first sends.
+could check. It is dropped: the Gateway never sends.
