@@ -1055,9 +1055,10 @@ async def test_records_are_backlog_while_the_relay_drains_and_live_after() -> No
     assert processor.draining == [True, True, True, False, False]
 
 
-async def test_a_deep_queue_alone_never_starts_a_drain() -> None:
-    """§8's depth scales with the fleet, so it starts nothing by itself; a
-    big frame does, and the same depth then keeps it draining."""
+async def test_a_depth_with_no_rate_known_starts_nothing() -> None:
+    """Before any record has been stored the session's rate is unknown, so
+    a reported depth, however large, cannot start a drain; a big frame
+    still does, and the depth then keeps it draining."""
     processor = RecordingProcessor()
     async with (
         running(processor=processor, ack_interval_s=0.05) as server,
@@ -1071,6 +1072,40 @@ async def test_a_deep_queue_alone_never_starts_a_drain() -> None:
         await drain_and_settle(connection, 49)
 
     assert processor.draining == [False, True, True]
+
+
+async def test_a_slow_gateway_session_with_small_frames_is_flagged_by_depth() -> None:
+    """The reviewer's stuck-false case: the relay's send loop returns once
+    the socket buffer takes a frame, so with a Gateway slow to process
+    (ADR-002) small 100 ms frames arrive old while the relay's queue grows.
+    At 1000 records/s the clearing bound is 3000 and the start bound 6000:
+    a depth of 5000 is still live, 7000 flags, and the flag holds on small
+    frames until a depth of 2500 (under 3000) lets a small frame clear it."""
+    processor = RecordingProcessor()
+    async with (
+        running(processor=processor, ack_interval_s=0.05) as server,
+        connect(url(server), additional_headers=auth()) as connection,
+    ):
+        await handshake(connection, hello(newest_seq_held=-1))
+
+        def small(first_seq: int) -> bytes:
+            return timed_batch(first_seq, 100, rate_hz=1000.0, datagram_bytes=60)
+
+        await connection.send(small(0))
+        await connection.send(small(100))
+        await connection.send(status(queue_depth=5000))  # under 6 s of rate
+        await connection.send(small(200))
+        await connection.send(status(queue_depth=7000))  # over 6 s of rate
+        await connection.send(small(300))
+        await connection.send(status(queue_depth=4000))  # over 3 s: still
+        await connection.send(small(400))
+        await connection.send(status(queue_depth=2500))  # under 3 s: clears
+        await connection.send(small(500))
+        await connection.send(small(600))
+        await drain_and_settle(connection, 699)
+
+    assert [b[0] for b in processor.batches] == [0, 100, 200, 300, 400, 500, 600]
+    assert processor.draining == [False, False, False, True, True, False, False]
 
 
 async def test_with_no_status_ever_a_small_frame_ends_the_drain() -> None:
@@ -1089,10 +1124,21 @@ async def test_with_no_status_ever_a_small_frame_ends_the_drain() -> None:
     assert processor.draining == [True, False]
 
 
-def test_the_clearing_bound_follows_the_sessions_rate_with_a_floor() -> None:
+def bare_session() -> Any:
     session = _Session.__new__(_Session)
     session._recent_batches = deque()
-    session.server = cast(Any, type("S", (), {"drain_clear_s": 3.0})())
+    session.clock_steps_back = 0
+    session.draining = False
+    session._last_queue_depth = None
+    session.log = cast(Any, logging.getLogger("gateway.tests.bare_session"))
+    session.server = cast(
+        Any, type("S", (), {"drain_clear_s": 3.0, "drain_start_factor": 2.0})()
+    )
+    return session
+
+
+def test_the_clearing_bound_follows_the_sessions_rate_with_a_floor() -> None:
+    session = bare_session()
     assert session.drain_clear_bound() is None
 
     # 1000 records over one second of capture: 3000 at 3 s.
@@ -1102,6 +1148,52 @@ def test_the_clearing_bound_follows_the_sessions_rate_with_a_floor() -> None:
     session._recent_batches.clear()
     session._recent_batches.append((0, 1_000_000_000, 10))
     assert session.drain_clear_bound() == 100
+
+
+def test_the_start_trigger_is_a_multiple_of_the_clearing_bound() -> None:
+    session = bare_session()
+    session._note_queue_depth(1_000_000)
+    assert session.draining is False, "no rate known: depth starts nothing"
+
+    session._recent_batches.append((0, 1_000_000_000, 1000))  # bound 3000
+    session._note_queue_depth(6000)
+    assert session.draining is False, "at the start bound, not over it"
+    session._note_queue_depth(6001)
+    assert session.draining is True
+
+
+def records_between(start_s: float, end_s: float, count: int) -> list[Record]:
+    return [
+        Record(
+            seq=n,
+            recv_utc_ns=int((start_s + (end_s - start_s) * n / (count - 1)) * 1e9),
+            datagram=b"x",
+        )
+        for n in range(count)
+    ]
+
+
+def test_a_backward_clock_step_resets_the_rate_window_and_is_counted() -> None:
+    """A batch captured before the previous one ended would never age out
+    of the window (nothing is older than it by more than the window), so
+    the deque would grow for the length of the step. It starts over."""
+    session = bare_session()
+    session._note_records(records_between(0.0, 1.0, 100))
+    session._note_records(records_between(1.0, 2.0, 100))
+    assert len(session._recent_batches) == 2
+    assert session.record_rate_hz() == pytest.approx(100.0)
+
+    # The station clock steps back 90 s: the next batch is captured at -88.
+    session._note_records(records_between(-88.0, -87.0, 500))
+    assert len(session._recent_batches) == 1
+    assert session.clock_steps_back == 1
+    assert session.record_rate_hz() == pytest.approx(500.0)
+
+    # Later batches on the stepped clock age the window out as normal.
+    for start_s in range(-87, -80):
+        session._note_records(records_between(start_s, start_s + 1.0, 500))
+    assert len(session._recent_batches) <= 7
+    assert session.clock_steps_back == 1
 
 
 async def test_each_batch_is_processed_with_its_sessions_newest_seq_held() -> None:

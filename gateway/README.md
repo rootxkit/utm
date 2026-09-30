@@ -47,15 +47,22 @@ Every published telemetry message carries these time-related fields:
     without any clock: a frame at or above 32 KiB, half the §6 size bound,
     only occurs when more than 100 ms of records were waiting (three
     aircraft produce under 1 KiB per 100 ms), and a real drain always
-    sends one first. That, and only that, starts the drain. It ends on a
-    frame under the bound once the last reported `status.queue_depth` (§8,
-    records awaiting acknowledgement) is within `RelayServer.drain_clear_s`
-    (3 s) of the session's own record rate, measured on the records'
-    `recv_utc_ns`, with a floor of 100 records; with no depth or rate known
-    yet, a small frame clears it. Depth is never compared with a fixed
+    sends one first. A reported `status.queue_depth` (§8, records awaiting
+    acknowledgement) also starts it, when it exceeds
+    `RelayServer.drain_start_factor` (2) times the clearing bound below,
+    that is, six seconds of the session's own intake: the relay's send
+    loop returns as soon as the socket buffer takes a frame, so a Gateway
+    slow to process can have hundreds of KB of small, old frames in flight
+    while the relay's queue grows. It ends on a frame under the size bound
+    once the last reported depth is within `RelayServer.drain_clear_s`
+    (3 s) of the session's record rate, measured on the records'
+    `recv_utc_ns` over the last 5 s of capture, with a floor of 100 records;
+    with no depth or rate known yet, a small frame clears it, and with no
+    rate known, depth starts nothing. Depth is never compared with a fixed
     count: a healthy twelve-aircraft station holds over a thousand
-    unacknowledged records before each 1 s ack, and a fixed count would
-    flag it for ever. Once the drain ends, `captured_at` is within a batch
-    of `rx_ts`.
+    unacknowledged records (about 1.1 s) before each 1 s ack, and a fixed
+    count would flag it for ever. A station clock stepping back resets the
+    rate window (counted). Once the drain ends, `captured_at` is within a
+    batch of `rx_ts`.
   Those positions are history: the airspace monitor records them but raises
   no live alert from them. Always `false` for Remote ID, which has no queue.

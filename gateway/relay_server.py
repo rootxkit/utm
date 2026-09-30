@@ -81,6 +81,15 @@ DRAIN_CLEAR_S: Final = 3.0
 # The bound never falls below this many records, so a station with a very
 # low rate (one aircraft at a low message rate) still clears its drain.
 DRAIN_CLEAR_MIN_RECORDS: Final = 100
+# S-11. A reported depth above this many clearing bounds (six seconds of
+# the session's own rate) starts a drain even with small frames. The relay
+# reads only what is queued and `send` returns once the socket buffer takes
+# the frame (agent/relay.py `_send_loop`), so a Gateway that is slow to
+# process (ADR-002: 47 s behind) can have hundreds of KB of small, old
+# frames sitting in socket buffers while the relay's queue keeps growing;
+# the frames arrive small and stale. A healthy fleet holds about 1.1 s of
+# records before each ack, so it can never reach six.
+DRAIN_START_FACTOR: Final = 2.0
 # How much of the session's own capture the record rate is measured over,
 # on the relay's `recv_utc_ns` (§4): clock-free with respect to the Gateway,
 # and the intake rate is what the queue depth has to be compared with.
@@ -185,6 +194,9 @@ class RelayServer:
     # S-11. Seconds of a session's own intake its reported queue depth must
     # be within before a drain is over (see `_Session.draining`).
     drain_clear_s: float = DRAIN_CLEAR_S
+    # S-11. Multiples of the clearing bound at which a reported depth
+    # starts a drain by itself.
+    drain_start_factor: float = DRAIN_START_FACTOR
     station_report_interval_s: float = STATION_REPORT_INTERVAL_S
     unreachable_after_s: float = 3.0
     radio_silent_after_ms: int = 3_000
@@ -439,19 +451,23 @@ class _Session:
     # S-11. Whether the relay is still working off a queue. While it is,
     # records captured during this session reach here seconds to minutes
     # late (relay-v1 §10: drain barely exceeds intake), and must not be
-    # taken as the present. One clock-free signal starts it: a frame at or
-    # above `DRAIN_FRAME_BYTES`, which §6 only produces when there is more
-    # than 100 ms of records waiting; a real drain always sends one first.
-    # It ends on a frame under the bound, once the last reported
-    # `status.queue_depth` (§8) is within `RelayServer.drain_clear_s` of the
-    # session's own record rate (or no depth or rate is known yet). Depth
-    # alone never starts a drain: it scales with the fleet, and a fixed
-    # count would flag a busy live station for ever.
+    # taken as the present. Two signals start it, neither a fixed count: a
+    # frame at or above `DRAIN_FRAME_BYTES`, which §6 only produces when
+    # there is more than 100 ms of records waiting, and a reported
+    # `status.queue_depth` (§8) above `RelayServer.drain_start_factor`
+    # clearing bounds, that is, more of the session's own intake than any
+    # healthy ack lag holds (small frames can arrive stale when the Gateway
+    # is slow to process, see `DRAIN_START_FACTOR`). It ends on a frame
+    # under the bound, once the last reported depth is within
+    # `RelayServer.drain_clear_s` of the session's rate (or no depth or
+    # rate is known yet). With no rate known, depth starts nothing.
     draining: bool = False
     _last_queue_depth: int | None = None
     # (first recv_utc_ns, last recv_utc_ns, records) per stored batch, kept
-    # for `_RATE_WINDOW_NS` of capture, for the session's record rate.
+    # for `_RATE_WINDOW_NS` of capture, for the session's record rate. Reset
+    # when the station's clock steps back, counted in `clock_steps_back`.
     _recent_batches: deque[tuple[int, int, int]] = field(default_factory=deque)
+    clock_steps_back: int = 0
 
     def __post_init__(self) -> None:
         # The highest seq durably stored for this epoch, cumulative. -1 means
@@ -555,11 +571,24 @@ class _Session:
         timings.report_if_due()
 
     def _note_records(self, records: list[Record]) -> None:
-        """Keep the batch's capture span and count for the record rate."""
-        self._recent_batches.append(
-            (records[0].recv_utc_ns, records[-1].recv_utc_ns, len(records))
-        )
-        newest_ns = records[-1].recv_utc_ns
+        """Keep the batch's capture span and count for the record rate. A
+        batch captured before the previous one ended means the station's
+        clock stepped back (relay-v1 §9): the window would never age out
+        and would grow for the length of the step, so it starts over."""
+        first_ns, newest_ns = records[0].recv_utc_ns, records[-1].recv_utc_ns
+        if self._recent_batches and first_ns < self._recent_batches[-1][1]:
+            self.clock_steps_back += 1
+            self.log.warning(
+                "station clock stepped back; record rate starts over",
+                extra={
+                    "step_back_s": round(
+                        (self._recent_batches[-1][1] - first_ns) / 1e9, 3
+                    ),
+                    "clock_steps_back": self.clock_steps_back,
+                },
+            )
+            self._recent_batches.clear()
+        self._recent_batches.append((first_ns, newest_ns, len(records)))
         while (
             len(self._recent_batches) > 1
             and newest_ns - self._recent_batches[0][1] > _RATE_WINDOW_NS
@@ -613,9 +642,19 @@ class _Session:
             self.draining = False
 
     def _note_queue_depth(self, queue_depth: int) -> None:
-        """Remember the latest `status.queue_depth` (§8) for the clearing
-        guard. Depth never starts a drain: see `draining`."""
+        """Remember the latest `status.queue_depth` (§8), and start a drain
+        when it exceeds `drain_start_factor` clearing bounds of this
+        session's own rate: see `draining`. With no rate known, nothing."""
         self._last_queue_depth = queue_depth
+        bound = self.drain_clear_bound()
+        if bound is None or self.draining:
+            return
+        if queue_depth > self.server.drain_start_factor * bound:
+            self.log.info(
+                "relay reports a queue far beyond its rate; its records are backlog",
+                extra={"queue_depth": queue_depth, "clear_bound": bound},
+            )
+            self.draining = True
 
     async def _handle_control(self, payload: str) -> None:
         message = parse_control_message(payload)
