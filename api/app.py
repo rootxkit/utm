@@ -450,9 +450,14 @@ def _add_replay_routes(app: FastAPI, replay: ReplayStore, auth: Authenticator) -
         until: datetime | None = None,
         limit: int = Query(default=50, ge=1, le=MAX_FLIGHTS_PER_PAGE),
     ) -> list[dict[str, Any]]:
-        """Armed spans of this aircraft, newest first."""
+        """Armed spans of this aircraft, newest first. A window longer than
+        the configured maximum is refused with 413."""
         end = _utc(until) if until is not None else datetime.now(tz=UTC)
-        start = _utc(since) if since is not None else end - DEFAULT_FLIGHT_LOOKBACK
+        # The default look-back never exceeds the maximum it would be refused by.
+        lookback = min(
+            DEFAULT_FLIGHT_LOOKBACK, timedelta(seconds=replay.max_flight_window_s)
+        )
+        start = _utc(since) if since is not None else end - lookback
         try:
             return await replay.flights(drone_id, since=start, until=end, limit=limit)
         except ReplayError as error:

@@ -54,6 +54,7 @@ def build_app(settings: ApiSettings) -> FastAPI:
         evidence_slack_s=settings.replay_evidence_slack_s,
         flight_split_s=settings.replay_flight_split_s,
         max_samples=settings.replay_max_samples,
+        max_flight_window_s=settings.replay_max_flight_window_s,
     )
     operators = OperatorStore(
         engine=engine,

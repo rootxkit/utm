@@ -661,6 +661,10 @@ class ReplayStore:
     evidence_slack_s: float
     flight_split_s: float
     max_samples: int
+    # S-16. The flight list scans armed telemetry across its whole window, so
+    # a window is refused beyond this rather than scanned; `max_samples` does
+    # the same for a replay. The default matches `REPLAY_MAX_FLIGHT_WINDOW_S`.
+    max_flight_window_s: float = 90 * 86400.0
 
     async def drones(self) -> list[dict[str, Any]]:
         async with self.telemetry.connect() as connection:
@@ -709,6 +713,13 @@ class ReplayStore:
     ) -> list[dict[str, Any]]:
         """Armed spans, newest first. A flight is armed telemetry with no
         silence longer than `flight_split_s` inside it."""
+        if until <= since:
+            raise ReplayError("the window must end after it starts")
+        if (until - since).total_seconds() > self.max_flight_window_s:
+            raise WindowTooLargeError(
+                f"a flight list spans at most {self.max_flight_window_s:g} s; "
+                "narrow the window"
+            )
         _, source = await self.identify(drone_id)
         query = _RID_FLIGHTS if source == SOURCE_REMOTE_ID else _FLIGHTS
         async with self.telemetry.connect() as connection:

@@ -132,6 +132,11 @@ class ApiSettings(
     replay_max_samples: int = Field(
         default=100_000, gt=0, validation_alias="REPLAY_MAX_SAMPLES"
     )
+    # S-16. The longest window the flight list scans; a longer one is
+    # refused, as a replay over `replay_max_samples` is. 90 days.
+    replay_max_flight_window_s: float = Field(
+        default=90 * 86400.0, gt=0, validation_alias="REPLAY_MAX_FLIGHT_WINDOW_S"
+    )
 
 
 class ConsoleSettings(FeedTicketSettings, NatsSettings):
