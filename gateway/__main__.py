@@ -39,12 +39,12 @@ import redis.asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from common import configure_logging, get_logger, load_settings
+from common.bus import RECONNECT_FOREVER
 from common.sources import (
     RELAY,
-    SourceControlFollower,
     SourceControlState,
-    bucket_reader,
     follow,
+    follower_from_settings,
 )
 from gateway.archive import RawArchive
 from gateway.binding import BindingResolver
@@ -149,7 +149,9 @@ async def run(args: argparse.Namespace) -> int:
     archive = RawArchive(root=settings.archive_root)
     store = TimescaleIngestStore(engine=engine, archive=archive)
 
-    bus = await nats.connect(str(settings.nats_url))
+    bus = await nats.connect(
+        str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
+    )
     # One publisher, two producers. The pipeline publishes what it parsed out
     # of the datagrams; the relay server publishes the health of the link that
     # carried them. The console needs both, and a station with no aircraft on
@@ -188,11 +190,7 @@ async def run(args: argparse.Namespace) -> int:
         if closed:
             _log.info("relay sessions closed by a switch", extra={"closed": closed})
 
-    follower = SourceControlFollower(
-        read=bucket_reader(bus, settings.source_control_bucket),
-        on_change=on_switch,
-        poll_s=settings.source_control_poll_s,
-    )
+    follower = follower_from_settings(bus, settings, on_change=on_switch)
     server.sources = SourceActivity(
         source_type=RELAY,
         switch=follower,
@@ -200,7 +198,10 @@ async def run(args: argparse.Namespace) -> int:
         connected=server.connected_stations,
     )
     # Before the server listens, so a station disabled before this start
-    # is refused from its first attempt.
+    # is refused from its first attempt - provided the bucket could be read.
+    # If it could not, after a few tries, the Gateway serves anyway with
+    # every station enabled and says so (`follower.start`), rather than
+    # refusing every station because the switches are unknown.
     control = await follow(bus, follower, subject=settings.source_control_subject)
     await server.start()
     _log.info(

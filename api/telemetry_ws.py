@@ -55,7 +55,7 @@ from nats.aio.msg import Msg
 from api.assets import STATIC, mount_map_assets
 from api.auth import FEED_COOKIE, verify_feed_ticket, wall_clock_s
 from common import get_logger
-from common.bus import round_trip
+from common.bus import RECONNECT_FOREVER, round_trip
 
 _log = get_logger(__name__)
 
@@ -266,7 +266,8 @@ def create_app(
         client: NatsClient | None = None
         try:
             client = await asyncio.wait_for(
-                nats.connect(nats_url), timeout=connect_timeout_s
+                nats.connect(nats_url, max_reconnect_attempts=RECONNECT_FOREVER),
+                timeout=connect_timeout_s,
             )
         except Exception as error:
             # A console that will not load because the bus is down is worse

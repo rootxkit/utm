@@ -25,11 +25,11 @@ from airspace.policy import load_height_limit, load_policy
 from airspace.service import AirspaceService, EventsAuditLog, run_ticker
 from airspace.zones import load_zones
 from common import configure_logging, get_logger, load_settings
+from common.bus import RECONNECT_FOREVER
 from common.sources import (
-    SourceControlFollower,
     SourceControlState,
-    bucket_reader,
     follow,
+    follower_from_settings,
 )
 from common.terrain import Terrain
 
@@ -58,13 +58,12 @@ async def run(settings: AirspaceSettings) -> None:
             "be evaluated",
             extra={"max_height_agl_m": max_height_agl_m},
         )
-    bus = await nats.connect(str(settings.nats_url))
+    bus = await nats.connect(
+        str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
+    )
     # U-15. The switches, from the same bucket and subject the adapters
     # follow, so the monitor stops judging a source when they stop taking it.
-    follower = SourceControlFollower(
-        read=bucket_reader(bus, settings.source_control_bucket),
-        poll_s=settings.source_control_poll_s,
-    )
+    follower = follower_from_settings(bus, settings)
     monitor = AirspaceMonitor(
         source_enabled=follower.enabled,
         policy=policy,
@@ -84,6 +83,7 @@ async def run(settings: AirspaceSettings) -> None:
         close_timeout_s=settings.audit_close_timeout_s,
         tiles=terrain,
         tile_log_every_s=settings.terrain_retry_missing_s,
+        source_control=follower,
     )
     _log.info(
         "airspace monitor running",

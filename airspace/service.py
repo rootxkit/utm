@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from airspace.monitor import AirspaceMonitor, Alert, Change, ClearReason
 from common import get_logger
+from common.sources import SourceControlFollower
 from common.terrain import cell_name
 
 _log = get_logger(__name__)
@@ -136,6 +137,9 @@ class AirspaceService:
     monitor: AirspaceMonitor
     bus: Bus
     audit: AuditLog | None = None
+    # U-15. The source switches, for the status line: whether they could be
+    # read. None in tests that do not follow them.
+    source_control: SourceControlFollower | None = None
     # Wall clock, on the same epoch as telemetry's `ts` (S-11): the monitor
     # compares the two to tell live telemetry from a replayed backlog.
     clock: Callable[[], float] = time.time
@@ -290,6 +294,7 @@ class AirspaceService:
             "audit_overflow": self.audit_overflow,
             "audit_failures": self.audit_failures,
             "audit_abandoned": self.audit_abandoned,
+            **({} if self.source_control is None else self.source_control.status()),
         }
 
     def _log_status(self, now_s: float) -> None:

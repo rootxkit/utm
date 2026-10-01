@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from common import get_logger
-from common.sources import WHOLE_TYPE, SourceControlState
+from common.sources import WHOLE_TYPE, SourceControlFollower, SourceControlState
 from gateway.publisher import Bus
 from gateway.rate_limit import RateLimiter
 
@@ -183,6 +183,12 @@ class SourceActivity:
                 if not state.enabled(self.source_type, name)
             ),
             "source_type_disabled": int(not state.enabled(self.source_type, None)),
+            # Whether the switches themselves could be read (common/sources.py).
+            **(
+                self.switch.status()
+                if isinstance(self.switch, SourceControlFollower)
+                else {}
+            ),
         }
 
 

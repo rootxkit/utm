@@ -52,8 +52,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from common import configure_logging, get_logger, load_settings
+from common.bus import RECONNECT_FOREVER
 from common.geoid import GeoidGrid
-from common.sources import REMOTE_ID, SourceControlFollower, bucket_reader, follow
+from common.sources import REMOTE_ID, follow, follower_from_settings
 from gateway import odid
 from gateway.config import RemoteIdSettings
 from gateway.publisher import Bus
@@ -231,6 +232,9 @@ class RemoteIdIngest:
         }
         for reason in TIME_FALLBACK_REASONS:
             totals[f"time_fallback_{reason}"] = tracker.time_fallbacks[reason]
+        if self.sources is not None:
+            # U-15: refusals, and whether the switches could be read.
+            totals.update(self.sources.status())
         if self.store is not None:
             totals["store_pending"] = self.store.pending
             totals["store_written"] = self.store.written
@@ -327,7 +331,9 @@ async def refresh_serials_periodically(
 
 
 async def run(settings: RemoteIdSettings) -> None:
-    bus = await nats.connect(str(settings.nats_url))
+    bus = await nats.connect(
+        str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
+    )
     engine = create_async_engine(str(settings.telemetry_database_url))
     store = PendingRows(writer=RemoteIdWriter(engine))
     geoid = load_geoid(settings.geoid_path)
@@ -341,10 +347,7 @@ async def run(settings: RemoteIdSettings) -> None:
     await fleet.refresh(engine)
     # U-15. The switches, from the bucket the API writes; never from the
     # relational database.
-    follower = SourceControlFollower(
-        read=bucket_reader(bus, settings.source_control_bucket),
-        poll_s=settings.source_control_poll_s,
-    )
+    follower = follower_from_settings(bus, settings)
     sources = SourceActivity(
         source_type=REMOTE_ID,
         switch=follower,
