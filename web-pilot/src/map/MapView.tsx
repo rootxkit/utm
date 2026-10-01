@@ -422,6 +422,26 @@ export function MapView({
     setData(map, "draft", draftGeoJson(draft));
   }, [styleEpoch, draft]);
 
+  // A zone selected in the list is brought into view, once per selection.
+  const zonesRef = useRef(zones);
+  zonesRef.current = zones;
+  useEffect(() => {
+    const map = mapRef.current;
+    const zone = zonesRef.current.find((z) => z.id === selectedZone);
+    if (!map || !zone) return;
+    const ring = (zone.geometry as { coordinates?: number[][][] }).coordinates?.[0] ?? [];
+    const lons = ring.map((p) => p[0] ?? 0);
+    const lats = ring.map((p) => p[1] ?? 0);
+    if (lons.length === 0) return;
+    map.fitBounds(
+      [
+        [Math.min(...lons), Math.min(...lats)],
+        [Math.max(...lons), Math.max(...lats)],
+      ],
+      { padding: 60, maxZoom: 15 },
+    );
+  }, [selectedZone]);
+
   // While drawing, a double click must not zoom, and the cursor says so.
   useEffect(() => {
     const map = mapRef.current;
