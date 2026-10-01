@@ -104,10 +104,12 @@ export interface Alert {
     // Null when either aircraft's vertical position is unknown (S-33).
     d_alt_at_cpa_m?: number | null;
     vertical_separation_known?: boolean;
-    // Zone and height alerts on a pressure altitude (S-33): judged with
-    // this margin, and only a warning.
+    // Zone and height alerts on a pressure altitude (S-33): approximate to
+    // within this margin; within_band false when only inside the widened
+    // band, which is a warning.
     vertical_known?: boolean;
     pressure_uncertainty_m?: number;
+    within_band?: boolean;
     d_horizontal_now_m?: number;
     zone_name?: string;
     zone_type?: string;

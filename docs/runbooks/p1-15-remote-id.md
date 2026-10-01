@@ -185,11 +185,14 @@ as poor, the pressure altitude is used instead (S-33).
   monitor therefore treats such an aircraft's vertical position as
   unknown. A conflict with it is judged on the horizontal criteria alone,
   and its alert says `vertical_separation_known: false`, with no vertical
-  distance. A zone's altitude band is widened by the monitor's
-  `PRESSURE_UNCERTAINTY_M` (250 m) each way for it. The height limit counts
-  as exceeded only if it still is with that margin taken off. Both alerts
-  are then warnings saying `vertical_known: false`. Zones without altitude
-  limits are judged as for anyone. The monitor counts these messages as
+  distance. Inside a zone's altitude band as indicated, it raises as
+  usual, a no-fly zone at critical. Inside the band widened by the
+  monitor's `PRESSURE_UNCERTAINTY_M` (250 m) each way, but not the band
+  itself, it raises a warning. The height limit is judged on the indicated
+  height, as a warning. These alerts say `vertical_known: false`. Zones
+  without altitude limits are judged as for anyone. When an active alert's
+  severity changes, it is raised again under its key, so the console and
+  the audit log see the change. The monitor counts these messages as
   `vertical_unknown` in its status line.
 - **Stored:** the row's `geoid_model` says `pressure altitude, ISA
   1013.25 hPa`. That is not a geoid: read it as "no geodetic height".
