@@ -24,9 +24,16 @@ VIEWER = Operator(
     display_name="Test Viewer",
     role=Role.VIEWER,
 )
-TOKENS = {"admin-token": ADMIN, "viewer-token": VIEWER}
+OPERATOR = Operator(
+    id=UUID("00000000-0000-4000-8000-00000000c0c0"),
+    username="test-operator",
+    display_name="Test Operator",
+    role=Role.OPERATOR,
+)
+TOKENS = {"admin-token": ADMIN, "viewer-token": VIEWER, "operator-token": OPERATOR}
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 VIEWER_HEADERS = {"Authorization": "Bearer viewer-token"}
+OPERATOR_HEADERS = {"Authorization": "Bearer operator-token"}
 FEED_SECRET = b"test-feed-secret-0123456789abcdef0123"
 
 

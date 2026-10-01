@@ -553,7 +553,7 @@ async def test_an_edit_is_audited_with_what_changed_and_a_no_op_writes_nothing(
     )
 
     assert changed.status_code == 200
-    assert changed.json()["contact_phone"] == "+995 555 000 111"
+    assert changed.json()["contact"]["contact_phone"] == "+995 555 000 111"
     assert same.status_code == 200
     events = (
         await client.get(

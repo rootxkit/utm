@@ -185,6 +185,40 @@ def _changes(current: Mapping[str, Any], wanted: Mapping[str, Any]) -> dict[str,
     }
 
 
+# Contact details of a person. Never written to `events`, which every viewer
+# can read, and returned only to operators and admins (`api.uas_routes`).
+CONTACT_FIELDS = frozenset({"contact_email", "contact_phone", "postal_address"})
+
+
+def _without_contact(row: Mapping[str, Any]) -> dict[str, Any]:
+    """An audit payload of a record: its values but its contact details,
+    of which only the names of those present are recorded."""
+    payload = {name: value for name, value in row.items() if name not in CONTACT_FIELDS}
+    payload["contact_fields"] = sorted(
+        name for name in CONTACT_FIELDS if row.get(name) is not None
+    )
+    return payload
+
+
+def _audited_changes(diff: Mapping[str, Any]) -> dict[str, Any]:
+    """What an edit is audited as: every changed field by name, and from/to
+    values only for fields that are not contact details."""
+    return {
+        "changed_fields": sorted(diff),
+        "changes": {
+            name: change for name, change in diff.items() if name not in CONTACT_FIELDS
+        },
+    }
+
+
+def _refuse_revoked(entity: str, name: str, status: str) -> None:
+    """A revoked record is final: not edited, not re-homed."""
+    if status == RegistrationStatus.REVOKED:
+        raise ConflictError(
+            f"{entity} {name} is revoked, which is final", code="revoked"
+        )
+
+
 def _uas_out(row: dict[str, Any]) -> dict[str, Any]:
     row["serial_cta2063"] = is_cta2063(row["serial"])
     return row
@@ -258,7 +292,7 @@ class UasRegistry:
                     "uas_operator",
                     operator["id"],
                     "registered",
-                    operator,
+                    _without_contact(operator),
                     actor=actor,
                 )
         except IntegrityError as error:
@@ -334,7 +368,8 @@ class UasRegistry:
             rows = await connection.execute(
                 sa.text(
                     f"SELECT {_OPERATOR_COLUMNS} FROM uas_operators {where} "
-                    "ORDER BY registration_number LIMIT :limit OFFSET :offset"
+                    "ORDER BY upper(registration_number), registration_number "
+                    "LIMIT :limit OFFSET :offset"
                 ),
                 params,
             )
@@ -374,6 +409,9 @@ class UasRegistry:
         try:
             async with self.engine.begin() as connection:
                 current = await self._lock_operator(connection, operator_id)
+                _refuse_revoked(
+                    "UAS operator", current["registration_number"], current["status"]
+                )
                 diff = _changes(current, wanted)
                 if not diff:
                     return current
@@ -397,7 +435,7 @@ class UasRegistry:
                     "uas_operator",
                     operator_id,
                     "updated",
-                    {"changes": diff, "source": source},
+                    {**_audited_changes(diff), "source": source},
                     actor=actor,
                 )
                 return _row(updated)
@@ -469,7 +507,12 @@ class UasRegistry:
             return
         status = (
             await connection.execute(
-                sa.text("SELECT status FROM uas_operators WHERE id = :id"),
+                # FOR KEY SHARE waits for a revocation in progress (which
+                # holds FOR UPDATE) and then reads its outcome, so nothing is
+                # attached to an operator in the moment it is revoked.
+                sa.text(
+                    "SELECT status FROM uas_operators WHERE id = :id FOR KEY SHARE"
+                ),
                 {"id": str(operator_id)},
             )
         ).scalar_one_or_none()
@@ -563,7 +606,10 @@ class UasRegistry:
         """Record or replace one competency. The previous one is in `events`."""
         _aware("valid_until", record.valid_until)
         async with self.engine.begin() as connection:
-            await self._lock_pilot(connection, pilot_id)
+            current = await self._lock_pilot(connection, pilot_id)
+            _refuse_revoked(
+                "remote pilot", current["name"], current["registration_status"]
+            )
             await self._record_competency(connection, pilot_id, record)
             await audit(
                 connection,
@@ -706,7 +752,8 @@ class UasRegistry:
     ) -> dict[str, Any]:
         """Register a UAS and project it into `known_drones`, like a fleet drone.
 
-        `label` is what consoles show; the serial when not given.
+        `label` is what consoles show; the serial when not given. A label
+        another aircraft already has is refused as `label_taken`.
         """
         label_class = None if class_label is None else ClassLabel(class_label)
         normalized = self.valid_serial(serial, label_class)
@@ -716,6 +763,20 @@ class UasRegistry:
         try:
             async with self.engine.begin() as connection:
                 await self._refuse_revoked_operator(connection, uas_operator_id)
+                holder = (
+                    await connection.execute(
+                        sa.text("SELECT serial FROM drones WHERE label = :label"),
+                        {"label": shown},
+                    )
+                ).scalar_one_or_none()
+                if holder is not None and holder != normalized:
+                    # Labels are unique across fleet and UAS. Say so, rather
+                    # than a bare `duplicate` the caller would read as the serial.
+                    raise ConflictError(
+                        f"the label {shown!r} is another aircraft's; give this "
+                        "UAS a label of its own",
+                        code="label_taken",
+                    )
                 drone_id: UUID = (
                     await connection.execute(
                         sa.text(
@@ -855,6 +916,9 @@ class UasRegistry:
         try:
             async with self.engine.begin() as connection:
                 current = await self._lock_uas(connection, drone_id)
+                _refuse_revoked(
+                    "UAS", current["serial"], current["registration_status"]
+                )
                 diff = _changes(current, wanted)
                 if not diff:
                     return await self._uas(connection, drone_id)

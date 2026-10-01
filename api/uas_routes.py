@@ -23,6 +23,7 @@ from api.auth_http import Authenticator, require
 from api.http_errors import registry_http
 from api.registry import RegistryError
 from api.uas_registry import (
+    CONTACT_FIELDS,
     MAX_PAGE,
     Competency,
     CompetencyRecord,
@@ -59,14 +60,19 @@ class UasOperatorPatch(BaseModel):
     valid_until: datetime | None = None
 
 
+class UasOperatorContact(BaseModel):
+    contact_email: str | None
+    contact_phone: str | None
+    postal_address: str | None
+
+
 class UasOperatorOut(BaseModel):
     id: UUID
     registration_number: str
     legal_name: str
     operator_type: OperatorType
-    contact_email: str | None
-    contact_phone: str | None
-    postal_address: str | None
+    # A person's contact details: for operators and admins, null for viewers.
+    contact: UasOperatorContact | None
     status: RegistrationStatus
     # The instant the registration stops being valid; null when not recorded.
     valid_until: datetime | None
@@ -156,6 +162,21 @@ class UasOut(BaseModel):
 
 Handler = Callable[[], Coroutine[Any, Any, dict[str, Any]]]
 
+# Who may see an operator's contact details.
+_SEES_CONTACT = frozenset({Role.OPERATOR, Role.ADMIN})
+
+
+def _shown(row: dict[str, Any], who: Operator) -> dict[str, Any]:
+    """An operator as `who` may see it: contact details only for operators
+    and admins, never for viewers."""
+    shown = {name: value for name, value in row.items() if name not in CONTACT_FIELDS}
+    shown["contact"] = (
+        {name: row.get(name) for name in CONTACT_FIELDS}
+        if who.role in _SEES_CONTACT
+        else None
+    )
+    return shown
+
 
 async def _call(action: Handler) -> dict[str, Any]:
     try:
@@ -181,15 +202,16 @@ def uas_router(uas: UasRegistry | None, auth: Authenticator) -> APIRouter:
     async def create_operator(
         body: UasOperatorIn, operator: Annotated[Operator, Depends(admin)]
     ) -> dict[str, Any]:
-        return await _call(
+        created = await _call(
             lambda: registry().create_operator(
                 **body.model_dump(), actor=operator.actor
             )
         )
+        return _shown(created, operator)
 
     @router.get("/operators", response_model=list[UasOperatorOut])
     async def list_operators(
-        _: Annotated[Operator, Depends(viewer)],
+        who: Annotated[Operator, Depends(viewer)],
         status: RegistrationStatus | None = None,
         source: RecordSource | None = None,
         q: str | None = Query(default=None, max_length=_TEXT),
@@ -197,25 +219,27 @@ def uas_router(uas: UasRegistry | None, auth: Authenticator) -> APIRouter:
         offset: int = Query(default=0, ge=0),
     ) -> list[dict[str, Any]]:
         """`q` matches the registration number or the legal name."""
-        return await registry().list_operators(
+        rows = await registry().list_operators(
             status=status, source=source, query=q, limit=limit, offset=offset
         )
+        return [_shown(row, who) for row in rows]
 
     @router.get("/operators/lookup", response_model=UasOperatorOut)
     async def operator_by_registration(
-        _: Annotated[Operator, Depends(viewer)],
+        who: Annotated[Operator, Depends(viewer)],
         registration_number: str = Query(min_length=1, max_length=64),
     ) -> dict[str, Any]:
         """Exactly one operator, by registration number, ignoring case."""
-        return await _call(
+        found = await _call(
             lambda: registry().operator_by_registration(registration_number)
         )
+        return _shown(found, who)
 
     @router.get("/operators/{operator_id}", response_model=UasOperatorOut)
     async def get_operator(
-        operator_id: UUID, _: Annotated[Operator, Depends(viewer)]
+        operator_id: UUID, who: Annotated[Operator, Depends(viewer)]
     ) -> dict[str, Any]:
-        return await _call(lambda: registry().get_operator(operator_id))
+        return _shown(await _call(lambda: registry().get_operator(operator_id)), who)
 
     @router.patch("/operators/{operator_id}", response_model=UasOperatorOut)
     async def update_operator(
@@ -223,11 +247,12 @@ def uas_router(uas: UasRegistry | None, auth: Authenticator) -> APIRouter:
         body: UasOperatorPatch,
         operator: Annotated[Operator, Depends(admin)],
     ) -> dict[str, Any]:
-        return await _call(
+        updated = await _call(
             lambda: registry().update_operator(
                 operator_id, body.model_dump(exclude_unset=True), actor=operator.actor
             )
         )
+        return _shown(updated, operator)
 
     def operator_status_route(path: str, status: RegistrationStatus) -> None:
         @router.post(
@@ -240,7 +265,7 @@ def uas_router(uas: UasRegistry | None, auth: Authenticator) -> APIRouter:
             operator: Annotated[Operator, Depends(admin)],
             body: StatusChangeIn | None = None,
         ) -> dict[str, Any]:
-            return await _call(
+            changed = await _call(
                 lambda: registry().set_operator_status(
                     operator_id,
                     status,
@@ -248,6 +273,7 @@ def uas_router(uas: UasRegistry | None, auth: Authenticator) -> APIRouter:
                     actor=operator.actor,
                 )
             )
+            return _shown(changed, operator)
 
     # --- remote pilots --------------------------------------------------------------
 

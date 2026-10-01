@@ -1125,6 +1125,50 @@
         "title": "UasIn",
         "type": "object"
       },
+      "UasOperatorContact": {
+        "properties": {
+          "contact_email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contact Email"
+          },
+          "contact_phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contact Phone"
+          },
+          "postal_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Postal Address"
+          }
+        },
+        "required": [
+          "contact_email",
+          "contact_phone",
+          "postal_address"
+        ],
+        "title": "UasOperatorContact",
+        "type": "object"
+      },
       "UasOperatorIn": {
         "properties": {
           "contact_email": {
@@ -1201,27 +1245,15 @@
       },
       "UasOperatorOut": {
         "properties": {
-          "contact_email": {
+          "contact": {
             "anyOf": [
               {
-                "type": "string"
+                "$ref": "#/components/schemas/UasOperatorContact"
               },
               {
                 "type": "null"
               }
-            ],
-            "title": "Contact Email"
-          },
-          "contact_phone": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Contact Phone"
+            ]
           },
           "created_at": {
             "format": "date-time",
@@ -1239,17 +1271,6 @@
           },
           "operator_type": {
             "$ref": "#/components/schemas/OperatorType"
-          },
-          "postal_address": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Postal Address"
           },
           "registration_number": {
             "title": "Registration Number",
@@ -1284,9 +1305,7 @@
           "registration_number",
           "legal_name",
           "operator_type",
-          "contact_email",
-          "contact_phone",
-          "postal_address",
+          "contact",
           "status",
           "valid_until",
           "source",
