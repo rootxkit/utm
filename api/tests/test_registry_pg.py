@@ -680,7 +680,11 @@ async def test_the_audit_log_refuses_to_be_edited(
 async def test_zones_come_back_as_geojson_as_the_monitor_sees_them(
     client: AsyncClient, relational_engine: AsyncEngine
 ) -> None:
+    """A corridor written straight into the table (as before U-03 zones
+    were) is listed for drawing, with its geometry as stored. U-03's own
+    routes are tested in test_zones_pg.py."""
     name = f"map-zone-{uuid4().hex[:8]}"
+    identifier = f"M{uuid4().hex[:6].upper()}"
     ring = [
         [44.80, 41.70],
         [44.81, 41.70],
@@ -691,12 +695,17 @@ async def test_zones_come_back_as_geojson_as_the_monitor_sees_them(
     async with relational_engine.begin() as connection:
         await connection.execute(
             sa.text(
-                "INSERT INTO airspace_zones (name, type, geom, max_alt_amsl_m) "
-                "VALUES (:name, 'no_fly', "
-                "ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), 900)"
+                "INSERT INTO airspace_zones (name, type, geom, identifier, country, "
+                " ed269_type, restriction, zone_authority, applicability, "
+                " uom_dimensions, lower_reference, upper_limit, upper_reference) "
+                "VALUES (:name, 'corridor', "
+                "ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326), :identifier, "
+                "'GEO', 'COMMON', 'NO_RESTRICTION', '[]', "
+                "'[{\"permanent\": \"YES\"}]', 'M', 'AMSL', 900, 'AMSL')"
             ),
             {
                 "name": name,
+                "identifier": identifier,
                 "geojson": json.dumps({"type": "Polygon", "coordinates": [ring]}),
             },
         )
@@ -704,10 +713,12 @@ async def test_zones_come_back_as_geojson_as_the_monitor_sees_them(
     response = await client.get("/airspace/zones")
 
     assert response.status_code == 200
-    (zone,) = [z for z in response.json() if z["name"] == name]
-    assert zone["type"] == "no_fly"
-    assert zone["max_alt_amsl_m"] == 900
-    assert zone["min_alt_amsl_m"] is None
+    (zone,) = [z for z in response.json() if z["feature"].get("name") == name]
+    assert zone["type"] == "corridor"
+    assert zone["active_now"] is True
+    (volume,) = zone["feature"]["geometry"]
+    assert volume["upperLimit"] == 900
+    assert "lowerLimit" not in volume
     assert zone["geometry"]["type"] == "Polygon"
     assert zone["geometry"]["coordinates"][0][0] == [44.80, 41.70]
     async with relational_engine.begin() as connection:

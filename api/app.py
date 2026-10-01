@@ -40,7 +40,8 @@ from api.registry import (
 from api.replay import DroneNotFoundError, ReplayError, ReplayStore, WindowTooLargeError
 from api.uas_registry import UasRegistry
 from api.uas_routes import uas_router
-from api.zones import ZoneReader
+from api.zone_routes import zone_router
+from api.zones import ZoneStore
 from common.terrain import Terrain
 
 MAX_EVENTS_PER_PAGE = 1_000
@@ -122,17 +123,6 @@ class DroneOut(BaseModel):
 
 class MaintenanceIn(BaseModel):
     in_maintenance: bool
-
-
-class ZoneOut(BaseModel):
-    id: UUID
-    name: str
-    # no_fly, restricted, corridor or base (migration 0001_fleet).
-    type: str
-    min_alt_amsl_m: float | None
-    max_alt_amsl_m: float | None
-    # A GeoJSON Polygon in WGS84, as PostGIS writes it.
-    geometry: dict[str, Any]
 
 
 class TerrainOut(BaseModel):
@@ -320,18 +310,15 @@ def create_api_app(
     # Always routed, so the schema carries them; without `uas` they answer 503.
     app.include_router(uas_router(uas, auth))
 
-    # --- airspace (P6-01) ------------------------------------------------------
+    # --- airspace zones (P6-01, U-03) ---------------------------------------------
 
-    zone_reader = ZoneReader(engine=registry.engine) if registry is not None else None
-
-    @app.get("/airspace/zones", response_model=list[ZoneOut])
-    async def zones(
-        _: Annotated[Operator, Depends(viewer)],
-    ) -> list[dict[str, Any]]:
-        """Every zone, for drawing. The monitor alerts on no-fly and restricted."""
-        if zone_reader is None:
-            raise HTTPException(status_code=503, detail="no relational database")
-        return await zone_reader.zones()
+    # Always routed, so the schema carries them; without a database they
+    # answer 503.
+    app.include_router(
+        zone_router(
+            ZoneStore(engine=registry.engine) if registry is not None else None, auth
+        )
+    )
 
     # --- terrain (P5-00) -------------------------------------------------------
 

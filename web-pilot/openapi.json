@@ -1,6 +1,117 @@
 {
   "components": {
     "schemas": {
+      "AirspaceVolume": {
+        "additionalProperties": false,
+        "properties": {
+          "horizontalProjection": {
+            "discriminator": {
+              "mapping": {
+                "Circle": "#/components/schemas/CircleProjection",
+                "Polygon": "#/components/schemas/PolygonProjection"
+              },
+              "propertyName": "type"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PolygonProjection"
+              },
+              {
+                "$ref": "#/components/schemas/CircleProjection"
+              }
+            ],
+            "title": "Horizontalprojection"
+          },
+          "lowerLimit": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lowerlimit"
+          },
+          "lowerVerticalReference": {
+            "$ref": "#/components/schemas/VerticalReference"
+          },
+          "uomDimensions": {
+            "$ref": "#/components/schemas/Uom"
+          },
+          "upperLimit": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upperlimit"
+          },
+          "upperVerticalReference": {
+            "$ref": "#/components/schemas/VerticalReference"
+          }
+        },
+        "required": [
+          "uomDimensions",
+          "lowerVerticalReference",
+          "upperVerticalReference",
+          "horizontalProjection"
+        ],
+        "title": "AirspaceVolume",
+        "type": "object"
+      },
+      "Applicability": {
+        "additionalProperties": false,
+        "properties": {
+          "endDateTime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enddatetime"
+          },
+          "permanent": {
+            "$ref": "#/components/schemas/YesNo"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/DailyPeriod"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule"
+          },
+          "startDateTime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startdatetime"
+          }
+        },
+        "required": [
+          "permanent"
+        ],
+        "title": "Applicability",
+        "type": "object"
+      },
       "BaseIn": {
         "properties": {
           "capacity": {
@@ -109,6 +220,34 @@
         "title": "BaseOut",
         "type": "object"
       },
+      "CircleProjection": {
+        "additionalProperties": false,
+        "properties": {
+          "center": {
+            "items": {
+              "type": "number"
+            },
+            "title": "Center",
+            "type": "array"
+          },
+          "radius": {
+            "title": "Radius",
+            "type": "number"
+          },
+          "type": {
+            "const": "Circle",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "center",
+          "radius"
+        ],
+        "title": "CircleProjection",
+        "type": "object"
+      },
       "ClassLabel": {
         "description": "The class marking of 2019/945. None of them: no class label.",
         "enum": [
@@ -211,6 +350,43 @@
           "recorded_at"
         ],
         "title": "CompetencyOut",
+        "type": "object"
+      },
+      "DailyPeriod": {
+        "additionalProperties": false,
+        "properties": {
+          "day": {
+            "items": {
+              "enum": [
+                "MON",
+                "TUE",
+                "WED",
+                "THU",
+                "FRI",
+                "SAT",
+                "SUN",
+                "ANY"
+              ],
+              "type": "string"
+            },
+            "title": "Day",
+            "type": "array"
+          },
+          "endTime": {
+            "title": "Endtime",
+            "type": "string"
+          },
+          "startTime": {
+            "title": "Starttime",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day",
+          "startTime",
+          "endTime"
+        ],
+        "title": "DailyPeriod",
         "type": "object"
       },
       "DroneIn": {
@@ -491,6 +667,212 @@
         "title": "DroneStatus",
         "type": "string"
       },
+      "Ed269Document": {
+        "additionalProperties": true,
+        "description": "An ED-269 document: `features` (or `UASZoneList`), checked strictly.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "features": {
+            "items": {
+              "$ref": "#/components/schemas/Ed269Zone"
+            },
+            "title": "Features",
+            "type": "array"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "title": "Ed269Document",
+        "type": "object"
+      },
+      "Ed269Zone": {
+        "additionalProperties": false,
+        "description": "An ED-269 UASZoneVersion with one volume.",
+        "properties": {
+          "applicability": {
+            "items": {
+              "$ref": "#/components/schemas/Applicability"
+            },
+            "title": "Applicability",
+            "type": "array"
+          },
+          "country": {
+            "title": "Country",
+            "type": "string"
+          },
+          "extendedProperties": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extendedproperties"
+          },
+          "geometry": {
+            "items": {
+              "$ref": "#/components/schemas/AirspaceVolume"
+            },
+            "title": "Geometry",
+            "type": "array"
+          },
+          "identifier": {
+            "title": "Identifier",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "otherReasonInfo": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Otherreasoninfo"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/Reason"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "regulationExemption": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/YesNo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "restriction": {
+            "$ref": "#/components/schemas/Restriction"
+          },
+          "restrictionConditions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restrictionconditions"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "uSpaceClass": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uspaceclass"
+          },
+          "zoneAuthority": {
+            "items": {
+              "$ref": "#/components/schemas/ZoneAuthority"
+            },
+            "title": "Zoneauthority",
+            "type": "array"
+          }
+        },
+        "required": [
+          "identifier",
+          "country",
+          "type",
+          "restriction",
+          "applicability",
+          "zoneAuthority",
+          "geometry"
+        ],
+        "title": "Ed269Zone",
+        "type": "object"
+      },
       "EventOut": {
         "properties": {
           "actor_id": {
@@ -559,6 +941,53 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ImportReportOut": {
+        "properties": {
+          "created": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Created",
+            "type": "array"
+          },
+          "dry_run": {
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "unchanged": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unchanged",
+            "type": "array"
+          },
+          "updated": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Updated",
+            "type": "array"
+          },
+          "zones": {
+            "title": "Zones",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sha256",
+          "dry_run",
+          "zones",
+          "created",
+          "updated",
+          "unchanged"
+        ],
+        "title": "ImportReportOut",
         "type": "object"
       },
       "LoginIn": {
@@ -842,6 +1271,59 @@
         "title": "PilotStatusIn",
         "type": "object"
       },
+      "PolygonProjection": {
+        "additionalProperties": false,
+        "properties": {
+          "coordinates": {
+            "items": {
+              "items": {
+                "items": {
+                  "type": "number"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "title": "Coordinates",
+            "type": "array"
+          },
+          "type": {
+            "const": "Polygon",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "coordinates"
+        ],
+        "title": "PolygonProjection",
+        "type": "object"
+      },
+      "Purpose": {
+        "enum": [
+          "AUTHORIZATION",
+          "NOTIFICATION",
+          "INFORMATION"
+        ],
+        "title": "Purpose",
+        "type": "string"
+      },
+      "Reason": {
+        "enum": [
+          "AIR_TRAFFIC",
+          "SENSITIVE",
+          "PRIVACY",
+          "POPULATION",
+          "NATURE",
+          "NOISE",
+          "FOREIGN_TERRITORY",
+          "EMERGENCY",
+          "OTHER"
+        ],
+        "title": "Reason",
+        "type": "string"
+      },
       "RecordSource": {
         "description": "Where a record's current values came from.",
         "enum": [
@@ -984,6 +1466,16 @@
         ],
         "title": "RemotePilotOut",
         "type": "object"
+      },
+      "Restriction": {
+        "enum": [
+          "PROHIBITED",
+          "REQ_AUTHORISATION",
+          "CONDITIONAL",
+          "NO_RESTRICTION"
+        ],
+        "title": "Restriction",
+        "type": "string"
       },
       "Role": {
         "enum": [
@@ -1569,6 +2061,14 @@
         "title": "UasPatch",
         "type": "object"
       },
+      "Uom": {
+        "enum": [
+          "M",
+          "FT"
+        ],
+        "title": "Uom",
+        "type": "string"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -1609,8 +2109,131 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VerticalReference": {
+        "enum": [
+          "AGL",
+          "AMSL",
+          "WGS84"
+        ],
+        "title": "VerticalReference",
+        "type": "string"
+      },
+      "YesNo": {
+        "enum": [
+          "YES",
+          "NO"
+        ],
+        "title": "YesNo",
+        "type": "string"
+      },
+      "ZoneAuthority": {
+        "additionalProperties": false,
+        "properties": {
+          "contactName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contactname"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "intervalBefore": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intervalbefore"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "phone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone"
+          },
+          "purpose": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Purpose"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "service": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Service"
+          },
+          "siteURL": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Siteurl"
+          }
+        },
+        "title": "ZoneAuthority",
+        "type": "object"
+      },
       "ZoneOut": {
         "properties": {
+          "active_now": {
+            "title": "Active Now",
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "feature": {
+            "$ref": "#/components/schemas/Ed269Zone"
+          },
           "geometry": {
             "additionalProperties": true,
             "title": "Geometry",
@@ -1621,44 +2244,24 @@
             "title": "Id",
             "type": "string"
           },
-          "max_alt_amsl_m": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Max Alt Amsl M"
-          },
-          "min_alt_amsl_m": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Min Alt Amsl M"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
           "type": {
             "title": "Type",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
             "type": "string"
           }
         },
         "required": [
           "id",
-          "name",
           "type",
-          "min_alt_amsl_m",
-          "max_alt_amsl_m",
-          "geometry"
+          "active_now",
+          "feature",
+          "geometry",
+          "created_at",
+          "updated_at"
         ],
         "title": "ZoneOut",
         "type": "object"
@@ -1673,8 +2276,8 @@
   "paths": {
     "/airspace/zones": {
       "get": {
-        "description": "Every zone, for drawing. The monitor alerts on no-fly and restricted.",
-        "operationId": "zones_airspace_zones_get",
+        "description": "Every zone, for drawing: geozones, corridors and bases. The\nmonitor alerts on geozones that restrict and apply.",
+        "operationId": "list_zones_airspace_zones_get",
         "responses": {
           "200": {
             "content": {
@@ -1683,7 +2286,7 @@
                   "items": {
                     "$ref": "#/components/schemas/ZoneOut"
                   },
-                  "title": "Response Zones Airspace Zones Get",
+                  "title": "Response List Zones Airspace Zones Get",
                   "type": "array"
                 }
               }
@@ -1691,7 +2294,255 @@
             "description": "Successful Response"
           }
         },
-        "summary": "Zones"
+        "summary": "List Zones",
+        "tags": [
+          "airspace zones"
+        ]
+      },
+      "post": {
+        "description": "Create a zone, as the editor draws it.",
+        "operationId": "create_zone_airspace_zones_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ed269Zone"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Zone",
+        "tags": [
+          "airspace zones"
+        ]
+      }
+    },
+    "/airspace/zones/export": {
+      "get": {
+        "description": "Every geozone as an ED-269 document, to save as a file.",
+        "operationId": "export_zones_airspace_zones_export_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ed269Document"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Export Zones",
+        "tags": [
+          "airspace zones"
+        ]
+      }
+    },
+    "/airspace/zones/import": {
+      "post": {
+        "description": "Add and replace zones from an ED-269 document, by identifier, all\nor nothing. `dry_run` validates and reports, writing nothing.",
+        "operationId": "import_zones_airspace_zones_import_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dry Run",
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ed269Document"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportReportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Zones",
+        "tags": [
+          "airspace zones"
+        ]
+      }
+    },
+    "/airspace/zones/{zone_id}": {
+      "delete": {
+        "operationId": "delete_zone_airspace_zones__zone_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "zone_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Zone Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Zone",
+        "tags": [
+          "airspace zones"
+        ]
+      },
+      "get": {
+        "operationId": "get_zone_airspace_zones__zone_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "zone_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Zone Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Zone",
+        "tags": [
+          "airspace zones"
+        ]
+      },
+      "put": {
+        "description": "Replace a zone with the one sent; the identifier may change.",
+        "operationId": "replace_zone_airspace_zones__zone_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "zone_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Zone Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ed269Zone"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZoneOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replace Zone",
+        "tags": [
+          "airspace zones"
+        ]
       }
     },
     "/auth/feed-ticket": {
