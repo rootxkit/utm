@@ -56,6 +56,20 @@ one that source gave, delivered no later than it, is out of order and
 ignored. Another source's sample is never compared, since two stations'
 clocks agree only by accident.
 
+## A pressure altitude is not a vertical position (S-33)
+
+A Remote ID broadcast's `alt_amsl_m` may be its pressure altitude
+(`alt_source: "pressure"`): referenced to 1013.25 hPa, not the local QNH,
+about 8 m off per hPa, some 160 m on a 20 hPa day against a 20 m vertical
+minimum. Compared as AMSL it could hide a conflict or invent one. Such a
+track's vertical position is unknown: a pair with one is judged on the
+horizontal criteria alone, as though the vertical minimum were not met, and
+the alert says `vertical_separation_known: false` with `d_alt_at_cpa_m`
+null. The height limit, and zones with altitude limits, are not evaluated
+for it: neither raised nor cleared by its messages. Zones without altitude
+limits are. Each such message is counted (`vertical_unknown`, in the status
+line) and the first of a run per aircraft is logged.
+
 ## Raise once, clear with hysteresis
 
 An alert is raised once per condition, not once per tick, and cleared only
@@ -251,7 +265,21 @@ def track_from_telemetry(
         source=source_of(message),
         source_ts_s=captured_at_s(message),
         transmitter=transmitter_of(message),
+        vertical_known=vertical_known(message),
     )
+
+
+# The Gateway's `alt_source` for an AMSL altitude taken from a Remote ID
+# broadcast's pressure altitude (gateway/remote_id.py, S-33).
+ALT_SOURCE_PRESSURE = "pressure"
+
+
+def vertical_known(message: dict[str, Any]) -> bool:
+    """Whether `alt_amsl_m` places the aircraft vertically (S-33).
+
+    A pressure altitude does not: see `Track.vertical_known`.
+    """
+    return message.get("alt_source") != ALT_SOURCE_PRESSURE
 
 
 def transmitter_of(message: dict[str, Any]) -> str | None:
@@ -322,6 +350,11 @@ class AirspaceMonitor:
     # Checks that raised instead of answering (S-12). Each is logged with its
     # traceback; the count is here so a test, or a health report, can see it.
     check_failures: int = field(default=0, init=False)
+    # Messages whose altitude is a pressure altitude (S-33): conflicts are
+    # judged on the horizontal alone, and the height limit and zones with
+    # altitude limits are not evaluated. Logged once per aircraft per run.
+    vertical_unknown: int = field(default=0, init=False)
+    _vertical_unknown_logged: set[UUID] = field(default_factory=set, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     # The latest (`ts`, `rx_ts`) each source gave for each aircraft, so a
@@ -421,12 +454,15 @@ class AirspaceMonitor:
         # Each check on its own: a missing terrain tile must not silence
         # the conflict and zone alerts already found (S-12).
         not_evaluated: set[AlertKind] = set()
+        self._note_vertical(track)
         for kind, check in (
             (AlertKind.CONFLICT, self._check_conflicts),
             (AlertKind.ZONE, self._check_zones),
             (AlertKind.HEIGHT, self._check_height),
         ):
-            if kind is AlertKind.HEIGHT and not height_available:
+            if kind is AlertKind.HEIGHT and not (
+                height_available and track.vertical_known
+            ):
                 not_evaluated.add(kind)
                 continue
             found = self._guarded(kind, check, track, at_s)
@@ -472,6 +508,26 @@ class AirspaceMonitor:
                 },
             )
             return None
+
+    def _note_vertical(self, track: Track) -> None:
+        """Count a message whose vertical position is unknown (S-33), and
+        log once per aircraft until it reports a known one again."""
+        if track.vertical_known:
+            self._vertical_unknown_logged.discard(track.drone_id)
+            return
+        self.vertical_unknown += 1
+        if track.drone_id not in self._vertical_unknown_logged:
+            self._vertical_unknown_logged.add(track.drone_id)
+            _log.warning(
+                "altitude is a pressure altitude; conflicts judged on the "
+                "horizontal alone, height limit and zone altitude limits not "
+                "evaluated",
+                extra={
+                    "drone_id": str(track.drone_id),
+                    "station_id": track.source,
+                    "vertical_unknown": self.vertical_unknown,
+                },
+            )
 
     def _note_missing_times(self, track: Track, message: dict[str, Any]) -> None:
         """Count a message without `rx_ts` (placed at its arrival time) or
@@ -612,17 +668,29 @@ class AirspaceMonitor:
             detail={
                 "t_cpa_s": round(approach.t_cpa_s, 1),
                 "d_cpa_horizontal_m": round(approach.d_cpa_horizontal_m, 1),
-                "d_alt_at_cpa_m": round(approach.d_alt_at_cpa_m, 1),
+                # None, never a number, when it is not known (S-33).
+                "d_alt_at_cpa_m": (
+                    round(approach.d_alt_at_cpa_m, 1)
+                    if approach.vertical_known
+                    else None
+                ),
                 "d_horizontal_now_m": round(approach.d_horizontal_now_m, 1),
+                "vertical_separation_known": approach.vertical_known,
             },
         )
 
     def _check_zones(self, track: Track, now_s: float) -> list[Alert]:
         raised: list[Alert] = []
         for zone in self.zones:
+            key = zone_key(track.drone_id, zone)
+            limited = zone.min_alt_amsl_m is not None or zone.max_alt_amsl_m is not None
+            if limited and not track.vertical_known:
+                # Inside or outside its altitude band is unknown (S-33): not
+                # judged, so neither raised nor cleared by this message.
+                self._unevaluated_keys.add(key)
+                continue
             if not zone.contains(track.lat_deg, track.lon_deg, track.alt_amsl_m):
                 continue
-            key = zone_key(track.drone_id, zone)
             alert = Alert(
                 key=key,
                 kind=AlertKind.ZONE,

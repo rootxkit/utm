@@ -91,7 +91,9 @@ altitude is referenced to the standard 1013.25 hPa, not to the local QNH,
 so it is AMSL only on a standard day: off by about 8 m per hPa of
 difference. That is why `alt_source` says which was used, `geodetic` or
 `pressure` (None when there is no AMSL altitude), and the raw
-`alt_pressure_m` is carried beside it. An unknown accuracy is not a flag:
+`alt_pressure_m` is carried beside it. The airspace monitor reads
+`alt_source: pressure` as an unknown vertical position: horizontal-only
+conflicts, no height limit, no zone altitude limits (`airspace/monitor.py`). An unknown accuracy is not a flag:
 the geodetic altitude is kept. Without a geoid, a usable geodetic altitude
 still gives no AMSL altitude; pressure is a substitute for a bad geodetic
 altitude, not for a missing geoid.
@@ -155,7 +157,11 @@ _VERTICAL_ACCURACY_UNKNOWN = 0
 ALT_SOURCE_GEODETIC = "geodetic"
 ALT_SOURCE_PRESSURE = "pressure"
 # What a stored row names as the model behind an AMSL height taken from
-# pressure altitude (`remote_id_observations.geoid_model`).
+# pressure altitude (`remote_id_observations.geoid_model`). Not a geoid: the
+# column is the only place a row can say what produced `alt_amsl_m`
+# without a migration, and its check constraint requires one to be named.
+# A reader must treat a row carrying this text as having no geodetic
+# height, exactly as the monitor does (S-33).
 PRESSURE_ALTITUDE_MODEL = "pressure altitude, ISA 1013.25 hPa"
 
 

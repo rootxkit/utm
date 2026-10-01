@@ -76,6 +76,11 @@ class Track:
     # A Remote ID broadcast's transmitter address; None for anything else.
     # Two tracks with one address are one radio (S-32).
     transmitter: str | None = None
+    # False when `alt_amsl_m` is a pressure altitude (S-33): referenced to
+    # 1013.25 hPa, not the local QNH, it is off by about 8 m per hPa, some
+    # 160 m on a 20 hPa day against a 20 m vertical minimum. Such a track's
+    # vertical position is unknown for separation and for altitude limits.
+    vertical_known: bool = True
 
 
 def _radii_m(lat_deg: float) -> tuple[float, float]:
@@ -118,6 +123,7 @@ def advance(track: Track, dt_s: float) -> Track:
         source=track.source,
         source_ts_s=track.source_ts_s,
         transmitter=track.transmitter,
+        vertical_known=track.vertical_known,
     )
 
 
@@ -133,6 +139,9 @@ class Approach:
     d_alt_at_cpa_m: float
     d_horizontal_now_m: float
     d_alt_now_m: float
+    # False when either aircraft's vertical position is unknown (S-33): the
+    # two altitude differences above are then not evidence of anything.
+    vertical_known: bool = True
 
 
 def local_offset_m(
@@ -205,6 +214,7 @@ def closest_approach(a: Track, b: Track) -> Approach:
         d_alt_at_cpa_m=abs(alt_b_at - alt_a_at),
         d_horizontal_now_m=math.hypot(rel_n, rel_e),
         d_alt_now_m=abs(b.alt_amsl_m - a.alt_amsl_m),
+        vertical_known=a.vertical_known and b.vertical_known,
     )
 
 
@@ -231,14 +241,18 @@ class SeparationPolicy:
         apart. A pair inside the minima is in conflict whatever the
         arithmetic says about when it will be closest. The same clause holds
         a diverging pair's alert until it is actually past the minimum.
+
+        With either aircraft's vertical position unknown (S-33), the
+        vertical test is taken as failed separation, so the pair is judged
+        on the horizontal criteria alone: an unknown is not a clearance.
         """
-        inside_now = (
-            approach.d_horizontal_now_m < self.d_horizontal_min_m
-            and approach.d_alt_now_m < self.d_vertical_min_m
+        unknown = not approach.vertical_known
+        inside_now = approach.d_horizontal_now_m < self.d_horizontal_min_m and (
+            unknown or approach.d_alt_now_m < self.d_vertical_min_m
         )
         closing_inside = (
             approach.t_cpa_s < self.t_cpa_max_s
             and approach.d_cpa_horizontal_m < self.d_horizontal_min_m
-            and approach.d_alt_at_cpa_m < self.d_vertical_min_m
+            and (unknown or approach.d_alt_at_cpa_m < self.d_vertical_min_m)
         )
         return inside_now or closing_inside

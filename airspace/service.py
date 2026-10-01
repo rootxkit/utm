@@ -281,6 +281,7 @@ class AirspaceService:
             "without_receive_time": self.monitor.without_receive_time,
             "without_capture_time": self.monitor.without_capture_time,
             "check_failures": self.monitor.check_failures,
+            "vertical_unknown": self.monitor.vertical_unknown,
             "tile_failures": self.tile_failures,
             "audit_pending": self.audit_pending,
             "audit_overflow": self.audit_overflow,

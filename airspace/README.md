@@ -51,6 +51,12 @@ Two Remote ID tracks with the same transmitter address
 transmitter as unidentified while it has no fresh identity and under its
 serial once it has one (S-32), so they are one radio under two ids.
 
+A track whose altitude is a Remote ID pressure altitude (`alt_source:
+"pressure"`, S-33) has no known vertical position. Conflicts with it are
+judged on the horizontal criteria alone, and say
+`vertical_separation_known: false`; the height limit and zones with altitude
+limits are not evaluated for it, counted in `vertical_unknown`.
+
 Rejected messages, failed checks, unreadable tiles and audit-queue losses are
 counted and logged in the `airspace monitor status` line every minute.
 

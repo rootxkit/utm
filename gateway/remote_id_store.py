@@ -114,9 +114,13 @@ def row_from_observation(
 def _height_model(observation: dict[str, Any], geoid_model: str | None) -> str | None:
     """What produced the row's AMSL height; None when it has none.
 
-    The geoid for a geodetic altitude; for a pressure altitude (S-33), the
-    standard atmosphere it is referenced to, so the row says its AMSL height
-    is not geodetic without another column.
+    The geoid for a geodetic altitude. For a pressure altitude (S-33), the
+    text `PRESSURE_ALTITUDE_MODEL`: the standard atmosphere it is referenced
+    to, so the row says its height is not geodetic without a new column.
+    Note that this puts a non-geoid in `geoid_model`: whoever reads the
+    column must treat that text as "this AMSL height is a pressure altitude,
+    vertical position unknown", never as a geoid model name. A dedicated
+    `alt_source` column would need a telemetry migration.
     """
     if observation["alt_amsl_m"] is None:
         return None
