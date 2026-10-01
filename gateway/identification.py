@@ -93,6 +93,8 @@ class Reason(StrEnum):
     OPERATOR_MISMATCH = "operator_mismatch"
     OWNER_UNKNOWN = "owner_unknown"
     MATCHED = "matched"
+    # In `known_drones`, but the relational registry has no such aircraft.
+    NOT_IN_REGISTRY = "not_in_registry"
     FLEET = "fleet"
     RELAY_BINDING = "relay_binding"
     # S-10: a registered serial heard away from where its aircraft is.
@@ -166,6 +168,14 @@ def resolve(
             serial=serial,
             operator_reg=operator_reg,
         )
+    if not uas.in_registry:
+        return Identification(
+            IdentificationStatus.UNKNOWN_OPERATOR,
+            Reason.NOT_IN_REGISTRY,
+            serial=serial,
+            operator_reg=operator_reg,
+            drone_id=uas.drone_id,
+        )
     owner = (
         None
         if uas.uas_operator_id is None
@@ -214,6 +224,15 @@ def resolve_bound(snapshot: RegistrySnapshot, drone_id: UUID) -> Identification:
         # predate the registration.
         return Identification(
             IdentificationStatus.REGISTERED, Reason.RELAY_BINDING, drone_id=drone_id
+        )
+    if not uas.in_registry:
+        # Bound by a station, but the registry has no such aircraft (a row
+        # from before the API, or a registry restored without it).
+        return Identification(
+            IdentificationStatus.UNKNOWN_OPERATOR,
+            Reason.NOT_IN_REGISTRY,
+            serial=uas.serial,
+            drone_id=drone_id,
         )
     owner = (
         None

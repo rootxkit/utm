@@ -45,6 +45,7 @@ OF_SUSPENDED_OP = UUID(int=13)
 OF_REVOKED_OP = UUID(int=14)
 FLEET = UUID(int=15)
 OF_GHOST = UUID(int=16)
+ORPHAN = UUID(int=17)  # in known_drones only, not in the registry
 
 R = RegistrationStatus
 
@@ -61,6 +62,7 @@ def snapshot() -> RegistrySnapshot:
             UasFacts(OF_REVOKED_OP, "uas-e", "SN-E", R.ACTIVE, REVOKED_OP),
             UasFacts(FLEET, "hexa-01", "SN-FLEET", R.ACTIVE, None),
             UasFacts(OF_GHOST, "uas-g", "SN-G", R.ACTIVE, GHOST_OP),
+            UasFacts(ORPHAN, "orphan", "SN-ORPHAN", R.ACTIVE, None, in_registry=False),
         ),
         operators=(
             OperatorFacts(ACTIVE_OP, "GEOabcd1234efgh", R.ACTIVE),
@@ -110,6 +112,13 @@ TABLE = [
     (("SN-NOBODY", None), (S.UNKNOWN_OPERATOR, Reason.SERIAL_UNKNOWN, False)),
     # ... or the owner is not in the projection
     (("SN-G", "GEOabcd1234efgh"), (S.UNKNOWN_OPERATOR, Reason.OWNER_UNKNOWN, False)),
+    # in the projection but not the registry: never registered
+    (("SN-ORPHAN", None), (S.UNKNOWN_OPERATOR, Reason.NOT_IN_REGISTRY, False)),
+    # the EU number's secret suffix is not part of the comparison
+    (
+        ("1581F5FKD229400A", "GEOabcd1234efgh-x9z"),
+        (S.REGISTERED, Reason.MATCHED, False),
+    ),
     # our own fleet: registered on its serial alone
     (("SN-FLEET", None), (S.REGISTERED, Reason.FLEET, False)),
     (("SN-FLEET", "GEOANYTHING00001"), (S.REGISTERED, Reason.FLEET, False)),
@@ -230,6 +239,8 @@ def test_an_identity_that_is_not_a_serial_is_not_looked_up_as_one() -> None:
         (OF_SUSPENDED_OP, S.SUSPENDED, Reason.OPERATOR_SUSPENDED),
         # Bound but not yet in the projection read: the binding is the proof.
         (UUID(int=99), S.REGISTERED, Reason.RELAY_BINDING),
+        # Bound, but the registry has no such aircraft.
+        (ORPHAN, S.UNKNOWN_OPERATOR, Reason.NOT_IN_REGISTRY),
     ],
 )
 def test_a_relay_track_is_identified_by_its_binding(

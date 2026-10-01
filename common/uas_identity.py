@@ -118,6 +118,21 @@ def normalize_registration_number(value: str) -> str:
     return value.strip()
 
 
+def public_registration_number(value: str) -> str:
+    """The public part of an operator registration number as given.
+
+    The EU number is broadcast and written as the public number, but may
+    come with a hyphen and its three secret characters (e.g.
+    `FIN87astrdge12k8-xyz`). Those are stripped; a value with no such tail
+    is returned trimmed, as it is.
+    """
+    stripped = value.strip()
+    head, hyphen, tail = stripped.rpartition("-")
+    if hyphen and head and len(tail) == 3 and tail.isalnum():
+        return head
+    return stripped
+
+
 def registration_number_problem(value: str, pattern: re.Pattern[str]) -> str | None:
     """Why `value` is not an operator registration number, or None.
 

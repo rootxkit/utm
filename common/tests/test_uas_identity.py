@@ -10,6 +10,7 @@ from common.uas_identity import (
     ClassLabel,
     cta2063_problem,
     is_cta2063,
+    public_registration_number,
     registration_number_problem,
     serial_problem,
 )
@@ -81,3 +82,23 @@ def test_a_registration_number_not_matching_is_refused(number: str, why: str) ->
     problem = registration_number_problem(number, EU)
     assert problem is not None
     assert why in problem
+
+
+@pytest.mark.parametrize(
+    ("given", "public"),
+    [
+        # The EU number with its three secret characters (U-02).
+        ("FIN87astrdge12k8-xyz", "FIN87astrdge12k8"),
+        (" FIN87astrdge12k8-XY1 ", "FIN87astrdge12k8"),
+        # No secret tail: kept as it is.
+        ("FIN87astrdge12k8", "FIN87astrdge12k8"),
+        ("GEO-OP-SITL", "GEO-OP-SITL"),
+        ("FIN87astrdge12k8-", "FIN87astrdge12k8-"),
+        ("-xyz", "-xyz"),
+        ("FIN87astrdge12k8-x!z", "FIN87astrdge12k8-x!z"),
+    ],
+)
+def test_the_public_part_drops_only_a_three_character_secret(
+    given: str, public: str
+) -> None:
+    assert public_registration_number(given) == public

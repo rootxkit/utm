@@ -55,7 +55,11 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from common import get_logger
-from common.uas_identity import RegistrationStatus, normalize_serial
+from common.uas_identity import (
+    RegistrationStatus,
+    normalize_serial,
+    public_registration_number,
+)
 
 _log = get_logger(__name__)
 
@@ -63,8 +67,9 @@ DEFAULT_REFRESH_S = 5.0
 
 
 def operator_key(registration_number: str) -> str:
-    """How a registration number is compared: trimmed, upper case (U-01)."""
-    return registration_number.strip().upper()
+    """How a registration number is compared: its public part (the EU
+    secret suffix stripped), upper case (U-01)."""
+    return public_registration_number(registration_number).upper()
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +81,14 @@ class UasFacts:
     # active: what the relational column defaults to.
     registration_status: RegistrationStatus
     uas_operator_id: UUID | None
+    # False for a `known_drones` row the relational registry has no aircraft
+    # for (`unregistered` in the projection, migration 0010).
+    in_registry: bool = True
+
+
+# What the projection says of a `known_drones` row with no relational
+# `drones` row (migration 0010).
+UNREGISTERED = "unregistered"
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,8 +174,13 @@ async def load_snapshot(engine: AsyncEngine) -> RegistrySnapshot:
                 drone_id=row.drone_id,
                 label=str(row.label),
                 serial=None if row.serial is None else str(row.serial),
-                registration_status=_status(row.registration_status),
+                registration_status=_status(
+                    None
+                    if row.registration_status == UNREGISTERED
+                    else row.registration_status
+                ),
                 uas_operator_id=row.uas_operator_id,
+                in_registry=row.registration_status != UNREGISTERED,
             )
             for row in uas_rows
         ),
@@ -278,9 +296,11 @@ class IdentityProjection:
         uas: Iterable[ProjectedUas],
     ) -> tuple[int, int]:
         """Make the projection say exactly what the registry says. Returns
-        (operator rows written, aircraft rows updated). Operators no longer
-        in the registry are deleted; aircraft rows are only updated, since
-        `known_drones` belongs to the fleet projection too."""
+        (operator rows written, aircraft rows changed). Operators no longer
+        in the registry are deleted. Aircraft rows are updated, never
+        deleted (`known_drones` is the fleet projection too, and bindings
+        and history refer to it): a row with no aircraft in `uas` is marked
+        `unregistered`, never left to read as registered."""
         operator_list = list(operators)
         uas_list = list(uas)
         async with self.engine.begin() as connection:
@@ -293,6 +313,15 @@ class IdentityProjection:
             )
             await self._upsert_operators(connection, operator_list)
             updated = await self._update_uas(connection, uas_list)
+            orphans = await connection.execute(
+                sa.text(
+                    "UPDATE known_drones SET registration_status = :unregistered, "
+                    "uas_operator_id = NULL WHERE NOT (drone_id = ANY(:ids)) "
+                    "AND registration_status IS DISTINCT FROM :unregistered"
+                ),
+                {"ids": [u.drone_id for u in uas_list], "unregistered": UNREGISTERED},
+            )
+            updated += int(orphans.rowcount)
         return len(operator_list), updated
 
     @staticmethod
