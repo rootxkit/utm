@@ -206,6 +206,13 @@ class ApiSettings(
         default=30.0, gt=0, validation_alias="SOURCE_CONTROL_REPUBLISH_S"
     )
 
+    # U-02. How often the API re-projects the whole UAS registry into the
+    # telemetry database for identification (`api/uas_registry.py`). Each
+    # change is projected as it is made; this repairs one that was lost.
+    registry_projection_sync_s: float = Field(
+        default=300.0, gt=0, validation_alias="REGISTRY_PROJECTION_SYNC_S"
+    )
+
     @field_validator("uas_operator_registration_pattern")
     @classmethod
     def _pattern_compiles(cls, value: str) -> str:

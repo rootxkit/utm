@@ -35,6 +35,18 @@ _CTA_CHAR = "[0-9A-HJ-NP-Z]"
 _CTA_SHAPE = re.compile(rf"^({_CTA_CHAR}{{4}})([1-9A-F])({_CTA_CHAR}{{1,15}})$")
 
 
+class RegistrationStatus(StrEnum):
+    """An operator's, a remote pilot's or a UAS's registration (U-01).
+
+    Here because both sides need it: the API sets it, and U-02's resolvers
+    read it back from the projection (`gateway/registry_projection.py`).
+    """
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    REVOKED = "revoked"
+
+
 class ClassLabel(StrEnum):
     """The class marking of 2019/945. None of them: no class label."""
 
@@ -104,6 +116,21 @@ def serial_problem(serial: str, class_label: ClassLabel | None) -> str | None:
 def normalize_registration_number(value: str) -> str:
     """A registration number as it is stored: surrounding space removed."""
     return value.strip()
+
+
+def public_registration_number(value: str) -> str:
+    """The public part of an operator registration number as given.
+
+    The EU number is broadcast and written as the public number, but may
+    come with a hyphen and its three secret characters (e.g.
+    `FIN87astrdge12k8-xyz`). Those are stripped; a value with no such tail
+    is returned trimmed, as it is.
+    """
+    stripped = value.strip()
+    head, hyphen, tail = stripped.rpartition("-")
+    if hyphen and head and len(tail) == 3 and tail.isalnum():
+        return head
+    return stripped
 
 
 def registration_number_problem(value: str, pattern: re.Pattern[str]) -> str | None:

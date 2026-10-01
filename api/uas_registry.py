@@ -29,16 +29,29 @@ Statuses are independent: suspending an operator does not rewrite its
 aircraft's rows. A UAS is reported with its operator's status alongside its
 own, and deciding what the pair means for a track is U-02's job, not this
 module's.
+
+## The identity projection (U-02)
+
+What U-02's resolvers need, each operator's registration number and status
+and each UAS's status and owner, is projected into the telemetry database
+(`gateway/registry_projection.py`) by `identity`, inside the relational
+transaction of the change, as `known_drones` already is. A projection
+write that fails rolls the change back. `sync_projection` re-projects the
+whole registry; the API runs it at start and every
+`REGISTRY_PROJECTION_SYNC_S`, which repairs a projection that drifted (a
+lost write, a telemetry database restored, rows from before U-02).
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -53,6 +66,7 @@ from api.registry import (
     NotFoundError,
     TelemetryProjection,
     audit,
+    lock_projection,
     refused,
 )
 from common import get_logger
@@ -64,16 +78,14 @@ from common.uas_identity import (
     registration_number_problem,
     serial_problem,
 )
+from common.uas_identity import (  # re-exported: routes, tools, tests
+    RegistrationStatus as RegistrationStatus,
+)
+from gateway.registry_projection import ProjectedOperator, ProjectedUas
 
 _log = get_logger(__name__)
 
 MAX_PAGE = 500
-
-
-class RegistrationStatus(StrEnum):
-    ACTIVE = "active"
-    SUSPENDED = "suspended"
-    REVOKED = "revoked"
 
 
 class OperatorType(StrEnum):
@@ -224,6 +236,36 @@ def _uas_out(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+class IdentityWriter(Protocol):
+    """The write side of U-02's projection (`gateway.registry_projection`)."""
+
+    async def project_operator(self, operator: ProjectedOperator) -> None: ...
+
+    async def project_uas(self, uas: ProjectedUas) -> None: ...
+
+    async def replace_all(
+        self,
+        operators: Iterable[ProjectedOperator],
+        uas: Iterable[ProjectedUas],
+    ) -> tuple[int, int]: ...
+
+
+def _projected_operator(row: Mapping[str, Any]) -> ProjectedOperator:
+    return ProjectedOperator(
+        operator_id=row["id"],
+        registration_number=row["registration_number"],
+        status=row["status"],
+    )
+
+
+def _projected_uas(row: Mapping[str, Any]) -> ProjectedUas:
+    return ProjectedUas(
+        drone_id=row["id"],
+        registration_status=row["registration_status"],
+        uas_operator_id=row["uas_operator_id"],
+    )
+
+
 @dataclass
 class UasRegistry:
     engine: AsyncEngine
@@ -231,6 +273,76 @@ class UasRegistry:
     registration_pattern: re.Pattern[str] = field(
         default_factory=lambda: re.compile(DEFAULT_REGISTRATION_PATTERN)
     )
+    # U-02. None: nothing is projected for identification (a test, or a
+    # tool that leaves it to the API's next `sync_projection`).
+    identity: IdentityWriter | None = None
+
+    async def sync_projection(self) -> tuple[int, int]:
+        """Re-project every operator and every aircraft (U-02). Returns
+        (operators written, aircraft rows changed); (0, 0) without `identity`."""
+        if self.identity is None:
+            return 0, 0
+        async with self.engine.begin() as connection:
+            # Held until this transaction ends, after the write below: no
+            # registry change can commit between this read and that write.
+            await lock_projection(connection)
+            operators = [
+                _projected_operator(_row(row))
+                for row in await connection.execute(
+                    sa.text("SELECT id, registration_number, status FROM uas_operators")
+                )
+            ]
+            uas = [
+                _projected_uas(_row(row))
+                for row in await connection.execute(
+                    sa.text(
+                        "SELECT id, registration_status, uas_operator_id FROM drones"
+                    )
+                )
+            ]
+            written, changed = await self.identity.replace_all(operators, uas)
+        _log.info(
+            "registry projection synchronised",
+            extra={"operators": written, "uas_changed": changed, "uas": len(uas)},
+        )
+        return written, changed
+
+    async def sync_projection_periodically(
+        self, stop: asyncio.Event, *, every_s: float
+    ) -> None:
+        """`sync_projection` at once, then every `every_s`, until `stop`. A
+        failed pass is logged and retried at the next; it never stops the
+        API."""
+        while not stop.is_set():
+            try:
+                await self.sync_projection()
+            except Exception:
+                # Whatever failed, the next pass tries again: a dead loop
+                # would leave every lost projection write unrepaired.
+                _log.exception(
+                    "could not synchronise the registry projection",
+                    extra={"retry_in_s": every_s},
+                )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), every_s)
+
+    async def _project_operator(self, operator: Mapping[str, Any]) -> None:
+        if self.identity is not None:
+            await self.identity.project_operator(_projected_operator(operator))
+
+    async def _project_uas(self, connection: AsyncConnection, drone_id: UUID) -> None:
+        if self.identity is None:
+            return
+        row = (
+            await connection.execute(
+                sa.text(
+                    "SELECT id, registration_status, uas_operator_id FROM drones "
+                    "WHERE id = :id"
+                ),
+                {"id": str(drone_id)},
+            )
+        ).one()
+        await self.identity.project_uas(_projected_uas(_row(row)))
 
     # --- operators --------------------------------------------------------------
 
@@ -263,6 +375,7 @@ class UasRegistry:
             raise InvalidError("a legal name is required", code="invalid_value")
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 created = (
                     await connection.execute(
                         sa.text(
@@ -295,6 +408,8 @@ class UasRegistry:
                     _without_contact(operator),
                     actor=actor,
                 )
+                # Last, and inside the transaction, like `known_drones`.
+                await self._project_operator(operator)
         except IntegrityError as error:
             raise refused("UAS operator", number, error) from error
         _log.info(
@@ -451,6 +566,7 @@ class UasRegistry:
         actor: Actor = SYSTEM,
     ) -> dict[str, Any]:
         async with self.engine.begin() as connection:
+            await lock_projection(connection)
             current = await self._lock_operator(connection, operator_id)
             check_transition(
                 "UAS operator",
@@ -476,6 +592,7 @@ class UasRegistry:
                 {"from": current["status"], "to": status, "reason": reason},
                 actor=actor,
             )
+            await self._project_operator(_row(updated))
         _log.info(
             "UAS operator status changed",
             extra={"uas_operator_id": str(operator_id), "status": status.value},
@@ -762,6 +879,7 @@ class UasRegistry:
             raise InvalidError("MTOM must be positive", code="invalid_value")
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 await self._refuse_revoked_operator(connection, uas_operator_id)
                 holder = (
                     await connection.execute(
@@ -804,6 +922,7 @@ class UasRegistry:
                 )
                 # Last, and inside the transaction: see `api.registry`.
                 await self.projection.register_drone(drone_id, shown, serial=normalized)
+                await self._project_uas(connection, drone_id)
         except IntegrityError as error:
             raise refused("UAS", normalized, error) from error
         _log.info(
@@ -915,6 +1034,7 @@ class UasRegistry:
             wanted["class_label"] = ClassLabel(wanted["class_label"]).value
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 current = await self._lock_uas(connection, drone_id)
                 _refuse_revoked(
                     "UAS", current["serial"], current["registration_status"]
@@ -951,6 +1071,8 @@ class UasRegistry:
                     {"changes": diff},
                     actor=actor,
                 )
+                if "uas_operator_id" in diff:
+                    await self._project_uas(connection, drone_id)
                 return await self._uas(connection, drone_id)
         except IntegrityError as error:
             raise refused("UAS", str(drone_id), error) from error
@@ -963,10 +1085,12 @@ class UasRegistry:
         reason: str | None = None,
         actor: Actor = SYSTEM,
     ) -> dict[str, Any]:
-        """Suspend, reactivate or revoke. `known_drones` is left as it is, so
-        a suspended aircraft's broadcasts are still recognised as it
-        (migration 0005_uas_registry)."""
+        """Suspend, reactivate or revoke. The aircraft stays in
+        `known_drones`, so its broadcasts are still recognised as it
+        (migration 0005_uas_registry), and its new status is projected there
+        for U-02, which shows it as suspended."""
         async with self.engine.begin() as connection:
+            await lock_projection(connection)
             current = await self._lock_uas(connection, drone_id)
             check_transition(
                 "UAS", current["serial"], current["registration_status"], status
@@ -989,6 +1113,7 @@ class UasRegistry:
                 },
                 actor=actor,
             )
+            await self._project_uas(connection, drone_id)
             uas = await self._uas(connection, drone_id)
         _log.info(
             "UAS status changed",

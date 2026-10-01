@@ -1,6 +1,8 @@
 import { ageSeconds, num, shortId } from "../format";
 import { useT } from "../i18n";
+import { badgeClass, identificationStatus, statusHintKey, statusLabelKey } from "../identification";
 import { type Aircraft, type Alert, worse } from "../types";
+import { IdentificationLegend } from "./IdentificationLegend";
 
 interface Props {
   aircraft: Map<string, Aircraft>;
@@ -30,52 +32,71 @@ export function AircraftList({ aircraft, alerts, selected, now, onSelect, source
     }
   }
   return (
-    <ul className="list">
-      {sortedAircraft(aircraft).map(([id, item]) => {
-        const d = item.data;
-        const placed = d.lat_deg !== null && d.lon_deg !== null;
-        const alert = severity.get(id);
-        return (
-          <li key={id}>
-            <button
-              type="button"
-              className={`row${id === selected ? " selected" : ""}${alert ? ` alert-${alert}` : ""}`}
-              onClick={() => onSelect(id)}
-            >
-              <div className="row-head">
-                <strong>{d.label ?? <span className="muted">{t("unnamed")}</span>}</strong>
-                <span className="muted mono small">{shortId(id)}</span>
-              </div>
-              <div className="row-body small">
-                {d.source === "remote_id" ? (
-                  <>
-                    <span className="pill remote-id" title={t("remote_id_unverified")}>
-                      {t("remote_id")}
-                    </span>
-                    <span>{d.airborne ? t("airborne") : t("on_ground")}</span>
-                  </>
-                ) : (
-                  <>
-                    <span className={`pill ${d.armed ? "armed" : ""}`}>
-                      {d.armed === null ? t("unknown") : d.armed ? t("armed") : t("disarmed")}
-                    </span>
-                    <span>{d.mode ?? "—"}</span>
-                    <span title={t("battery")}>{num(d.batt_pct, 0, "%")}</span>
-                  </>
-                )}
-                <span title={t("altitude_home")}>{num(d.alt_above_home_m, 0, "m")}</span>
-                <span className="muted">
-                  {t("seconds_ago", { n: ageSeconds(item.receivedAt, now) })}
-                </span>
-                {!placed && <span className="pill unplaced">{t("no_position")}</span>}
-                {sourceDisabled.has(id) && (
-                  <span className="pill source-disabled">{t("source_disabled_track")}</span>
-                )}
-              </div>
-            </button>
-          </li>
-        );
-      })}
-    </ul>
+    <>
+      <IdentificationLegend aircraft={aircraft} />
+      <ul className="list">
+        {sortedAircraft(aircraft).map(([id, item]) => {
+          const d = item.data;
+          const placed = d.lat_deg !== null && d.lon_deg !== null;
+          const alert = severity.get(id);
+          const status = identificationStatus(d);
+          return (
+            <li key={id}>
+              <button
+                type="button"
+                className={`row${id === selected ? " selected" : ""}${alert ? ` alert-${alert}` : ""}`}
+                onClick={() => onSelect(id)}
+              >
+                <div className="row-head">
+                  <strong>{d.label ?? <span className="muted">{t("unnamed")}</span>}</strong>
+                  <span
+                    className={badgeClass(status)}
+                    title={status ? t(statusHintKey(status, d.identification?.reason)) : undefined}
+                  >
+                    {t(statusLabelKey(status))}
+                  </span>
+                  {d.identification?.mismatch && (
+                    <span className="pill id-mismatch">{t("id_mismatch")}</span>
+                  )}
+                  <span className="muted mono small">{shortId(id)}</span>
+                </div>
+                <div className="row-body small">
+                  {d.source === "remote_id" || d.source === "network_remote_id" ? (
+                    <>
+                      {d.source === "remote_id" ? (
+                        <span className="pill remote-id" title={t("remote_id_unverified")}>
+                          {t("remote_id")}
+                        </span>
+                      ) : (
+                        <span className="pill network-rid" title={t("network_rid_unverified")}>
+                          {t("network_rid")}
+                        </span>
+                      )}
+                      <span>{d.airborne ? t("airborne") : t("on_ground")}</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className={`pill ${d.armed ? "armed" : ""}`}>
+                        {d.armed === null ? t("unknown") : d.armed ? t("armed") : t("disarmed")}
+                      </span>
+                      <span>{d.mode ?? "—"}</span>
+                      <span title={t("battery")}>{num(d.batt_pct, 0, "%")}</span>
+                    </>
+                  )}
+                  <span title={t("altitude_home")}>{num(d.alt_above_home_m, 0, "m")}</span>
+                  <span className="muted">
+                    {t("seconds_ago", { n: ageSeconds(item.receivedAt, now) })}
+                  </span>
+                  {!placed && <span className="pill unplaced">{t("no_position")}</span>}
+                  {sourceDisabled.has(id) && (
+                    <span className="pill source-disabled">{t("source_disabled_track")}</span>
+                  )}
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </>
   );
 }

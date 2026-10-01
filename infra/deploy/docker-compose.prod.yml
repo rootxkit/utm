@@ -147,6 +147,15 @@ services:
     volumes:
       - ./data/geoid:/data/geoid:ro
 
+  # U-02: network Remote ID, an F3411 Display Provider polling USSPs. Its
+  # own process, like every source (ARCHITECTURE.md 2.1). Idle, and saying
+  # so, until NETWORK_RID_PROVIDERS names a provider.
+  network-rid:
+    <<: *app
+    command: ["python", "-m", "gateway.network_rid_ingest"]
+    volumes:
+      - ./data/geoid:/data/geoid:ro
+
   caddy:
     image: caddy:2-alpine
     ports:

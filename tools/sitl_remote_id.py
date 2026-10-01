@@ -59,6 +59,16 @@ does, which exercises the ingest's join by transmitter address.
 back (signed when it is finally sent, as a slow receiver would), and
 `--spoof-serial` broadcasts someone else's serial number (U-02).
 
+## Several identities on one vehicle (U-02)
+
+`--sysid` may be given more than once with the same SYSID, each time with
+its own `--serial`, `--operator-id` and `--transmitter`: the vehicle then
+carries several Remote ID modules, each its own radio. An empty serial
+(`--serial ""`) sends no Basic ID, so that module is heard as an
+unidentified transmitter (S-32); an empty operator ID sends no Operator ID
+message. This is how U-02's four identification statuses are flown on
+three SITL vehicles (`docs/runbooks/u02-identification.md`).
+
 Nothing here is a flight instruction: the bridge only listens to SITL.
 """
 
@@ -411,11 +421,15 @@ class RidModule:
             self._next_static_s = _advance(
                 self._next_static_s, self.rates.static_period_s, now_s
             )
-            messages.append(self.basic_id())
+            # U-02: an empty serial is a module that sends no Basic ID, an
+            # empty operator ID one that sends no Operator ID.
+            if self.spoof_serial or self.identity.serial:
+                messages.append(self.basic_id())
             system = self.system()
             if system is not None:
                 messages.append(encode_system(system))
-            messages.append(self.operator_id())
+            if self.identity.operator_id:
+                messages.append(self.operator_id())
         # Last, so that sent singly (Bluetooth 4) the ingest already has the
         # identity and operator when the position arrives.
         messages.append(odid.encode_location(location))
@@ -596,7 +610,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="per vehicle, or once with {sysid}, e.g. SITLRID{sysid:04d}",
     )
-    parser.add_argument("--operator-id", action="append", default=[])
+    parser.add_argument(
+        "--operator-id",
+        action="append",
+        default=[],
+        help='per vehicle; "" sends no Operator ID message',
+    )
+    parser.add_argument(
+        "--transmitter",
+        action="append",
+        default=[],
+        help="per vehicle: its radio's address; default one per SYSID",
+    )
     parser.add_argument("--ua-type", type=int, default=UA_TYPE_MULTIROTOR)
     parser.add_argument("--link", choices=("udp", "tcp"), default="udp")
     parser.add_argument(
@@ -660,8 +685,22 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     try:
         args.serial = _per_vehicle(args.serial, args.sysid, "serial")
         args.operator_id = _per_vehicle(args.operator_id, args.sysid, "operator-id")
+        args.transmitter = (
+            _per_vehicle(args.transmitter, args.sysid, "transmitter")
+            if args.transmitter
+            else [None] * len(args.sysid)
+        )
     except ValueError as error:
         parser.error(str(error))
+    radios = [
+        t or transmitter_for(s, spoofing=args.spoof_serial is not None)
+        for s, t in zip(args.sysid, args.transmitter, strict=True)
+    ]
+    if len(set(radios)) != len(radios):
+        parser.error(
+            "two modules on one transmitter address would be joined into one "
+            "aircraft; give each its own --transmitter"
+        )
     return args
 
 
@@ -697,8 +736,8 @@ def main(
     )
     vehicles = []
     sources: dict[str, MavlinkSource] = {}
-    for sysid, serial, operator_id in zip(
-        args.sysid, args.serial, args.operator_id, strict=True
+    for sysid, serial, operator_id, radio in zip(
+        args.sysid, args.serial, args.operator_id, args.transmitter, strict=True
     ):
         address = mavlink_address(args, sysid)
         module = RidModule(
@@ -712,10 +751,13 @@ def main(
         )
         if address not in sources:
             sources[address] = connect(address)
-        transmitter = transmitter_for(sysid, spoofing=args.spoof_serial is not None)
+        transmitter = radio or transmitter_for(
+            sysid, spoofing=args.spoof_serial is not None
+        )
         vehicles.append(Vehicle(module, sources[address], transmitter))
         claimed = f" (spoofing {args.spoof_serial})" if args.spoof_serial else ""
-        print(f"SYSID {sysid} on {address} -> {serial}{claimed}")
+        shown = serial or "(no Basic ID)"
+        print(f"SYSID {sysid} on {address} -> {shown}{claimed} via {transmitter}")
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         target = (args.host, args.port)

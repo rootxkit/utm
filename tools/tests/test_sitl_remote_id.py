@@ -901,3 +901,88 @@ def test_one_mavlink_address_serves_every_vehicle(tmp_path: Path) -> None:
     argv += ["--key-file", str(keys), "--duration-s", "0.05", "--port", "9"]
     assert bridge.main(argv, connect=connect) == 0
     assert connected == ["udpin:127.0.0.1:14550"]
+
+
+# --- U-02: modules without a Basic ID or an Operator ID, several per vehicle -----
+
+
+def test_a_module_with_no_serial_sends_no_basic_id() -> None:
+    rid = RidModule(
+        state=VehicleState(sysid=SYSID),
+        identity=Identity(serial="", operator_id="GEOU02ACTIVE001"),
+        geoid=FlatGeoid(),
+    )
+    for message in flying():
+        rid.state.update(message, now_s=0.0)
+    sent = decoded(rid.tick(0.0))
+    assert not any(isinstance(m, odid.BasicId) for m in sent)
+    assert one(sent, odid.OperatorId).operator_id == "GEOU02ACTIVE001"
+    assert one(sent, odid.Location).lat_deg is not None
+
+
+def test_a_module_with_no_operator_sends_no_operator_id() -> None:
+    rid = module(*flying())
+    rid = RidModule(
+        state=rid.state,
+        identity=Identity(serial="SN-1", operator_id=""),
+        geoid=FlatGeoid(),
+    )
+    sent = decoded(rid.tick(0.0))
+    assert not any(isinstance(m, odid.OperatorId) for m in sent)
+    assert one(sent, odid.BasicId).ua_id == "SN-1"
+
+
+def test_two_modules_on_one_vehicle_need_two_transmitters(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    twice = ["--sysid", "1", "--sysid", "1", "--serial", "A", "--serial", ""]
+    twice += ["--operator-id", "OP", "--geoid", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        bridge.parse_args(twice)
+    assert "own --transmitter" in capsys.readouterr().err
+
+    args = bridge.parse_args(
+        [
+            *twice,
+            "--transmitter",
+            "02:55:16:00:00:01",
+            "--transmitter",
+            "02:55:18:00:00:01",
+        ]
+    )
+    assert args.transmitter == ["02:55:16:00:00:01", "02:55:18:00:00:01"]
+    assert args.serial == ["A", ""]
+
+
+def test_an_unidentified_module_beside_an_identified_one_is_its_own_track() -> None:
+    """Through the ingest: one vehicle, two radios, one without a Basic ID."""
+    shared = FakeSource(flying())
+    radios = {"02:55:16:00:00:03": "SN-REG", "02:55:18:00:00:03": ""}
+    vehicles = [
+        Vehicle(
+            RidModule(
+                state=VehicleState(sysid=SYSID),
+                identity=Identity(serial, "GEOU02ACTIVE001"),
+                geoid=FlatGeoid(),
+            ),
+            shared,
+            radio,
+        )
+        for radio, serial in radios.items()
+    ]
+    datagrams: list[bytes] = []
+    Bridge(
+        vehicles=vehicles,
+        receiver=Receiver("sitl-rx"),
+        link=FaultyLink(),
+        send=datagrams.append,
+        clock_s=lambda: 0.0,
+    ).step()
+    tracker = RemoteIdTracker(geoid=FlatGeoid(), identify_within_s=0.0)
+    seen = []
+    for datagram in datagrams:
+        frame = parse_datagram(datagram, received_at=datetime.now(tz=UTC))
+        observation = tracker.take(frame, now_s=0.0)
+        assert observation is not None
+        seen.append((observation["remote_id"]["identified"], observation["label"]))
+    assert sorted(seen) == [(False, "02:55:18:00:00:03"), (True, "SN-REG")]

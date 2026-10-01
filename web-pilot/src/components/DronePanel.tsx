@@ -2,6 +2,7 @@
 // not here: there are no missions yet (P3).
 import { DASH, ageSeconds, num, shortId } from "../format";
 import { useT } from "../i18n";
+import { badgeClass, identificationStatus, statusHintKey, statusLabelKey } from "../identification";
 import { useTerrain } from "../terrain";
 import type { Aircraft, Alert } from "../types";
 import { Sparkline } from "./Sparkline";
@@ -48,6 +49,62 @@ export function DronePanel({ droneId, aircraft, alerts, now, onClose, sourceDisa
         <p className="muted pad">{t("no_position")}</p>
       ) : (
         <>
+          <section className="id-box">
+            <strong>{t("identification")}</strong>{" "}
+            <span className={badgeClass(identificationStatus(d))}>
+              {t(statusLabelKey(identificationStatus(d)))}
+            </span>
+            {d.identification?.mismatch && (
+              <span className="pill id-mismatch">{t("id_mismatch")}</span>
+            )}
+            {identificationStatus(d) && (
+              <p className="small">
+                {t(
+                  statusHintKey(
+                    identificationStatus(d) ?? "unidentified",
+                    d.identification?.reason,
+                  ),
+                )}
+              </p>
+            )}
+            {d.identification && (
+              <dl className="fields">
+                <Field label={t("id_serial")} value={d.identification.serial ?? DASH} />
+                <Field label={t("id_operator")} value={d.identification.operator_reg ?? DASH} />
+                {d.identification.mismatch && (
+                  <Field
+                    label={t("id_registered_operator")}
+                    value={d.identification.registered_operator_reg ?? DASH}
+                  />
+                )}
+                <Field label={t("id_reason")} value={d.identification.reason} />
+              </dl>
+            )}
+          </section>
+          {d.source === "network_remote_id" && d.network_rid && (
+            <section className="remote-id-box">
+              <strong>{t("network_rid")}</strong>
+              <p className="small">{t("network_rid_unverified")}</p>
+              {d.network_rid.extrapolated && <p className="small">{t("nrid_extrapolated")}</p>}
+              <dl className="fields">
+                <Field label={t("nrid_provider")} value={d.network_rid.provider} />
+                <Field label={t("nrid_flight")} value={d.network_rid.flight_id} />
+                <Field label={t("rid_ua_id")} value={d.network_rid.serial ?? DASH} />
+                <Field label={t("rid_operator")} value={d.network_rid.operator_id ?? DASH} />
+                <Field
+                  label={t("rid_operator_position")}
+                  value={
+                    d.network_rid.operator_lat_deg === null ||
+                    d.network_rid.operator_lon_deg === null
+                      ? DASH
+                      : `${d.network_rid.operator_lat_deg.toFixed(6)}, ${d.network_rid.operator_lon_deg.toFixed(6)}`
+                  }
+                />
+                <Field label={t("altitude_hae")} value={num(d.alt_hae_m, 1, "m")} />
+                <Field label={t("track")} value={num(d.track_deg, 0, "°")} />
+              </dl>
+            </section>
+          )}
           {d.source === "remote_id" && d.remote_id && (
             <section className="remote-id-box">
               <strong>{t("remote_id")}</strong>
@@ -79,12 +136,19 @@ export function DronePanel({ droneId, aircraft, alerts, now, onClose, sourceDisa
                     ? t("conflict")
                     : alert.kind === "height"
                       ? t("above_height_limit")
-                      : t("in_zone", { zone: alert.detail.zone_name ?? DASH })}
+                      : alert.kind === "identification_mismatch"
+                        ? t("id_mismatch")
+                        : alert.kind === "identification"
+                          ? t("identification_in_zone", {
+                              status: t(statusLabelKey(alert.detail.status ?? null)),
+                              zone: alert.detail.zone_name ?? DASH,
+                            })
+                          : t("in_zone", { zone: alert.detail.zone_name ?? DASH })}
                 </li>
               ))}
             </ul>
           )}
-          {d.source !== "remote_id" && (
+          {d.source === undefined && (
             <section>
               <h3>{t("battery_trend")}</h3>
               <Sparkline

@@ -15,7 +15,7 @@ import pytest
 from airspace.config import AirspaceSettings
 from api.config import ApiSettings, ConsoleSettings
 from common.config import Settings, load_settings
-from gateway.config import GatewaySettings, RemoteIdSettings
+from gateway.config import GatewaySettings, NetworkRidSettings, RemoteIdSettings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENV_EXAMPLE = REPO_ROOT / "infra" / ".env.example"
@@ -30,6 +30,7 @@ SERVICE_SETTINGS: tuple[type[Settings], ...] = (
     ConsoleSettings,
     AirspaceSettings,
     RemoteIdSettings,
+    NetworkRidSettings,
 )
 
 # Variables the example sets that are consumed by docker-compose rather than by

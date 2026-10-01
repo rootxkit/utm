@@ -85,6 +85,7 @@ def encode_row(
     rx_ts: datetime | None = None,
     backlog: bool = False,
     captured_at: datetime | None = None,
+    identification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """A drone_state row as the console reads it.
 
@@ -145,6 +146,10 @@ def encode_row(
         "sat_count": row.sat_count,
         "groundspeed_ms": row.groundspeed_ms,
         "climb_ms": row.climb_ms,
+        # U-02: the registry's verdict on the aircraft a station binding
+        # names (`gateway/identification.py`). None where the Gateway has no
+        # registry projection to resolve against.
+        "identification": identification,
     }
 
 
@@ -218,6 +223,7 @@ class TelemetryPublisher:
         rx_ts: datetime | None = None,
         backlog: bool = False,
         captured_at: datetime | None = None,
+        identification: dict[str, Any] | None = None,
     ) -> None:
         await self._send(
             telemetry_subject(row.drone_id),
@@ -229,6 +235,7 @@ class TelemetryPublisher:
                 rx_ts=rx_ts,
                 backlog=backlog,
                 captured_at=captured_at,
+                identification=identification,
             ),
         )
 
@@ -242,8 +249,10 @@ class TelemetryPublisher:
         rx_ts: datetime | None = None,
         backlog: Sequence[bool] | None = None,
         captured_at: Sequence[datetime] | None = None,
+        identifications: dict[UUID, dict[str, Any]] | None = None,
     ) -> None:
         """`backlog` and `captured_at`, when given, are parallel to `rows`."""
+        identifications = identifications or {}
         labels = labels or {}
         links = links or {}
         firmware = firmware or {}
@@ -260,6 +269,7 @@ class TelemetryPublisher:
                 rx_ts=rx_ts,
                 backlog=False if backlog is None else backlog[n],
                 captured_at=None if captured_at is None else captured_at[n],
+                identification=identifications.get(row.drone_id),
             )
 
     async def publish_station(

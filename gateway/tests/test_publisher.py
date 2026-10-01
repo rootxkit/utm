@@ -323,3 +323,10 @@ async def test_a_batch_publishes_one_message_per_row() -> None:
     assert {subject for subject, _ in bus.published} == {
         telemetry_subject(r.drone_id) for r in rows
     }
+
+
+def test_a_row_carries_its_identification_or_null() -> None:
+    """U-02: the registry's verdict travels with the row; none is null."""
+    verdict = {"status": "registered", "reason": "relay_binding"}
+    assert encode_row(row(), identification=verdict)["identification"] == verdict
+    assert encode_row(row())["identification"] is None

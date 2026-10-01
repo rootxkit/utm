@@ -43,6 +43,10 @@ dependencies = [
     # as a development extra, which every developer machine installs, so its
     # absence showed only when the first production image started (P0-09).
     "pymavlink>=2.4.40",
+    # U-02: the network Remote ID ingest is an ASTM F3411 Display Provider,
+    # an HTTPS client of USSPs. Async, because the adapter is asyncio; it was
+    # already the dev dependency the API tests drive FastAPI with.
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]

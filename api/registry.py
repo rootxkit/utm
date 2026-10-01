@@ -140,6 +140,22 @@ def refused(entity: str, name: str, error: IntegrityError) -> ConflictError:
     return ConflictError(f"{entity} {name!r} refused: {reason}", code=code)
 
 
+# U-02. Every transaction that writes the identity projection
+# (`gateway/registry_projection.py`) takes this transaction-scoped advisory
+# lock first, and the full re-projection holds it from its read of the
+# registry to the end of its write. So a re-projection never reads the
+# registry before a change commits and then writes over the projection that
+# change made: a suspension is never reverted to "registered" for a sync
+# interval. Its own key: U-15's lock (`api/sources.py`) guards another state.
+PROJECTION_LOCK_KEY = 0x553032
+_PROJECTION_LOCK = sa.text("SELECT pg_advisory_xact_lock(:key)")
+
+
+async def lock_projection(connection: AsyncConnection) -> None:
+    """Serialise this transaction with the identity re-projection (U-02)."""
+    await connection.execute(_PROJECTION_LOCK, {"key": PROJECTION_LOCK_KEY})
+
+
 async def audit(
     connection: AsyncConnection,
     entity_type: str,
@@ -464,6 +480,7 @@ class FleetRegistry:
         """Register a drone here and make it bindable in the telemetry database."""
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 created = (
                     await connection.execute(
                         sa.text(
@@ -592,6 +609,7 @@ class FleetRegistry:
         """
         at = self._now()
         async with self.engine.begin() as connection:
+            await lock_projection(connection)
             await _fleet_only(connection, "drones", "drone", drone_id)
             updated = (
                 await connection.execute(

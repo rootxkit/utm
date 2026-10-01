@@ -28,7 +28,12 @@ from airspace.policy import (
     load_height_limit,
     load_policy,
 )
-from airspace.service import AirspaceService, EventsAuditLog, run_ticker
+from airspace.service import (
+    AirspaceService,
+    CountedIncidentCandidates,
+    EventsAuditLog,
+    run_ticker,
+)
 from airspace.zones import Zone, load_zones, unjudgeable
 from common import configure_logging, get_logger, load_settings
 from common.bus import RECONNECT_FOREVER
@@ -113,6 +118,8 @@ async def run(settings: AirspaceSettings) -> None:
         neighbour_max_age_s=settings.neighbour_max_age_s,
         source_state_max=settings.source_state_max,
         pressure_uncertainty_m=settings.pressure_uncertainty_m,
+        identification_severity=Severity(settings.identification_alert_severity),
+        mismatch_severity=Severity(settings.identification_mismatch_severity),
     )
     service = AirspaceService(
         monitor=monitor,
@@ -123,6 +130,8 @@ async def run(settings: AirspaceSettings) -> None:
         tiles=terrain,
         tile_log_every_s=settings.terrain_retry_missing_s,
         source_control=follower,
+        # U-02: identification alerts, the seam U-12 turns into incidents.
+        incidents=CountedIncidentCandidates(),
     )
     _log.info(
         "airspace monitor running",

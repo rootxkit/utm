@@ -36,11 +36,49 @@ export interface RemoteIdInfo {
   ts_accuracy_s?: number | null;
 }
 
+// U-02. Who a track is, as the registry sees it (gateway/identification.py).
+// Every source carries it; null where the adapter had no registry to ask.
+export type IdentificationStatus = "registered" | "suspended" | "unknown_operator" | "unidentified";
+
+export interface Identification {
+  status: IdentificationStatus;
+  // A stable code for which rule applied, e.g. "operator_mismatch".
+  reason: string;
+  serial: string | null;
+  operator_reg: string | null;
+  // A registered serial given with an operator that is not its owner.
+  mismatch: boolean;
+  // Only on a mismatch: the operator the registry has for the serial.
+  registered_operator_reg: string | null;
+}
+
+// U-02. What network Remote ID (an ASTM F3411 USSP) adds.
+export interface NetworkRidInfo {
+  provider: string;
+  flight_id: string;
+  aircraft_type: string | null;
+  simulated: boolean;
+  // The provider projected this position forward.
+  extrapolated: boolean;
+  serial: string | null;
+  registration_id: string | null;
+  operator_id: string | null;
+  operator_lat_deg: number | null;
+  operator_lon_deg: number | null;
+  time_source: "broadcast" | "receiver";
+  ts_accuracy_s: number | null;
+}
+
 export interface Telemetry {
   drone_id: string;
-  // Absent on MAVLink telemetry; "remote_id" on a broadcast (P1-15).
-  source?: "remote_id";
+  // Absent on MAVLink telemetry; "remote_id" on a broadcast (P1-15);
+  // "network_remote_id" from a USSP (U-02).
+  source?: "remote_id" | "network_remote_id";
+  // U-02: "provider" for network Remote ID, as trustworthy as the USSP.
+  trust?: "provider";
   authenticated?: boolean;
+  identification?: Identification | null;
+  network_rid?: NetworkRidInfo;
   // Remote ID reports track over the ground, not heading.
   track_deg?: number | null;
   // Height above the WGS-84 ellipsoid, as broadcast. Not AMSL.
@@ -94,7 +132,10 @@ export interface Station {
 export interface Alert {
   state: "raised" | "active" | "cleared";
   key: string;
-  kind: "conflict" | "zone" | "height";
+  // U-02: "identification" is an unidentified or unknown-operator aircraft in
+  // a zone that needs an identity (the incident seam); "identification_mismatch"
+  // a registered serial given with another operator's number.
+  kind: "conflict" | "zone" | "height" | "identification" | "identification_mismatch";
   // "info" only for a CONDITIONAL zone when policy says so (U-03).
   severity: "critical" | "warning" | "info";
   drone_ids: string[];
@@ -134,6 +175,15 @@ export interface Alert {
     max_height_agl_m?: number;
     ground_elevation_m?: number;
     dataset?: string;
+    // U-02: identification alerts, and every zone alert's aircraft.
+    status?: IdentificationStatus;
+    serial?: string | null;
+    operator_reg?: string | null;
+    registered_operator_reg?: string | null;
+    mismatch?: boolean;
+    incident_candidate?: boolean;
+    identification_reason?: string;
+    identification?: Identification;
   };
 }
 

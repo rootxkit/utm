@@ -32,6 +32,16 @@ dropped once its receiver is established, before the tracker, the store or
 the bus sees it, and counted (`dropped_source_disabled` in the status line,
 and per receiver on `source.remote_id`). Switching it on again needs
 nothing at the receiver: the next datagram is taken.
+
+## Identification (U-02)
+
+Every observation published carries `identification`, the registry's
+verdict on its serial and operator ID (`gateway/identification.py`), from
+the registry projection the ingest re-reads every `REGISTRY_REFRESH_S`
+(`gateway/registry_projection.py`). A broadcast of one of our aircraft's
+serials far from where that aircraft's live relay telemetry places it is
+published as a separate track, `unknown_operator` with a mismatch (S-10),
+and counted (`serial_conflicts`).
 """
 
 from __future__ import annotations
@@ -41,6 +51,7 @@ import contextlib
 import json
 import signal
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -48,8 +59,7 @@ from pathlib import Path
 
 import nats
 from nats.aio.msg import Msg
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from common import configure_logging, get_logger, load_settings
 from common.bus import RECONNECT_FOREVER
@@ -57,16 +67,26 @@ from common.geoid import GeoidGrid
 from common.sources import REMOTE_ID, follow, follower_from_settings
 from gateway import odid
 from gateway.config import RemoteIdSettings
+from gateway.identification import resolve_remote_id, serial_conflict
 from gateway.publisher import Bus
 from gateway.rate_limit import RateLimiter
-from gateway.remote_id import Frame, RemoteIdTracker
+from gateway.registry_projection import RegistryFollower, RegistrySnapshot
+from gateway.remote_id import SOURCE, Frame, RemoteIdTracker
 from gateway.remote_id_auth import (
     AuthenticationError,
     ReceiverAuthenticator,
     load_keys,
     split,
 )
-from gateway.remote_id_match import FleetSerials, LinkFreshness, as_registered
+from gateway.remote_id_match import (
+    DEFAULT_SPOOF_DISTANCE_M,
+    FleetSerials,
+    LinkFreshness,
+    Verdict,
+    as_registered,
+    judge,
+    report_conflict,
+)
 from gateway.remote_id_store import PendingRows, RemoteIdWriter, row_from_observation
 from gateway.source_activity import SourceActivity, publish_periodically
 
@@ -74,9 +94,6 @@ _log = get_logger(__name__)
 
 MAX_DATAGRAM_BYTES = 4096
 FLUSH_INTERVAL_S = 0.5
-# How often the registered serials are re-read, so an aircraft registered
-# while the ingest runs is matched without a restart.
-SERIALS_REFRESH_S = 60.0
 # How often the running totals are logged, as the airspace monitor's are.
 STATUS_INTERVAL_S = 60.0
 # Why `captured_at` fell back to the receive time (gateway/remote_id.py).
@@ -154,6 +171,14 @@ class RemoteIdIngest:
     sources: SourceActivity | None = None
     # Datagrams from a receiver, or a type, that is switched off.
     dropped_source_disabled: int = field(default=0, init=False)
+    # U-02. The registry as last read; `RegistryFollower` replaces it.
+    registry: RegistrySnapshot = field(default_factory=RegistrySnapshot)
+    # S-10. See `gateway/remote_id_match.py`.
+    spoof_distance_m: float = DEFAULT_SPOOF_DISTANCE_M
+    # Broadcasts of our serials away from where our aircraft is (S-10).
+    serial_conflicts: int = field(default=0, init=False)
+    # Observations published by identification status.
+    identified_as: Counter[str] = field(default_factory=Counter, init=False)
 
     async def on_datagram(self, data: bytes, source: str) -> None:
         received_at = self.wall()
@@ -184,7 +209,28 @@ class RemoteIdIngest:
             return
         if observation is None:
             return
-        ours = self.fleet.match(observation)
+        lat, lon = observation.get("lat_deg"), observation.get("lon_deg")
+        judgement = judge(
+            self.fleet.match(observation),
+            None if lat is None or lon is None else (float(lat), float(lon)),
+            self.links,
+            now_s=self.clock_s(),
+            spoof_distance_m=self.spoof_distance_m,
+        )
+        conflict = judgement.verdict is Verdict.CONFLICT
+        if conflict:
+            # S-10: not our aircraft, whatever serial it claims.
+            self.serial_conflicts += 1
+            report_conflict(
+                self.refusals,
+                judgement,
+                broadcast_drone_id=observation["drone_id"],
+                station_id=observation.get("station_id"),
+                source=SOURCE,
+                spoof_distance_m=self.spoof_distance_m,
+                serial_conflicts=self.serial_conflicts,
+            )
+        ours = None if conflict else judgement.aircraft
         if self.store is not None:
             # Before publishing: a bus failure must not lose the record too.
             self.store.add(
@@ -198,11 +244,18 @@ class RemoteIdIngest:
                     matched_drone_id=None if ours is None else ours.drone_id,
                 )
             )
-        if ours is not None:
-            if self.links.live(ours.drone_id, now_s=self.clock_s()):
-                self.withheld += 1
-                return
+        if judgement.verdict is Verdict.WITHHOLD:
+            self.withheld += 1
+            return
+        if judgement.verdict is Verdict.AS_OURS and ours is not None:
             observation = as_registered(observation, ours)
+        rid = observation["remote_id"]
+        identification = (
+            serial_conflict(rid["ua_id"], rid.get("operator_id"))
+            if conflict
+            else resolve_remote_id(self.registry, rid)
+        )
+        observation["identification"] = identification.as_dict()
         try:
             await self.bus.publish(
                 f"telemetry.{observation['drone_id']}",
@@ -215,6 +268,7 @@ class RemoteIdIngest:
             )
             return
         self.published += 1
+        self.identified_as[identification.status.value] += 1
 
     def status(self) -> dict[str, int]:
         """The running totals, as the status line logs them."""
@@ -229,7 +283,10 @@ class RemoteIdIngest:
             "identity_changes": tracker.identity_changes,
             "address_conflicts": tracker.address_conflicts,
             "silences": tracker.silences,
+            "serial_conflicts": self.serial_conflicts,
         }
+        for status in ("registered", "suspended", "unknown_operator", "unidentified"):
+            totals[f"identified_{status}"] = self.identified_as[status]
         for reason in TIME_FALLBACK_REASONS:
             totals[f"time_fallback_{reason}"] = tracker.time_fallbacks[reason]
         if self.sources is not None:
@@ -314,22 +371,6 @@ async def flush_periodically(store: PendingRows, stop: asyncio.Event) -> None:
         await store.flush()
 
 
-async def refresh_serials_periodically(
-    fleet: FleetSerials, engine: AsyncEngine, stop: asyncio.Event
-) -> None:
-    while not stop.is_set():
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), SERIALS_REFRESH_S)
-        if stop.is_set():
-            return
-        try:
-            await fleet.refresh(engine)
-        except (SQLAlchemyError, OSError) as error:
-            # Keep the serials we have: a database hiccup must not make our
-            # aircraft appear twice.
-            _log.error("could not re-read serials", extra={"error": repr(error)})
-
-
 async def run(settings: RemoteIdSettings) -> None:
     bus = await nats.connect(
         str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
@@ -344,7 +385,12 @@ async def run(settings: RemoteIdSettings) -> None:
             max_skew_s=settings.remote_id_max_skew_s,
         )
     fleet = FleetSerials()
-    await fleet.refresh(engine)
+    # U-02. The registry projection: serials for matching, and the facts
+    # every observation is identified by. Re-read every REGISTRY_REFRESH_S,
+    # so an aircraft registered or suspended while the ingest runs is seen
+    # without a restart.
+    registry = RegistryFollower(engine=engine, refresh_s=settings.registry_refresh_s)
+    await registry.refresh()
     # U-15. The switches, from the bucket the API writes; never from the
     # relational database.
     follower = follower_from_settings(bus, settings)
@@ -361,7 +407,15 @@ async def run(settings: RemoteIdSettings) -> None:
         authenticator=authenticator,
         fleet=fleet,
         sources=sources,
+        spoof_distance_m=settings.remote_id_spoof_distance_m,
     )
+
+    def take_registry(snapshot: RegistrySnapshot) -> None:
+        fleet.take(snapshot)
+        ingest.registry = snapshot
+
+    registry.on_change = take_registry
+    take_registry(registry.snapshot)
     control = await follow(bus, follower, subject=settings.source_control_subject)
 
     async def on_telemetry(message: Msg) -> None:
@@ -378,6 +432,7 @@ async def run(settings: RemoteIdSettings) -> None:
             "port": settings.remote_id_bind_port,
             "geoid": str(settings.geoid_path) if settings.geoid_path else None,
             "serials_matched": len(fleet.by_serial),
+            "registry_loaded": registry.loaded,
             "receivers": (
                 sorted(authenticator.keys) if authenticator else "unauthenticated"
             ),
@@ -391,7 +446,7 @@ async def run(settings: RemoteIdSettings) -> None:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop.set)
     flusher = asyncio.create_task(flush_periodically(store, stop))
-    refresher = asyncio.create_task(refresh_serials_periodically(fleet, engine, stop))
+    refresher = asyncio.create_task(registry.run(stop))
     reporter = asyncio.create_task(log_status_periodically(ingest, stop))
     announcer = asyncio.create_task(publish_periodically(sources, bus, stop))
     try:

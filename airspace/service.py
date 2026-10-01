@@ -33,7 +33,7 @@ from typing import Any, Protocol
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from airspace.monitor import AirspaceMonitor, Alert, Change, ClearReason
+from airspace.monitor import AirspaceMonitor, Alert, AlertKind, Change, ClearReason
 from common import get_logger
 from common.sources import SourceControlFollower
 from common.terrain import cell_name
@@ -64,6 +64,61 @@ class AuditLog(Protocol):
         at: datetime,
         reason: ClearReason | None = None,
     ) -> None: ...
+
+
+class Incidents(Protocol):
+    """Where an `identification` alert becomes an incident: U-12's seam.
+
+    The service hands every raise and clear of an `identification` alert
+    (an unidentified or unknown-operator aircraft in a zone that needs an
+    identity, U-02) to this, after publishing and queueing its audit row.
+    U-12 implements it with persisted, audited incidents; until then
+    `CountedIncidentCandidates` counts and logs them, so the seam has a
+    consumer and the status line shows it working.
+    """
+
+    async def candidate(
+        self,
+        alert: Alert,
+        state: str,
+        *,
+        at: datetime,
+        reason: ClearReason | None = None,
+    ) -> None: ...
+
+
+@dataclass
+class CountedIncidentCandidates:
+    """The `Incidents` sink until U-12: counts and logs, opens nothing."""
+
+    raised: int = field(default=0, init=False)
+    cleared: int = field(default=0, init=False)
+
+    async def candidate(
+        self,
+        alert: Alert,
+        state: str,
+        *,
+        at: datetime,
+        reason: ClearReason | None = None,
+    ) -> None:
+        if state == "raised":
+            self.raised += 1
+        elif state == "cleared":
+            self.cleared += 1
+        _log.warning(
+            "incident candidate (U-12 will open an incident here)",
+            extra={
+                "state": state,
+                "reason": None if reason is None else reason.value,
+                "key": alert.key,
+                "drone_id": str(alert.drone_ids[0]),
+                "status": alert.detail.get("status"),
+                "identifier": alert.detail.get("identifier"),
+                "at": at.isoformat(),
+                "incident_candidates_raised": self.raised,
+            },
+        )
 
 
 def alert_subject(alert: Alert) -> str:
@@ -140,6 +195,8 @@ class AirspaceService:
     # U-15. The source switches, for the status line: whether they could be
     # read. None in tests that do not follow them.
     source_control: SourceControlFollower | None = None
+    # U-02 / U-12. Where identification alerts go to become incidents.
+    incidents: Incidents | None = None
     # Wall clock, on the same epoch as telemetry's `ts` (S-11): the monitor
     # compares the two to tell live telemetry from a replayed backlog.
     clock: Callable[[], float] = time.time
@@ -300,6 +357,14 @@ class AirspaceService:
             "audit_failures": self.audit_failures,
             "audit_abandoned": self.audit_abandoned,
             **({} if self.source_control is None else self.source_control.status()),
+            **(
+                {
+                    "incident_candidates_raised": self.incidents.raised,
+                    "incident_candidates_cleared": self.incidents.cleared,
+                }
+                if isinstance(self.incidents, CountedIncidentCandidates)
+                else {}
+            ),
         }
 
     def _log_status(self, now_s: float) -> None:
@@ -370,9 +435,14 @@ class AirspaceService:
                 alert_subject(alert), encode_alert(alert, state, reason=reason)
             ),
         )
+        at = datetime.fromtimestamp(self.clock(), tz=UTC)
         if self.audit is not None:
-            at = datetime.fromtimestamp(self.clock(), tz=UTC)
             self._enqueue_audit(AuditEntry(alert, state, reason, at))
+        if self.incidents is not None and alert.kind is AlertKind.IDENTIFICATION:
+            await _guard(
+                "incident",
+                self.incidents.candidate(alert, state, at=at, reason=reason),
+            )
 
     def _enqueue_audit(self, entry: AuditEntry) -> None:
         # Started on first use rather than in a `start()` a caller could

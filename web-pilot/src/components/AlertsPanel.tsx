@@ -3,6 +3,7 @@
 // does when the condition is gone, and it is not yet recorded (P6-07).
 import { DASH, num, shortId } from "../format";
 import { useT } from "../i18n";
+import { badgeClass, isClaimed, statusLabelKey } from "../identification";
 import { type Aircraft, type Alert, bySeverity } from "../types";
 
 interface Props {
@@ -30,12 +31,19 @@ export function AlertsPanel({
   const t = useT();
   // A party known only from a Remote ID broadcast is marked where the alert
   // names it: the alert is about a claimed position.
-  const broadcastOnly = (droneId: string | undefined) =>
-    droneId && aircraft.get(droneId)?.data.source === "remote_id" ? (
+  const broadcastOnly = (droneId: string | undefined) => {
+    const data = droneId ? aircraft.get(droneId)?.data : undefined;
+    if (!data || !isClaimed(data)) return null;
+    return data.source === "remote_id" ? (
       <span className="pill remote-id" title={t("remote_id_unverified")}>
         {t("remote_id")}
       </span>
-    ) : null;
+    ) : (
+      <span className="pill network-rid" title={t("network_rid_unverified")}>
+        {t("network_rid")}
+      </span>
+    );
+  };
   if (alerts.size === 0) return <p className="muted pad">{t("none")}</p>;
   const ordered = [...alerts.values()].sort(bySeverity);
   return (
@@ -76,6 +84,58 @@ export function AlertsPanel({
                     t: num(d.t_cpa_s, 0),
                     v: num(d.d_alt_at_cpa_m, 0),
                   })}
+                </div>
+              </>
+            ) : alert.kind === "identification" ? (
+              <>
+                <div>
+                  <button
+                    type="button"
+                    className="link"
+                    onClick={() => onSelect(alert.drone_ids[0] ?? "")}
+                  >
+                    {name(alert, 0)}
+                  </button>
+                  {broadcastOnly(alert.drone_ids[0])}{" "}
+                  <span className={badgeClass(d.status ?? null)}>
+                    {t(statusLabelKey(d.status ?? null))}
+                  </span>
+                </div>
+                <div>
+                  {t("identification_in_zone", {
+                    status: t(statusLabelKey(d.status ?? null)),
+                    zone: d.zone_name ?? d.identifier ?? DASH,
+                  })}
+                </div>
+                <div className="small muted">
+                  {d.restriction ? t(`restriction_${d.restriction}`) : ""}
+                  {d.serial && ` · ${t("id_serial")} ${d.serial}`}
+                  {d.operator_reg && ` · ${t("id_operator")} ${d.operator_reg}`}
+                  {d.incident_candidate && ` · ${t("incident_candidate")}`}
+                </div>
+              </>
+            ) : alert.kind === "identification_mismatch" ? (
+              <>
+                <div>
+                  <button
+                    type="button"
+                    className="link"
+                    onClick={() => onSelect(alert.drone_ids[0] ?? "")}
+                  >
+                    {name(alert, 0)}
+                  </button>
+                  {broadcastOnly(alert.drone_ids[0])}{" "}
+                  <span className="pill id-mismatch">{t("id_mismatch")}</span>
+                </div>
+                <div className="small">
+                  {t("identification_mismatch", {
+                    given: d.operator_reg ?? DASH,
+                    registered: d.registered_operator_reg ?? DASH,
+                  })}
+                </div>
+                <div className="small muted">
+                  {d.serial && `${t("id_serial")} ${d.serial} · `}
+                  {t(statusLabelKey(d.status ?? null))}
                 </div>
               </>
             ) : alert.kind === "height" ? (
