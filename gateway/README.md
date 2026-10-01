@@ -91,3 +91,25 @@ Every published telemetry message carries these time-related fields:
     batch of `rx_ts`.
   Those positions are history: the airspace monitor records them but raises
   no live alert from them. Always `false` for Remote ID, which has no queue.
+
+### Network Remote ID (U-02)
+
+`gateway/network_rid_ingest.py` publishes on the same subjects, with
+`source: "network_remote_id"`, `trust: "provider"`, the provider as
+`station_id`, and a `network_rid` block. Its times follow the relay's batch
+rule with the Service Provider's response as the batch: `ts` is the
+flight state's own `timestamp` (the provider's clock), `rx_ts` our receive
+time, and `captured_at` is `rx_ts` less how far the state is behind the
+response's `timestamp`, so the provider's clock skew cancels. A state ahead
+of its response is placed at `rx_ts` and counted; one more than
+`NETWORK_RID_MAX_AGE_S` (60 s) behind is not published. `backlog` is
+always `false`.
+
+### Identification (U-02)
+
+Every `telemetry.*` message, from every adapter, carries `identification`:
+`{status, reason, serial, operator_reg, mismatch, registered_operator_reg}`,
+with `status` one of `registered`, `suspended`, `unknown_operator`,
+`unidentified` (`gateway/identification.py` has the table, and
+`docs/runbooks/u02-identification.md` how it is resolved). `null` only
+where an adapter has no registry projection to ask.

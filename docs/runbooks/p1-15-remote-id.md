@@ -371,7 +371,11 @@ registered, unretired aircraft's. It re-reads the serials every minute.
 | The aircraft's MAVLink telemetry | What happens to the broadcast |
 |---|---|
 | Heard within the last 5 s | Stored with `matched_drone_id` and not published. The MAVLink track is the better one. |
+| Heard within the last 5 s, but more than `REMOTE_ID_SPOOF_DISTANCE_M` (300 m) from where it places the aircraft | Not our aircraft (S-10, U-02): published as a separate unverified track, `unknown_operator` with a mismatch, and alerted. |
 | Quiet | Published as that aircraft: its id and label, still marked as a broadcast. |
+
+Every observation also carries `identification`, the registry's verdict
+(`docs/runbooks/u02-identification.md`).
 
 Either way it stays one track: it never becomes a second aircraft, and it
 never conflicts with itself. If our link drops, the track stays on the map

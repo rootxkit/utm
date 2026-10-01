@@ -73,8 +73,8 @@ it is how SITL aircraft enter the system for every end-to-end test.
 ### 2.1 Source isolation and control
 
 Each source is its own adapter process (its own container in production:
-`gateway` for relays, `remote-id` for receivers, and one per source added
-later). No adapter imports another, and the only thing they share is the
+`gateway` for relays, `remote-id` for receivers, `network-rid` for network
+Remote ID providers (U-02), and one per source added later). No adapter imports another, and the only thing they share is the
 internal track format they publish on NATS. So one can be stopped,
 redeployed or broken without touching the others.
 
@@ -115,8 +115,32 @@ never speaks for a registered aircraft (U-02).
 helicopter is alerted. Manned aircraft are never told to manoeuvre; the alert
 goes to the drone's operator and the control centre.
 
+**Network Remote ID** comes from USSPs: the `network-rid` adapter is an
+ASTM F3411 Display Provider that polls each configured Service Provider
+(OAuth 2 client credentials) for the flights in configured areas
+(`gateway/network_rid.py`). The provider is authenticated; what it says is
+as trustworthy as the provider (`trust: provider`), and the console shows
+it as a claim, like a broadcast. Operators publishing their own aircraft
+to us (U-17) will be one more provider instance of the same source type.
+
 **The registry** turns a serial number into an operator. An aircraft seen by
 any source whose serial is not registered is itself a violation (M-02, U-02).
+
+**Network identification (U-02).** Every track, whatever its source, is
+resolved against the registry to `registered`, `suspended`,
+`unknown_operator` or `unidentified`, and carries it on the bus
+(`identification`). The adapters resolve, each as it publishes, from a
+projection of the registry facts the API keeps in the telemetry database
+(`known_drones` status and owner, `known_uas_operators`): the Gateway never
+reads the relational registry, and a status change reaches every resolver
+within `REGISTRY_REFRESH_S` (5 s). A registered serial broadcast with
+another operator's number is a mismatch, raised by the airspace monitor as
+`identification_mismatch`; an `unidentified` or `unknown_operator`
+aircraft in a PROHIBITED or REQ_AUTHORISATION zone raises `identification`,
+which is where U-12 will open an incident. A broadcast of one of our
+serials away from where that aircraft's authenticated relay telemetry
+places it is never published as our aircraft (S-10).
+`docs/runbooks/u02-identification.md`.
 
 All sources converge on one internal track format on NATS, each published
 by its own adapter (§2.1). The airspace monitor and the console subscribe to

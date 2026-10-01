@@ -94,6 +94,7 @@ every source is enabled.
 |---|---|
 | Gateway, relays | Upgrade refused with **503** and `Retry-After: 10` (never 401/403, which the relay takes as fatal). An open session is closed with **1013** "source disabled" when the switch arrives; a batch that arrives first is neither stored nor acknowledged. The relay keeps queueing and retrying, and on switching on delivers its queue as backlog, which the monitor records and does not alert on. Its queue is capped (1 GiB by default, `queue_max_bytes`): over a long disable it drops its oldest records at the cap, counted in `dropped_cap_total` and declared as a `gap` when it reconnects. |
 | Remote ID ingest | Datagram dropped once its receiver is established, before the tracker, the store and the bus. |
+| Network Remote ID ingest (U-02) | The provider is not polled at all; each skipped poll is counted against it. |
 | Airspace monitor | Its messages counted (`rejected_source_disabled`) and not judged. Its aircraft dropped at once, and their alerts cleared with reason **`source_disabled`**, published and audited. |
 | Console | Sources tab: each type and instance, disabled (by type, instance or default deny) / healthy / stale / enabled-never-heard, last seen, refusals, the switch's reason and author. Admins switch with a reason; viewers cannot. Aircraft from a disabled source are marked *source disabled* and faded on the map. |
 
