@@ -16,7 +16,8 @@ Remote ID observations also say whether they are identified
 (`remote_id.identified`, S-32), which altitude `alt_amsl_m` came from
 (`alt_source`, S-33), and where their time came from
 (`remote_id.time_source`, S-27). `docs/runbooks/p1-15-remote-id.md` says
-how each is decided.
+how each is decided, and what the ingest's minutely "remote id ingest
+status" line counts.
 
 Every published telemetry message carries these time-related fields:
 
