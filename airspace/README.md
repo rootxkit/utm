@@ -46,6 +46,11 @@ is bounded by `SOURCE_STATE_MAX`. A pair whose neighbour sample is older
 than `NEIGHBOUR_MAX_AGE_S` is not judged by that message: neither refreshed
 nor cleared, because silence is not evidence.
 
+Two Remote ID tracks with the same transmitter address
+(`remote_id.transmitter`) are never paired: the Gateway publishes a
+transmitter as unidentified while it has no fresh identity and under its
+serial once it has one (S-32), so they are one radio under two ids.
+
 Rejected messages, failed checks, unreadable tiles and audit-queue losses are
 counted and logged in the `airspace monitor status` line every minute.
 

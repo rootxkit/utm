@@ -250,7 +250,19 @@ def track_from_telemetry(
         captured_at_s=arrived_at_s if received is None else received,
         source=source_of(message),
         source_ts_s=captured_at_s(message),
+        transmitter=transmitter_of(message),
     )
+
+
+def transmitter_of(message: dict[str, Any]) -> str | None:
+    """The transmitter address of a Remote ID broadcast; None otherwise."""
+    if message.get("source") != "remote_id":
+        return None
+    remote_id = message.get("remote_id")
+    if not isinstance(remote_id, dict):
+        return None
+    transmitter = remote_id.get("transmitter")
+    return transmitter if isinstance(transmitter, str) and transmitter else None
 
 
 def _flying(message: dict[str, Any]) -> bool:
@@ -547,6 +559,12 @@ class AirspaceMonitor:
         raised: list[Alert] = []
         for other in self.index.neighbours(track.drone_id):
             key = conflict_key(track.drone_id, other.drone_id)
+            if track.transmitter is not None and track.transmitter == other.transmitter:
+                # One radio under two ids: the Gateway publishes a
+                # transmitter as unidentified while it has no fresh
+                # identity, and under its serial once it has one (S-32).
+                # Not a pair, so not judged either way.
+                continue
             if (
                 abs(track.captured_at_s - other.captured_at_s)
                 > self.neighbour_max_age_s

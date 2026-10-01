@@ -73,6 +73,9 @@ class Track:
     # The station's own capture clock (`ts`), for ordering within a source;
     # None when the message carried none. Never compared across sources.
     source_ts_s: float | None = None
+    # A Remote ID broadcast's transmitter address; None for anything else.
+    # Two tracks with one address are one radio (S-32).
+    transmitter: str | None = None
 
 
 def _radii_m(lat_deg: float) -> tuple[float, float]:
@@ -114,6 +117,7 @@ def advance(track: Track, dt_s: float) -> Track:
         captured_at_s=track.captured_at_s + dt_s,
         source=track.source,
         source_ts_s=track.source_ts_s,
+        transmitter=track.transmitter,
     )
 
 
