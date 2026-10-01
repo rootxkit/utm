@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import signal
 import time
 from collections import Counter
@@ -446,6 +447,9 @@ async def run(settings: NetworkRidSettings) -> None:
 def main() -> None:
     settings = load_settings(NetworkRidSettings)
     configure_logging(service=settings.service_name, level=settings.log_level.value)
+    # httpx logs every request at INFO: a line a second per provider. The
+    # poller logs what matters, failures rate-limited, totals every minute.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run(settings))
 
