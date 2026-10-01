@@ -92,9 +92,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "known_uas_operators_number_unique", table_name="known_uas_operators"
-    )
+    op.drop_index("known_uas_operators_number_unique", table_name="known_uas_operators")
     op.drop_table("known_uas_operators")
     op.drop_column("known_drones", "uas_operator_id")
     op.drop_constraint(
