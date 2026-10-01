@@ -1,0 +1,9 @@
+<!-- A fixture in the form of airspace.gov.ge's page: circles get their radius
+     in the L.circle call, not in points.js. Invented values. -->
+<script>
+  var TSTA_CTR = L.circle(TSTA_CTR_point, {
+    color: 'red',
+    radius: 5556 //3 NM
+  }).bindPopup("TEST CTR");
+  var TSTB_CTR = L.polygon(TSTB_CTR_points,{ZoneName: 'TSTB_CTR'});
+</script>

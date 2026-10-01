@@ -1,0 +1,30 @@
+# Rules for converting the airspace.gov.ge fixture. Invented for tests: the
+# real rules (restriction, limits, times per kind of zone) are the
+# authority's to give, and airspace.gov.ge publishes none of them.
+country = "GEO"
+
+[authority]
+name = "Test authority"
+purpose = "AUTHORIZATION"
+
+[kinds.CTR]
+restriction = "REQ_AUTHORISATION"
+uom = "M"
+lower_reference = "AGL"
+lower_limit = 0
+upper_reference = "AGL"
+upper_limit = 120
+applicability = [{ permanent = "YES" }]
+reason = ["AIR_TRAFFIC"]
+
+[kinds.EPR]
+restriction = "PROHIBITED"
+uom = "FT"
+lower_reference = "AMSL"
+upper_reference = "AMSL"
+upper_limit = 3000
+applicability = [{ permanent = "YES" }]
+message = "Restricted area"
+
+[identifiers]
+UGT01_EPR = "UGT01"
