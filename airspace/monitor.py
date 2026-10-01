@@ -554,6 +554,7 @@ class AirspaceMonitor:
     def _drop_disabled(self, drone_ids: set[UUID]) -> list[Cleared]:
         for drone_id in drone_ids:
             source = self._track_source.pop(drone_id, None)
+            self._labels.pop(drone_id, None)
             self.index.remove(drone_id)
             self._last_seen_s.pop(drone_id, None)
             for by_source in [k for k in self._last_by_source_s if k[0] == drone_id]:

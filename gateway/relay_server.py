@@ -77,6 +77,10 @@ SOURCE_DISABLED_REASON: Final = "source disabled"
 SOURCE_DISABLED_STATUS: Final = 503
 # Seconds, as a hint; the relay's own backoff caps at 10 s (relay-v1 §12).
 SOURCE_DISABLED_RETRY_AFTER_S: Final = 10
+# U-15. How long closing one disabled session may take. The closes run
+# together, so a peer that never answers the close handshake holds up
+# neither the others nor the switch that triggered them.
+CLOSE_DISABLED_TIMEOUT_S: Final = 5.0
 
 # S-11. A data frame at least this large means the relay is draining a
 # queue: relay-v1 §6 flushes a batch at 100 ms or 64 KiB, whichever is first,
@@ -261,8 +265,19 @@ class RelayServer:
             if not self.station_enabled(station_id)
             for session in sessions
         ]
-        for session in closing:
-            await session.close_disabled()
+        results = await asyncio.gather(
+            *(
+                asyncio.wait_for(session.close_disabled(), CLOSE_DISABLED_TIMEOUT_S)
+                for session in closing
+            ),
+            return_exceptions=True,
+        )
+        for session, result in zip(closing, results, strict=True):
+            if isinstance(result, BaseException):
+                session.log.error(
+                    "closing a disabled session did not complete",
+                    extra={"error": repr(result)},
+                )
         return len(closing)
 
     @property
