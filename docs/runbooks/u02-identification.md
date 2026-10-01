@@ -228,4 +228,20 @@ and no network track was published after it; SYSID 2 stayed on the map
 through direct Remote ID. Switched on again, polling and network tracks
 resumed within a second.
 
+### Re-checked after review: a relay drain does not split our aircraft
+
+SYSID 1 registered as a fleet aircraft (serial `U02FLEET01`) and bound on
+station `u02-gs1`, its relay (`agent/`) reading UDP 14560 into the Gateway,
+and the U-16 bridge broadcasting the same serial. With the relay live, the
+broadcasts were withheld. The Gateway was stopped at 06:57:06 and SYSID 1
+flown 440 m east; through the outage the broadcasts were published as our
+aircraft (its id, 10 a 10 s). The Gateway was restarted at 06:59:26; the
+relay resumed from sequence 1953 and drained 583 backlog rows in 3 s, up
+to 438 m from where the aircraft's broadcast placed it at the moment of
+delivery. No broadcast was split off: no `serial_conflict`, no
+identification alert, and the broadcasts went back to withheld once live
+relay rows arrived. The code before the fix took every relay row as live
+and as the current position; that run was not repeated with it, so the
+split it would have caused here is read from the code, not observed.
+
 Evidence (not committed): `local/u02/` in the branch's worktree.
