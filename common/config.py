@@ -187,6 +187,15 @@ class SourceControlSettings(Settings):
     source_control_poll_s: float = Field(
         default=5.0, gt=0, validation_alias="SOURCE_CONTROL_POLL_S"
     )
+    # At start, how many times a failed read of the bucket is tried, the
+    # first wait between tries (doubling), before the service starts with
+    # the switch state unknown and every source enabled.
+    source_control_start_attempts: int = Field(
+        default=3, ge=1, le=20, validation_alias="SOURCE_CONTROL_START_ATTEMPTS"
+    )
+    source_control_start_backoff_s: float = Field(
+        default=0.5, gt=0, le=30, validation_alias="SOURCE_CONTROL_START_BACKOFF_S"
+    )
 
 
 def _describe(error: ValidationError) -> str:

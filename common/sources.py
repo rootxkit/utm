@@ -22,8 +22,15 @@ one transaction. The API then publishes the whole state:
 A follower reads the bucket at start and every `SOURCE_CONTROL_POLL_S`, and
 applies whatever arrives on the subject in between. A message lost on the
 subject, or a broker that restarted, costs at most one poll interval. The
-API republishes from the database periodically, so a write to the bucket
-that failed after the database committed is repaired without anyone acting.
+API writes the bucket inside the transaction that records a switch, so a
+switch the bucket cannot take (JetStream off or full) is refused and not
+recorded; it also republishes from the database periodically, which
+repairs a bucket that was lost.
+
+When the bucket cannot be read, a follower keeps what it holds, or, with
+nothing ever read, keeps every source enabled: it never fails closed. It
+logs the failure at error level and its owner's status line says so
+(`source_control_read_ok`, `source_control_state_unknown`).
 
 Why not the telemetry database as the read path: the API would have to
 write a second database on every switch, and the Gateway would have to poll
@@ -49,10 +56,12 @@ import asyncio
 import contextlib
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from common.config import SourceControlSettings
 from common.logging import get_logger
 
 _log = get_logger(__name__)
@@ -78,6 +87,8 @@ DEFAULT_BUCKET = "source_control"
 DEFAULT_SUBJECT = "control.sources"
 STATE_KEY = "state"
 DEFAULT_POLL_S = 5.0
+DEFAULT_START_ATTEMPTS = 3
+DEFAULT_START_BACKOFF_S = 0.5
 
 # Why a source is disabled, as `SourceControlState.why_disabled` says it.
 BY_TYPE = "type"
@@ -241,21 +252,42 @@ class SourceControlFollower:
     """Keeps the published state current in one process.
 
     `read` returns the bucket's value, or None when nothing has been
-    published yet; it may raise, and a failed read keeps the state held.
-    `on_change(before, after)` runs on every applied change, after `state`
-    already says the new thing, so whatever it calls sees the new state.
+    published yet; it may raise (JetStream off or full, broker away), and a
+    failed read keeps the state held. A follower never fails closed: with
+    nothing ever read, every source stays enabled, and the status line says
+    the switch state is unknown (`state_unknown`) until a read succeeds.
+    `on_change(before, after)` runs on every applied change of what is
+    switched, after `state` already says the new thing.
+
+    Only a version strictly above the one held is applied. Versions come
+    from a database sequence (`api/sources.py`), so they never repeat or go
+    back, whatever the clocks do.
     """
 
     read: StateReader
     on_change: OnChange | None = None
     poll_s: float = DEFAULT_POLL_S
+    # The first read is tried this many times, `start_backoff_s` apart
+    # (doubling), before the owner starts serving without a known state.
+    start_attempts: int = DEFAULT_START_ATTEMPTS
+    start_backoff_s: float = DEFAULT_START_BACKOFF_S
+    # A run of failed reads is logged at its start and then at most once
+    # per this interval, with the count.
+    failure_log_every_s: float = 60.0
+    clock_s: Callable[[], float] = time.monotonic
     state: SourceControlState = field(default_factory=SourceControlState)
+    # True until a read succeeds: nothing is known about the switches, and
+    # every source is enabled because of that, not because it was decided.
+    state_unknown: bool = field(default=True, init=False)
     # Totals for the owner's status line.
     reads: int = field(default=0, init=False)
     read_failures: int = field(default=0, init=False)
     changes: int = field(default=0, init=False)
     ignored_older: int = field(default=0, init=False)
     ignored_malformed: int = field(default=0, init=False)
+    _failing_since_s: float | None = field(default=None, init=False)
+    _failure_logged_s: float | None = field(default=None, init=False)
+    _failures_unlogged: int = field(default=0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _poller: asyncio.Task[None] | None = field(default=None, init=False)
 
@@ -265,30 +297,63 @@ class SourceControlFollower:
     def why_disabled(self, source_type: str, instance_id: str | None) -> str | None:
         return self.state.why_disabled(source_type, instance_id)
 
+    @property
+    def read_ok(self) -> bool:
+        return self._failing_since_s is None and not self.state_unknown
+
     async def refresh(self) -> bool:
         """Read the bucket and apply what it holds. False when the read
         failed; the state held is kept, and the failure is logged."""
         try:
             payload = await self.read()
         except Exception as error:
-            self.read_failures += 1
-            _log.error(
-                "could not read the source control state; keeping what is held",
+            self._note_failure(error)
+            return False
+        if self._failing_since_s is not None:
+            _log.info(
+                "source control state readable again",
                 extra={
-                    "error": repr(error),
-                    "version": self.state.version,
+                    "failed_for_s": round(self.clock_s() - self._failing_since_s, 1),
                     "read_failures": self.read_failures,
                 },
             )
-            return False
+        self._failing_since_s = None
+        self._failure_logged_s = None
+        self._failures_unlogged = 0
         self.reads += 1
+        self.state_unknown = False
         if payload is not None:
             await self.offer(payload, origin="read")
         return True
 
+    def _note_failure(self, error: Exception) -> None:
+        self.read_failures += 1
+        now_s = self.clock_s()
+        if self._failing_since_s is None:
+            self._failing_since_s = now_s
+        if (
+            self._failure_logged_s is not None
+            and now_s - self._failure_logged_s < self.failure_log_every_s
+        ):
+            self._failures_unlogged += 1
+            return
+        self._failure_logged_s = now_s
+        _log.error(
+            "could not read the source control state; keeping what is held",
+            extra={
+                "error": repr(error),
+                "version": self.state.version,
+                "state_unknown": self.state_unknown,
+                "failing_for_s": round(now_s - self._failing_since_s, 1),
+                "suppressed": self._failures_unlogged,
+                "read_failures": self.read_failures,
+            },
+        )
+        self._failures_unlogged = 0
+
     async def offer(self, payload: bytes, *, origin: str) -> bool:
-        """Apply a published state, unless it is older than the one held or
-        not a state at all. True when it changed something."""
+        """Apply a published state, unless it is not newer than the one held
+        or not a state at all. True when it changed something."""
         try:
             state = SourceControlState.from_json(payload)
         except ValueError as error:
@@ -303,12 +368,17 @@ class SourceControlFollower:
     async def apply(self, state: SourceControlState, *, origin: str) -> bool:
         async with self._lock:
             before = self.state
-            if state.version < before.version:
-                self.ignored_older += 1
-                return False
-            if state == before:
+            if state.version <= before.version:
+                if state.version < before.version:
+                    self.ignored_older += 1
                 return False
             self.state = state
+            if (state.default_deny, set(state.controls)) == (
+                before.default_deny,
+                set(before.controls),
+            ):
+                # A newer number for the same switches: nothing to do.
+                return False
             self.changes += 1
             _log.info(
                 "source control state applied",
@@ -333,8 +403,25 @@ class SourceControlFollower:
             return True
 
     async def start(self) -> None:
-        """Read once, then poll every `poll_s` until `stop`."""
-        await self.refresh()
+        """Read, retrying a failed read up to `start_attempts` times with a
+        doubling backoff, then poll every `poll_s` until `stop`. If no read
+        succeeds the owner starts anyway, with every source enabled, and
+        that is logged as a warning: refusing to start would take every
+        source away because the switch state could not be read."""
+        attempts = max(1, self.start_attempts)
+        delay_s = self.start_backoff_s
+        for attempt in range(1, attempts + 1):
+            if await self.refresh():
+                break
+            if attempt < attempts:
+                await asyncio.sleep(delay_s)
+                delay_s *= 2
+        else:
+            _log.warning(
+                "source control state unknown at start; every source is "
+                "enabled until it can be read",
+                extra={"attempts": attempts, "read_failures": self.read_failures},
+            )
         self._poller = asyncio.create_task(self._poll(), name="source-control-poll")
 
     async def stop(self) -> None:
@@ -352,9 +439,24 @@ class SourceControlFollower:
     def status(self) -> dict[str, int]:
         return {
             "source_control_version": self.state.version,
+            "source_control_state_unknown": int(self.state_unknown),
+            "source_control_read_ok": int(self.read_ok),
             "source_control_read_failures": self.read_failures,
             "source_control_changes": self.changes,
         }
+
+
+def follower_from_settings(
+    client: Any, settings: SourceControlSettings, on_change: OnChange | None = None
+) -> SourceControlFollower:
+    """A follower of the bucket named in `settings`, on `client`."""
+    return SourceControlFollower(
+        read=bucket_reader(client, settings.source_control_bucket),
+        on_change=on_change,
+        poll_s=settings.source_control_poll_s,
+        start_attempts=settings.source_control_start_attempts,
+        start_backoff_s=settings.source_control_start_backoff_s,
+    )
 
 
 def bucket_reader(

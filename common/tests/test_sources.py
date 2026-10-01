@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -236,3 +237,106 @@ async def test_the_poller_reads_again_until_stopped() -> None:
 
     assert not follower.enabled(RELAY, "station-1")
     assert follower.reads >= 2
+
+
+async def test_an_equal_version_is_never_applied_even_if_it_differs() -> None:
+    """Versions are a sequence: equal means the same publication. A second
+    state under the same number is a fault, and is not taken."""
+    follower = SourceControlFollower(read=Bucket().read)
+    assert await follower.apply(
+        state(control(RELAY, "s1", enabled=False), version=5), origin="push"
+    )
+    assert not await follower.apply(
+        state(control(RELAY, "s1", enabled=True), version=5), origin="read"
+    )
+    assert not follower.enabled(RELAY, "s1")
+
+
+async def test_a_newer_number_for_the_same_switches_reacts_to_nothing() -> None:
+    calls: list[int] = []
+
+    async def on_change(_: SourceControlState, after: SourceControlState) -> None:
+        calls.append(after.version)
+
+    follower = SourceControlFollower(read=Bucket().read, on_change=on_change)
+    await follower.apply(
+        state(control(RELAY, "s1", enabled=False), version=1), origin="push"
+    )
+    assert not await follower.apply(
+        state(control(RELAY, "s1", enabled=False), version=2), origin="read"
+    )
+    assert calls == [1]
+    assert follower.state.version == 2
+
+
+class FlakyBucket(Bucket):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.failures = failures
+
+    async def read(self) -> bytes | None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise ConnectionError("JetStream not ready")
+        return self.value
+
+
+async def test_start_retries_a_failed_first_read() -> None:
+    bucket = FlakyBucket(failures=2)
+    bucket.value = state(control(RELAY, "s1", enabled=False)).to_json()
+    follower = SourceControlFollower(
+        read=bucket.read, poll_s=3600, start_attempts=3, start_backoff_s=0.001
+    )
+    await follower.start()
+    try:
+        assert not follower.enabled(RELAY, "s1")
+        assert not follower.state_unknown
+        assert follower.status()["source_control_read_ok"] == 1
+    finally:
+        await follower.stop()
+
+
+async def test_start_without_a_readable_state_serves_with_everything_enabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    follower = SourceControlFollower(
+        read=FlakyBucket(failures=10).read,
+        poll_s=3600,
+        start_attempts=2,
+        start_backoff_s=0.001,
+    )
+    with caplog.at_level(logging.WARNING, logger="common.sources"):
+        await follower.start()
+    try:
+        assert follower.enabled(RELAY, "s1")
+        assert follower.status()["source_control_state_unknown"] == 1
+        assert follower.read_failures == 2
+        assert any(
+            r.levelno == logging.WARNING and "state unknown at start" in r.getMessage()
+            for r in caplog.records
+        )
+    finally:
+        await follower.stop()
+
+
+async def test_a_run_of_failed_reads_is_logged_once_per_interval(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = [0.0]
+    bucket = FlakyBucket(failures=5)
+    follower = SourceControlFollower(
+        read=bucket.read, failure_log_every_s=60.0, clock_s=lambda: clock[0]
+    )
+    with caplog.at_level(logging.INFO, logger="common.sources"):
+        for _ in range(4):
+            await follower.refresh()
+        clock[0] = 61.0
+        await follower.refresh()
+        await follower.refresh()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [getattr(r, "suppressed", None) for r in errors] == [0, 3]
+    assert any(
+        r.getMessage() == "source control state readable again" for r in caplog.records
+    )
+    assert follower.status()["source_control_read_ok"] == 1
