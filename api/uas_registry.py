@@ -55,7 +55,7 @@ from typing import Any, Protocol
 from uuid import UUID
 
 import sqlalchemy as sa
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from api.actors import SYSTEM, Actor
@@ -66,6 +66,7 @@ from api.registry import (
     NotFoundError,
     TelemetryProjection,
     audit,
+    lock_projection,
     refused,
 )
 from common import get_logger
@@ -281,7 +282,10 @@ class UasRegistry:
         (operators written, aircraft rows changed); (0, 0) without `identity`."""
         if self.identity is None:
             return 0, 0
-        async with self.engine.connect() as connection:
+        async with self.engine.begin() as connection:
+            # Held until this transaction ends, after the write below: no
+            # registry change can commit between this read and that write.
+            await lock_projection(connection)
             operators = [
                 _projected_operator(_row(row))
                 for row in await connection.execute(
@@ -296,7 +300,7 @@ class UasRegistry:
                     )
                 )
             ]
-        written, changed = await self.identity.replace_all(operators, uas)
+            written, changed = await self.identity.replace_all(operators, uas)
         _log.info(
             "registry projection synchronised",
             extra={"operators": written, "uas_changed": changed, "uas": len(uas)},
@@ -312,10 +316,12 @@ class UasRegistry:
         while not stop.is_set():
             try:
                 await self.sync_projection()
-            except (SQLAlchemyError, OSError) as error:
-                _log.error(
+            except Exception:
+                # Whatever failed, the next pass tries again: a dead loop
+                # would leave every lost projection write unrepaired.
+                _log.exception(
                     "could not synchronise the registry projection",
-                    extra={"error": repr(error), "retry_in_s": every_s},
+                    extra={"retry_in_s": every_s},
                 )
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), every_s)
@@ -369,6 +375,7 @@ class UasRegistry:
             raise InvalidError("a legal name is required", code="invalid_value")
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 created = (
                     await connection.execute(
                         sa.text(
@@ -559,6 +566,7 @@ class UasRegistry:
         actor: Actor = SYSTEM,
     ) -> dict[str, Any]:
         async with self.engine.begin() as connection:
+            await lock_projection(connection)
             current = await self._lock_operator(connection, operator_id)
             check_transition(
                 "UAS operator",
@@ -871,6 +879,7 @@ class UasRegistry:
             raise InvalidError("MTOM must be positive", code="invalid_value")
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 await self._refuse_revoked_operator(connection, uas_operator_id)
                 holder = (
                     await connection.execute(
@@ -1025,6 +1034,7 @@ class UasRegistry:
             wanted["class_label"] = ClassLabel(wanted["class_label"]).value
         try:
             async with self.engine.begin() as connection:
+                await lock_projection(connection)
                 current = await self._lock_uas(connection, drone_id)
                 _refuse_revoked(
                     "UAS", current["serial"], current["registration_status"]
@@ -1080,6 +1090,7 @@ class UasRegistry:
         (migration 0005_uas_registry), and its new status is projected there
         for U-02, which shows it as suspended."""
         async with self.engine.begin() as connection:
+            await lock_projection(connection)
             current = await self._lock_uas(connection, drone_id)
             check_transition(
                 "UAS", current["serial"], current["registration_status"], status

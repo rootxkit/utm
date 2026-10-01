@@ -273,3 +273,123 @@ async def test_a_revoked_operator_cannot_be_reactivated_and_stays_projected(
         await registry.set_operator_status(owner["id"], RegistrationStatus.ACTIVE)
     snapshot = await load_snapshot(engine)
     assert snapshot.operators_by_id[owner["id"]].status == RegistrationStatus.REVOKED
+
+
+# --- review: the re-projection race, orphans, the loop's survival ------------------
+
+
+class PausedIdentity:
+    """The real projection, but `replace_all` waits to be released: the
+    window between the re-projection's read and its write, held open."""
+
+    def __init__(self, real: IdentityProjection) -> None:
+        self.real = real
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def project_operator(self, operator: ProjectedOperator) -> None:
+        await self.real.project_operator(operator)
+
+    async def project_uas(self, uas: ProjectedUas) -> None:
+        await self.real.project_uas(uas)
+
+    async def replace_all(
+        self, operators: Iterable[ProjectedOperator], uas: Iterable[ProjectedUas]
+    ) -> tuple[int, int]:
+        operators, uas = list(operators), list(uas)
+        self.entered.set()
+        await self.release.wait()
+        return await self.real.replace_all(operators, uas)
+
+
+async def test_a_suspension_during_a_resync_is_not_reverted(
+    registry: UasRegistry, engine: AsyncEngine
+) -> None:
+    """The re-projection read the registry (UAS active) and is about to
+    write. A suspension arriving now waits for it, then lands: the
+    projection ends suspended. Without the lock the suspension committed in
+    the window and the stale write reverted it to registered."""
+    owner = await operator(registry)
+    sn = serial()
+    drone_id = await uas(registry, owner["id"], sn)
+    assert isinstance(registry.identity, IdentityProjection)
+    paused = PausedIdentity(registry.identity)
+    registry.identity = paused
+
+    syncing = asyncio.create_task(registry.sync_projection())
+    await asyncio.wait_for(paused.entered.wait(), 5)
+    suspending = asyncio.create_task(
+        registry.set_uas_status(drone_id, RegistrationStatus.SUSPENDED)
+    )
+    await asyncio.sleep(0.3)
+    assert not suspending.done(), "the suspension did not wait for the resync"
+
+    paused.release.set()
+    await asyncio.wait_for(asyncio.gather(syncing, suspending), 10)
+
+    snapshot = await load_snapshot(engine)
+    found = resolve(snapshot, serial=sn, operator_reg=owner["registration_number"])
+    assert found.status is IdentificationStatus.SUSPENDED
+
+
+async def test_an_aircraft_only_the_projection_knows_is_not_registered(
+    registry: UasRegistry, engine: AsyncEngine
+) -> None:
+    """A `known_drones` row with no relational aircraft (an old placeholder):
+    the re-projection marks it, and it resolves as unknown, never as ours."""
+    orphan = uuid4()
+    sn = serial()
+    await BindingResolver(engine=engine).register_drone(
+        orphan, f"orphan-{sn}", serial=sn
+    )
+    before = resolve(await load_snapshot(engine), serial=sn, operator_reg=None)
+    assert before.status is IdentificationStatus.REGISTERED  # NULL read as active
+
+    await registry.sync_projection()
+
+    snapshot = await load_snapshot(engine)
+    assert snapshot.by_drone_id[orphan].in_registry is False
+    after = resolve(snapshot, serial=sn, operator_reg=None)
+    assert (after.status, after.reason.value) == (
+        IdentificationStatus.UNKNOWN_OPERATOR,
+        "not_in_registry",
+    )
+
+
+async def test_the_sync_loop_survives_any_error(
+    registry: UasRegistry, caplog: pytest.LogCaptureFixture
+) -> None:
+    passes = [0]
+
+    class Broken(FailingIdentity):
+        async def replace_all(
+            self, operators: Iterable[ProjectedOperator], uas: Iterable[ProjectedUas]
+        ) -> tuple[int, int]:
+            passes[0] += 1
+            raise RuntimeError("not a database error")
+
+    registry.identity = Broken()
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        registry.sync_projection_periodically(stop, every_s=0.01)
+    )
+    while passes[0] < 3:
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+    assert passes[0] >= 3
+    assert "could not synchronise the registry projection" in caplog.text
+
+
+async def test_an_eu_number_with_its_secret_suffix_matches_its_owner(
+    registry: UasRegistry, engine: AsyncEngine
+) -> None:
+    owner = await operator(registry)
+    sn = serial()
+    await uas(registry, owner["id"], sn)
+    found = resolve(
+        await load_snapshot(engine),
+        serial=sn,
+        operator_reg=owner["registration_number"].lower() + "-xyz",
+    )
+    assert (found.status, found.mismatch) == (IdentificationStatus.REGISTERED, False)
