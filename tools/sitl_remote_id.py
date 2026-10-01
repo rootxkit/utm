@@ -491,10 +491,12 @@ class FaultyLink:
 def transmitter_for(sysid: int, *, spoofing: bool = False) -> str:
     """A locally administered address per SYSID, stable across runs.
 
-    A spoofer is another radio, so it has another address. It also keeps the
-    ingest, which joins messages by address and remembers an identity for a
-    minute, from attaching the spoofed positions to the honest broadcast of
-    a run just before.
+    A spoofer is another radio, so it has another address. The ingest joins
+    messages by address, and keeps an identity only while it is fresh: 15 s
+    since its Basic ID, unchanged, and no silence over 3 s (S-32). A second
+    run on the same address restarted within 3 s, whose first Basic ID is
+    lost, would still be joined to the first run's serial; another address
+    rules that out for spoofing runs.
     """
     third = 0x17 if spoofing else 0x16
     return f"02:55:{third:02x}:00:{(sysid >> 8) & 0xFF:02x}:{sysid & 0xFF:02x}"

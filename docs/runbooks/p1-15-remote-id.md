@@ -50,6 +50,11 @@ and is overtaken by the next one is not kept.
 The tracker counts `identity_changes`, `silences` and `unidentified`, and
 logs each identity change.
 
+**Our own aircraft.** If one of ours broadcasts without a fresh identity,
+its unidentified track is not matched to our fleet (only a serial is), so
+while its MAVLink telemetry is live the monitor can raise a conflict between
+the two. This is accepted for now: the MAVLink path is leaving utm.
+
 **Limit.** A different aircraft that takes over an address within
 `REMOTE_ID_MAX_GAP_S`, while the old Basic ID is still fresh, and whose own
 Basic ID is lost, is indistinguishable from the old aircraft losing a Basic
@@ -145,9 +150,16 @@ as poor, the pressure altitude is used instead (S-33).
 - **Marked:** every observation carries `alt_source` (`geodetic`,
   `pressure`, or null with no AMSL altitude) and the raw `alt_pressure_m`.
 - **Pressure altitude is not AMSL.** It is referenced to 1013.25 hPa, not
-  to the local QNH, and is off by about 8 m per hPa of difference. Two
-  aircraft both on pressure altitude compare well; one on pressure and one
-  geodetic do not.
+  to the local QNH, and is off by about 8 m per hPa of difference: some
+  160 m on a 20 hPa day, against a 20 m vertical minimum. The airspace
+  monitor therefore treats such an aircraft's vertical position as
+  unknown. A conflict with it is judged on the horizontal criteria alone,
+  and its alert says `vertical_separation_known: false`, with no vertical
+  distance. The height limit and zones with altitude limits are not
+  evaluated for it; zones without limits are. The monitor counts these
+  messages as `vertical_unknown` in its status line.
+- **Stored:** the row's `geoid_model` says `pressure altitude, ISA
+  1013.25 hPa`. That is not a geoid: read it as "no geodetic height".
 - **Without a geoid**, there is still no AMSL altitude: pressure replaces a
   poor geodetic altitude, not a missing geoid.
 

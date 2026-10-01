@@ -17,15 +17,23 @@ export interface Firmware {
 // P1-15. What a Remote ID broadcast adds. A broadcast is not authenticated:
 // anyone can transmit one, so it is a claim, never a verified position.
 export interface RemoteIdInfo {
+  // S-32: false for a transmitter heard without a fresh identity. Its
+  // ua_id is then "", id_type 0 and ua_type null, and the track's label is
+  // the transmitter address.
+  identified?: boolean;
   ua_id: string;
   id_type: number;
-  ua_type: number;
+  ua_type: number | null;
   status: number;
   operator_id: string | null;
   operator_lat_deg: number | null;
   operator_lon_deg: number | null;
   transmitter: string;
   rssi_dbm: number | null;
+  // S-27: what the track's captured_at is, the broadcast's own time or
+  // the Gateway's receive time; and the broadcast's timestamp accuracy.
+  time_source?: "broadcast" | "receiver";
+  ts_accuracy_s?: number | null;
 }
 
 export interface Telemetry {
@@ -37,6 +45,11 @@ export interface Telemetry {
   track_deg?: number | null;
   // Height above the WGS-84 ellipsoid, as broadcast. Not AMSL.
   alt_hae_m?: number | null;
+  // S-33: which broadcast altitude alt_amsl_m came from. "pressure" is
+  // referenced to 1013.25 hPa, not AMSL: vertical position unknown.
+  alt_source?: "geodetic" | "pressure" | null;
+  // Pressure altitude as broadcast. Not AMSL.
+  alt_pressure_m?: number | null;
   airborne?: boolean;
   remote_id?: RemoteIdInfo;
   label: string | null;
@@ -88,7 +101,9 @@ export interface Alert {
   detail: {
     t_cpa_s?: number;
     d_cpa_horizontal_m?: number;
-    d_alt_at_cpa_m?: number;
+    // Null when either aircraft's vertical position is unknown (S-33).
+    d_alt_at_cpa_m?: number | null;
+    vertical_separation_known?: boolean;
     d_horizontal_now_m?: number;
     zone_name?: string;
     zone_type?: string;

@@ -20,8 +20,12 @@ query rather than in a flag somebody forgets to filter on.
 
 One observation the ingest completed: the aircraft's broadcast identity, the
 position and height it claimed, and which receiver heard which transmitter.
-`ts` is the ingest's clock when the frame arrived, the same time the
-observation was published with; receivers are not trusted to keep time.
+`ts` is where the observation was placed in time, the `captured_at` it was
+published with: the broadcast's own capture time when that is plausible, or
+the ingest's clock when the frame arrived (S-27, gateway/remote_id.py).
+Receivers are not trusted to keep time; the module's GPS clock is, within
+limits. (This paragraph was revised after the migration ran; it describes,
+it does not change, the schema.)
 
 Heights are kept as broadcast and as converted, never merged:
 
