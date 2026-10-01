@@ -340,3 +340,61 @@ async def test_a_run_of_failed_reads_is_logged_once_per_interval(
         r.getMessage() == "source control state readable again" for r in caplog.records
     )
     assert follower.status()["source_control_read_ok"] == 1
+
+
+def epoch_state(version: int, epoch: str, *, enabled: bool) -> SourceControlState:
+    return SourceControlState(
+        version=version, epoch=epoch, controls=(control(RELAY, "s1", enabled=enabled),)
+    )
+
+
+async def test_a_new_epoch_is_taken_whatever_its_version() -> None:
+    """The API's database was restored: its sequence starts again below
+    what the follower holds, under a new epoch."""
+    follower = SourceControlFollower(read=Bucket().read)
+    assert await follower.apply(
+        epoch_state(500, "epoch-a", enabled=False), origin="read"
+    )
+
+    assert await follower.apply(epoch_state(3, "epoch-b", enabled=True), origin="read")
+
+    assert follower.enabled(RELAY, "s1")
+    assert follower.state.epoch == "epoch-b"
+
+
+async def test_a_lower_version_in_the_same_epoch_is_still_refused() -> None:
+    follower = SourceControlFollower(read=Bucket().read)
+    await follower.apply(epoch_state(500, "epoch-a", enabled=False), origin="read")
+
+    assert not await follower.apply(
+        epoch_state(3, "epoch-a", enabled=True), origin="read"
+    )
+
+    assert not follower.enabled(RELAY, "s1")
+    assert follower.ignored_older == 1
+
+
+def test_the_epoch_survives_the_wire() -> None:
+    held = epoch_state(7, "epoch-x", enabled=False)
+    assert SourceControlState.from_json(held.to_json()).epoch == "epoch-x"
+    with pytest.raises(ValueError):
+        SourceControlState.from_json(b'{"version": 1, "epoch": 5}')
+
+
+async def test_a_corrupt_bucket_keeps_the_state_held_and_is_counted() -> None:
+    bucket = Bucket()
+    bucket.value = state(control(RELAY, "s1", enabled=False), version=4).to_json()
+    follower = SourceControlFollower(read=bucket.read)
+    assert await follower.refresh()
+
+    bucket.value = b"\x00 not a state"
+    assert not await follower.refresh()
+
+    assert not follower.enabled(RELAY, "s1")
+    assert follower.ignored_malformed == 1
+    assert follower.status()["source_control_read_ok"] == 0
+
+    bucket.value = state(control(RELAY, "s1", enabled=True), version=5).to_json()
+    assert await follower.refresh()
+    assert follower.enabled(RELAY, "s1")
+    assert follower.status()["source_control_read_ok"] == 1

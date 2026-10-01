@@ -147,12 +147,16 @@ class Control:
 class SourceControlState:
     """Every switch, as the API last published it.
 
-    `version` orders publications: a follower never replaces a state with
-    an older one, which a slow poll racing a fresh push could otherwise do.
+    `version` orders publications within one `epoch`: a follower never
+    replaces a state with one numbered no higher, which a slow poll racing a
+    fresh push could otherwise do. `epoch` names the database's run of
+    versions; a restored or re-created database starts a new one, and a
+    state under a different epoch is taken whatever its number.
     """
 
     version: int = 0
     default_deny: bool = False
+    epoch: str = ""
     controls: tuple[Control, ...] = ()
     _by_key: dict[tuple[str, str | None], Control] = field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -184,6 +188,7 @@ class SourceControlState:
         return json.dumps(
             {
                 "version": self.version,
+                "epoch": self.epoch,
                 "default_deny": self.default_deny,
                 "controls": [control.as_dict() for control in self.controls],
             },
@@ -200,10 +205,13 @@ class SourceControlState:
         if not isinstance(raw, dict):
             raise ValueError("not a JSON object")
         version = raw.get("version")
+        epoch = raw.get("epoch", "")
         default_deny = raw.get("default_deny", False)
         controls = raw.get("controls", [])
         if isinstance(version, bool) or not isinstance(version, int):
             raise ValueError(f"version is not an integer: {version!r}")
+        if not isinstance(epoch, str):
+            raise ValueError(f"epoch is not a string: {epoch!r}")
         if not isinstance(default_deny, bool):
             raise ValueError("default_deny is not a boolean")
         if not isinstance(controls, list):
@@ -212,7 +220,9 @@ class SourceControlState:
             parsed = tuple(Control.from_dict(item) for item in controls)
         except (KeyError, TypeError, AttributeError) as error:
             raise ValueError(f"a control is malformed: {error!r}") from error
-        return cls(version=version, default_deny=default_deny, controls=parsed)
+        return cls(
+            version=version, default_deny=default_deny, controls=parsed, epoch=epoch
+        )
 
     def disabled(self) -> list[tuple[str, str | None]]:
         """Every switch that is off, for a log line."""
@@ -259,9 +269,12 @@ class SourceControlFollower:
     `on_change(before, after)` runs on every applied change of what is
     switched, after `state` already says the new thing.
 
-    Only a version strictly above the one held is applied. Versions come
-    from a database sequence (`api/sources.py`), so they never repeat or go
-    back, whatever the clocks do.
+    Within one epoch, only a version strictly above the one held is
+    applied. Versions come from a database sequence (`api/sources.py`), so
+    they never repeat or go back whatever the clocks do. A state under a
+    different epoch - the database was restored or re-created, and its
+    sequence started again - is taken whatever its version. A bucket value
+    that does not parse is counted, logged, and treated as a failed read.
     """
 
     read: StateReader
@@ -320,10 +333,21 @@ class SourceControlFollower:
         self._failing_since_s = None
         self._failure_logged_s = None
         self._failures_unlogged = 0
+        state: SourceControlState | None = None
+        if payload is not None:
+            try:
+                state = SourceControlState.from_json(payload)
+            except ValueError as error:
+                # A corrupt bucket is no state at all: keep what is held,
+                # count it, and treat the read as failed until the API
+                # overwrites it.
+                self.ignored_malformed += 1
+                self._note_failure(error)
+                return False
         self.reads += 1
         self.state_unknown = False
-        if payload is not None:
-            await self.offer(payload, origin="read")
+        if state is not None:
+            await self.apply(state, origin="read")
         return True
 
     def _note_failure(self, error: Exception) -> None:
@@ -368,10 +392,21 @@ class SourceControlFollower:
     async def apply(self, state: SourceControlState, *, origin: str) -> bool:
         async with self._lock:
             before = self.state
-            if state.version <= before.version:
+            if state.epoch == before.epoch and state.version <= before.version:
                 if state.version < before.version:
                     self.ignored_older += 1
                 return False
+            if state.epoch != before.epoch and before.epoch:
+                _log.warning(
+                    "source control epoch changed; taking its state whatever "
+                    "its version (the API's database was restored or re-created)",
+                    extra={
+                        "before_epoch": before.epoch,
+                        "before_version": before.version,
+                        "epoch": state.epoch,
+                        "version": state.version,
+                    },
+                )
             self.state = state
             if (state.default_deny, set(state.controls)) == (
                 before.default_deny,
