@@ -173,8 +173,10 @@ Every track carries the registry's verdict on who it is
   (`airspace/service.py`), which until U-12 counts and logs them.
 
 Every zone alert also carries the aircraft's `identification` in its
-detail. Like every other check, these judge only flying aircraft with a
-position the monitor can place.
+detail. The identification alert, like the zone's, needs a flying aircraft
+the monitor can place; the mismatch does not: it is judged on every live
+message, on the ground or without an AMSL altitude, and goes stale with
+the aircraft's messages (not with its track).
 
 ## Stage 0: an alert, not a resolution
 
@@ -583,10 +585,12 @@ class AirspaceMonitor:
     # The source each tracked aircraft's track came from.
     _track_source: dict[UUID, tuple[str, str]] = field(default_factory=dict, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
-    # U-02: each aircraft's latest `identification`.
+    # U-02: each aircraft's latest `identification`, and when a message
+    # last said it (a mismatch goes stale with these, not with the track).
     _identification: dict[UUID, dict[str, Any] | None] = field(
         default_factory=dict, init=False
     )
+    _identity_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     # The latest (`ts`, `rx_ts`) each source gave for each aircraft, so a
     # sample is judged out of order only against its own source's. Bounded
@@ -663,16 +667,22 @@ class AirspaceMonitor:
         )
 
         raised: list[Alert] = []
+        rejected = track is not None and self._rejects(track, message, now_s=now_s)
         if track is None:
             self.index.remove(drone_id)
             self._last_seen_s.pop(drone_id, None)
             for key in [k for k in self._last_by_source_s if k[0] == drone_id]:
                 del self._last_by_source_s[key]
             self._track_source.pop(drone_id, None)
-        elif not self._rejects(track, message, now_s=now_s):
+        elif not rejected:
             self._note_missing_times(track, message)
             self._track_source[drone_id] = source
             raised = self._evaluate(track, height_available=height_available)
+        if not rejected and not is_backlog(message):
+            # U-02: who the aircraft is does not depend on where it is, so
+            # a mismatch is judged for every live message, on the ground
+            # and without an AMSL altitude too.
+            raised.extend(self._judge_mismatch(drone_id, message, now_s=now_s))
 
         cleared = self._expire(now_s)
         return Change(raised=raised, cleared=cleared)
@@ -719,6 +729,7 @@ class AirspaceMonitor:
             source = self._track_source.pop(drone_id, None)
             self._labels.pop(drone_id, None)
             self._identification.pop(drone_id, None)
+            self._identity_seen_s.pop(drone_id, None)
             self.index.remove(drone_id)
             self._last_seen_s.pop(drone_id, None)
             for by_source in [k for k in self._last_by_source_s if k[0] == drone_id]:
@@ -763,7 +774,6 @@ class AirspaceMonitor:
             (AlertKind.CONFLICT, self._check_conflicts),
             (AlertKind.ZONE, self._check_zones),
             (AlertKind.HEIGHT, self._check_height),
-            (AlertKind.IDENTIFICATION_MISMATCH, self._check_mismatch),
         ):
             if kind is AlertKind.HEIGHT and not height_available:
                 not_evaluated.add(kind)
@@ -784,6 +794,8 @@ class AirspaceMonitor:
         for key, alert in self._active.items():
             if (
                 drone_id in alert.drone_ids
+                # Judged on every message, flying or not (`_judge_mismatch`).
+                and alert.kind is not AlertKind.IDENTIFICATION_MISMATCH
                 and alert.kind not in not_evaluated
                 and key not in self._unevaluated_keys
                 and self._last_true_s[key] != at_s
@@ -1117,17 +1129,27 @@ class AirspaceMonitor:
             },
         )
 
-    def _check_mismatch(self, track: Track, now_s: float) -> list[Alert]:
-        """U-02: a registered serial with another operator's number."""
-        identification = self._identification.get(track.drone_id)
+    def _judge_mismatch(
+        self, drone_id: UUID, message: dict[str, Any], *, now_s: float
+    ) -> list[Alert]:
+        """U-02: a registered serial with another operator's number. Raised
+        while messages say so, shown false by one that does not, and gone
+        stale with the aircraft's messages, not with its track."""
+        placed = placed_at_s(message)
+        at_s = now_s if placed is None else placed
+        self._identity_seen_s[drone_id] = at_s
+        key = mismatch_key(drone_id)
+        identification = self._identification.get(drone_id)
         if identification is None or identification.get("mismatch") is not True:
+            if key in self._active and self._last_true_s[key] != at_s:
+                self._last_false_s[key] = at_s
             return []
         alert = Alert(
-            key=mismatch_key(track.drone_id),
+            key=key,
             kind=AlertKind.IDENTIFICATION_MISMATCH,
             severity=self.mismatch_severity,
-            drone_ids=(track.drone_id,),
-            labels=(self._labels.get(track.drone_id),),
+            drone_ids=(drone_id,),
+            labels=(self._labels.get(drone_id),),
             detail={
                 "status": identification.get("status"),
                 "identification_reason": identification.get("reason"),
@@ -1138,7 +1160,7 @@ class AirspaceMonitor:
                 ),
             },
         )
-        return self._refresh(alert, now_s)
+        return self._refresh(alert, at_s)
 
     def _judge_vertical(self, zone: Zone, track: Track) -> VerticalVerdict:
         """The zone's limits against the aircraft, each in its own reference.
@@ -1308,10 +1330,19 @@ class AirspaceMonitor:
                 del self._last_seen_s[drone_id]
                 self._track_source.pop(drone_id, None)
 
+        for drone_id, seen_s in list(self._identity_seen_s.items()):
+            if now_s - seen_s > self.stale_after_s:
+                del self._identity_seen_s[drone_id]
+
         tracked = set(self._last_seen_s)
         cleared: list[Cleared] = []
         for key, alert in list(self._active.items()):
-            gone = not all(drone_id in tracked for drone_id in alert.drone_ids)
+            heard = (
+                set(self._identity_seen_s)
+                if alert.kind is AlertKind.IDENTIFICATION_MISMATCH
+                else tracked
+            )
+            gone = not all(drone_id in heard for drone_id in alert.drone_ids)
             shown_false_for_s = (
                 self._last_false_s.get(key, 0.0) - self._last_true_s[key]
             )

@@ -195,6 +195,59 @@ def test_the_mismatch_severity_is_configuration() -> None:
     assert alert.severity is Severity.CRITICAL
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        # On the ground: not flying, so no track.
+        {"armed": False},
+        # No geoid: no AMSL altitude, so no track.
+        {"alt_amsl_m": None},
+    ],
+)
+def test_a_mismatch_is_judged_without_a_track(change: dict[str, Any]) -> None:
+    m = AirspaceMonitor(policy=POLICY, clear_after_s=3.0)
+
+    [alert] = m.observe(
+        {**track("unknown_operator", mismatch=True), **change}, now_s=0.0
+    ).raised
+
+    assert alert.kind is AlertKind.IDENTIFICATION_MISMATCH
+    assert m.tracked == 0
+    # It stays while messages keep saying so; it is not stale for want of a track.
+    assert (
+        m.observe(
+            {**track("unknown_operator", mismatch=True, at_s=10.0), **change},
+            now_s=10.0,
+        ).raised
+        == []
+    )
+    assert [a.key for a in m.active] == [mismatch_key(A)]
+    # Shown false for longer than the hysteresis: resolved.
+    m.observe({**track("registered", at_s=11.0), **change}, now_s=11.0)
+    cleared = m.observe({**track("registered", at_s=15.0), **change}, now_s=15.0)
+    assert [(c.alert.key, c.reason) for c in cleared.cleared] == [
+        (mismatch_key(A), ClearReason.RESOLVED)
+    ]
+
+
+def test_a_mismatch_whose_messages_stop_goes_stale() -> None:
+    m = AirspaceMonitor(policy=POLICY, stale_after_s=15.0)
+    m.observe({**track("unknown_operator", mismatch=True), "armed": False}, now_s=0.0)
+
+    change = m.tick(now_s=16.0)
+
+    assert [(c.alert.key, c.reason) for c in change.cleared] == [
+        (mismatch_key(A), ClearReason.STALE)
+    ]
+
+
+def test_a_backlog_message_raises_no_mismatch() -> None:
+    m = AirspaceMonitor(policy=POLICY)
+    body = {**track("unknown_operator", mismatch=True), "backlog": True}
+    assert m.observe(body, now_s=0.0).raised == []
+    assert m.observe({**body, "armed": False}, now_s=0.0).raised == []
+
+
 # --- U-15: a network Remote ID provider switched off ------------------------------
 
 
