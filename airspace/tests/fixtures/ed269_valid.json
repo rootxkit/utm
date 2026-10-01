@@ -1,0 +1,134 @@
+{
+  "title": "U-03 test zones",
+  "description": "Invented zones around Tbilisi for tests; not real restrictions",
+  "features": [
+    {
+      "identifier": "TST001",
+      "country": "GEO",
+      "name": "Test prohibited square with a hole",
+      "type": "COMMON",
+      "restriction": "PROHIBITED",
+      "reason": ["SENSITIVE", "AIR_TRAFFIC"],
+      "message": "Test zone, not a real restriction",
+      "applicability": [{ "permanent": "YES" }],
+      "zoneAuthority": [
+        {
+          "name": "Test authority",
+          "service": "Airspace",
+          "contactName": "Duty officer",
+          "siteURL": "https://example.invalid/zones",
+          "email": "zones@example.invalid",
+          "phone": "+995 32 000 0000",
+          "purpose": "AUTHORIZATION",
+          "intervalBefore": "P2D"
+        }
+      ],
+      "geometry": [
+        {
+          "uomDimensions": "M",
+          "lowerLimit": 0,
+          "lowerVerticalReference": "AGL",
+          "upperLimit": 120,
+          "upperVerticalReference": "AGL",
+          "horizontalProjection": {
+            "type": "Polygon",
+            "coordinates": [
+              [[44.8, 41.7], [44.82, 41.7], [44.82, 41.72], [44.8, 41.72], [44.8, 41.7]],
+              [[44.805, 41.705], [44.815, 41.705], [44.815, 41.715], [44.805, 41.715], [44.805, 41.705]]
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "identifier": "TST002",
+      "country": "GEO",
+      "name": "Test circle in feet, AMSL",
+      "type": "COMMON",
+      "restriction": "REQ_AUTHORISATION",
+      "reason": ["POPULATION"],
+      "applicability": [
+        {
+          "permanent": "NO",
+          "startDateTime": "2026-01-01T00:00:00Z",
+          "endDateTime": "2027-01-01T00:00:00+04:00"
+        }
+      ],
+      "zoneAuthority": [{ "name": "Test authority", "purpose": "NOTIFICATION" }],
+      "geometry": [
+        {
+          "uomDimensions": "FT",
+          "lowerLimit": 1500,
+          "lowerVerticalReference": "AMSL",
+          "upperLimit": 2500.5,
+          "upperVerticalReference": "AMSL",
+          "horizontalProjection": {
+            "type": "Circle",
+            "center": [44.7831, 41.6938],
+            "radius": 1640
+          }
+        }
+      ],
+      "restrictionConditions": ["Notify 24 h before"],
+      "region": 7,
+      "regulationExemption": "NO",
+      "uSpaceClass": "EUROCONTROL",
+      "extendedProperties": { "source": "test", "revision": 3 }
+    },
+    {
+      "identifier": "TST003",
+      "country": "GEO",
+      "type": "COMMON",
+      "restriction": "CONDITIONAL",
+      "reason": ["OTHER"],
+      "otherReasonInfo": "Night works",
+      "message": "Applies at night, Monday to Friday",
+      "applicability": [
+        {
+          "permanent": "NO",
+          "startDateTime": "2026-09-01T00:00:00.00Z",
+          "endDateTime": "2026-12-31T23:59:59.00Z",
+          "schedule": [
+            { "day": ["MON", "TUE", "WED", "THU", "FRI"], "startTime": "22:00:00.00Z", "endTime": "02:00:00.00Z" }
+          ]
+        }
+      ],
+      "zoneAuthority": [],
+      "geometry": [
+        {
+          "uomDimensions": "M",
+          "lowerVerticalReference": "WGS84",
+          "upperLimit": 600,
+          "upperVerticalReference": "WGS84",
+          "horizontalProjection": {
+            "type": "Polygon",
+            "coordinates": [[[44.85, 41.73], [44.86, 41.73], [44.86, 41.74], [44.85, 41.73]]]
+          }
+        }
+      ],
+      "title": "Night works"
+    },
+    {
+      "identifier": "TST004",
+      "country": "GEO",
+      "name": "Test information zone",
+      "type": "COMMON",
+      "restriction": "NO_RESTRICTION",
+      "applicability": [
+        {
+          "permanent": "NO",
+          "schedule": [{ "day": ["ANY"], "startTime": "08:00+04:00", "endTime": "18:00+04:00" }]
+        }
+      ],
+      "zoneAuthority": [{ "purpose": "INFORMATION" }],
+      "geometry": [
+        {
+          "uomDimensions": "M",
+          "lowerVerticalReference": "AGL",
+          "upperVerticalReference": "AMSL",
+          "horizontalProjection": { "type": "Circle", "center": [44.9, 41.75], "radius": 250.5 }
+        }
+      ]
+    }
+  ]
+}
