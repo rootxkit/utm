@@ -248,12 +248,37 @@ const en = {
   source_switch_unavailable: "not changed — the control channel is unavailable; try again shortly",
   sources_unavailable: "source switches unavailable — states may be out of date",
   sources_admin_only: "Only an admin can switch sources.",
+  // U-02: network identification.
+  identification: "Identification",
+  id_registered: "registered",
+  id_suspended: "suspended",
+  id_unknown_operator: "unknown operator",
+  id_unidentified: "unidentified",
+  id_none: "not identified yet",
+  id_registered_hint: "The serial and the operator match an active registration.",
+  id_suspended_hint: "Registered, but the aircraft or its operator is suspended or revoked.",
+  id_unknown_operator_hint:
+    "The serial is not registered, or the operator it gives is missing, unknown or not the owner.",
+  id_unidentified_hint: "No serial number heard: nobody can say what aircraft this is.",
+  id_serial: "Serial",
+  id_operator: "Operator given",
+  id_registered_operator: "Registered operator",
+  id_mismatch: "operator mismatch",
+  id_reason: "Why",
+  identification_in_zone: "{status} aircraft inside {zone}",
+  identification_mismatch: "Gives operator {given}; registered to {registered}",
+  incident_candidate: "incident to be opened",
+  network_rid: "Network Remote ID",
+  network_rid_unverified: "From a USSP: as trustworthy as that provider, not verified here.",
+  nrid_provider: "Provider",
+  nrid_flight: "Flight",
+  nrid_extrapolated: "position extrapolated by the provider",
   source_disabled_track: "source disabled",
   source_disabled_note:
     "This aircraft's source is switched off: it is shown where it was last placed and is not monitored.",
 };
 
-type Key = keyof typeof en;
+export type Key = keyof typeof en;
 
 const ka: Partial<Record<Key, string>> = {
   console: "ოპერატორის ცენტრი",
@@ -504,6 +529,32 @@ const ka: Partial<Record<Key, string>> = {
   sources_unavailable:
     "წყაროების გადამრთველები მიუწვდომელია — მდგომარეობა შეიძლება მოძველებული იყოს",
   sources_admin_only: "წყაროების გადართვა მხოლოდ ადმინს შეუძლია.",
+  identification: "იდენტიფიკაცია",
+  id_registered: "რეგისტრირებული",
+  id_suspended: "შეჩერებული",
+  id_unknown_operator: "უცნობი ოპერატორი",
+  id_unidentified: "უიდენტიფიკაციო",
+  id_none: "ჯერ არ არის იდენტიფიცირებული",
+  id_registered_hint: "სერიული ნომერი და ოპერატორი ემთხვევა მოქმედ რეგისტრაციას.",
+  id_suspended_hint:
+    "რეგისტრირებულია, მაგრამ საფრენი აპარატი ან მისი ოპერატორი შეჩერებული ან გაუქმებულია.",
+  id_unknown_operator_hint:
+    "სერიული ნომერი არ არის რეგისტრირებული, ან მითითებული ოპერატორი აკლია, უცნობია ან არ არის მფლობელი.",
+  id_unidentified_hint: "სერიული ნომერი არ ისმის: ვერავინ იტყვის, რა აპარატია.",
+  id_serial: "სერიული ნომერი",
+  id_operator: "მითითებული ოპერატორი",
+  id_registered_operator: "რეგისტრირებული ოპერატორი",
+  id_mismatch: "ოპერატორი არ ემთხვევა",
+  id_reason: "მიზეზი",
+  identification_in_zone: "{status} აპარატი ზონაში: {zone}",
+  identification_mismatch: "მითითებულია ოპერატორი {given}; რეგისტრირებულია {registered}-ზე",
+  incident_candidate: "გაიხსნება ინციდენტი",
+  network_rid: "ქსელური Remote ID",
+  network_rid_unverified:
+    "USSP-დან: იმდენად სანდოა, რამდენადაც პროვაიდერი; აქ არ არის დადასტურებული.",
+  nrid_provider: "პროვაიდერი",
+  nrid_flight: "ფრენა",
+  nrid_extrapolated: "პოზიცია ექსტრაპოლირებულია პროვაიდერის მიერ",
   source_disabled_track: "წყარო გამორთულია",
   source_disabled_note:
     "ამ აპარატის წყარო გამორთულია: ნაჩვენებია ბოლო ცნობილ ადგილას და არ კონტროლდება.",

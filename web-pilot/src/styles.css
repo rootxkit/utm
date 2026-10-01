@@ -428,6 +428,61 @@ button.link {
 .drone-marker[data-source="remote_id"][data-alert=""] svg {
   fill: #8e24aa;
 }
+/* U-02: network Remote ID is a USSP's claim, drawn like a broadcast. */
+.pill.network-rid {
+  background: #00695c;
+  color: #fff;
+}
+.drone-marker[data-source="network_remote_id"] svg {
+  stroke-dasharray: 3 2;
+}
+.drone-marker[data-source="network_remote_id"][data-alert=""] svg {
+  fill: #00897b;
+}
+/* U-02: identification badges. The text says the status; colour only helps. */
+.pill.id-registered {
+  background: var(--ok);
+  color: #fff;
+}
+.pill.id-suspended {
+  background: var(--warning);
+  color: #fff;
+}
+.pill.id-unknown_operator {
+  background: var(--critical);
+  color: #fff;
+}
+.pill.id-unidentified {
+  background: #212121;
+  color: #fff;
+  outline: 1px solid var(--critical);
+}
+.pill.id-none {
+  background: var(--line);
+}
+.pill.id-mismatch {
+  background: #fff;
+  color: var(--critical);
+  outline: 1px solid var(--critical);
+}
+.id-legend {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.id-legend ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.id-box {
+  margin: 8px 0;
+}
+.id-box p {
+  margin: 4px 0;
+}
 .remote-id-box {
   margin: 8px 0;
   padding: 8px;
