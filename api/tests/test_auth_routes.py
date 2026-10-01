@@ -57,6 +57,15 @@ VIEWER_ROUTES = {
     ("GET", "/terrain"),
     ("GET", "/replay/drones/{drone_id}/flights"),
     ("GET", "/replay/drones/{drone_id}"),
+    # U-01: the UAS operator registry is read by viewers, changed by admins.
+    ("GET", "/uas/operators"),
+    ("GET", "/uas/operators/lookup"),
+    ("GET", "/uas/operators/{operator_id}"),
+    ("GET", "/uas/pilots"),
+    ("GET", "/uas/pilots/{pilot_id}"),
+    ("GET", "/uas/aircraft"),
+    ("GET", "/uas/aircraft/lookup"),
+    ("GET", "/uas/aircraft/{drone_id}"),
 }
 
 

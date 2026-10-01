@@ -1179,7 +1179,7 @@ optional there and can be made mandatory by the authority.
       its status; a client without the read scope is refused; every call is
       in `events`.
 
-- [ ] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
+- [x] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
       from console users, with a registration number, contact and status;
       remote pilots with competency records; UAS with serial, class label
       (C0-C6), MTOM and the operator that owns them. Import from a

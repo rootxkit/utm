@@ -437,3 +437,94 @@ button.link {
 .remote-id-box p {
   margin: 4px 0;
 }
+
+/* U-01: the UAS operator registry, in place of the map. */
+.registry {
+  grid-column: 1 / -1;
+  grid-row: 2 / -1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+.registry-main {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 12px;
+}
+.registry-main h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+.registry-detail {
+  width: 440px;
+  overflow: auto;
+  padding: 12px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+}
+.registry-detail h3 {
+  margin: 12px 0 4px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: normal;
+}
+.registry .stale {
+  opacity: 0.45;
+}
+.registry-lookup {
+  margin-bottom: 12px;
+}
+.registry-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+.registry-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+}
+.registry-table th,
+.registry-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.registry-table th {
+  font-size: 12px;
+  font-weight: normal;
+  color: var(--muted);
+}
+.registry-table tr.clickable {
+  cursor: pointer;
+}
+.registry-table tr.clickable:hover {
+  background: var(--selected);
+}
+.pill.reg-active {
+  background: var(--ok);
+  color: #fff;
+}
+.pill.reg-suspended,
+.pill.reg-expired {
+  background: var(--warning);
+  color: #fff;
+}
+.pill.reg-revoked {
+  background: var(--critical);
+  color: #fff;
+}
+@media (max-width: 1100px) {
+  .registry {
+    flex-direction: column;
+    overflow: auto;
+  }
+  .registry-detail {
+    width: auto;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+}
