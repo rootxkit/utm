@@ -191,6 +191,18 @@ export function sourceGroups(
   );
 }
 
+// What a refused switch means for what is shown. `control_channel_unavailable`:
+// nothing was changed (api/sources.py writes the bus inside the transaction).
+// `not_propagated`, from an API that records first and propagates after:
+// the change WAS recorded and is on its way, which is not a refusal.
+export type SwitchOutcome = "pending" | "unchanged" | "refused";
+
+export function switchOutcome(code: string): SwitchOutcome {
+  if (code === "not_propagated") return "pending";
+  if (code === "control_channel_unavailable") return "unchanged";
+  return "refused";
+}
+
 // The body of PUT /sources/... . A reason is required, and refused blank.
 export function switchRequest(
   enabled: boolean,

@@ -159,10 +159,10 @@ export function App() {
       const body = switchRequest(enabled, reason);
       if (!body) return "reason_required";
       const response = await apiPut(switchPath(sourceType, instanceId), body);
-      if (response.ok) {
-        await loadSources();
-        return null;
-      }
+      // Re-read either way: what is shown must be what the API holds,
+      // whether or not this switch took.
+      await loadSources();
+      if (response.ok) return null;
       const detail = ((await response.json().catch(() => ({}))) as { detail?: unknown }).detail;
       return typeof detail === "object" && detail !== null && "code" in detail
         ? String((detail as { code: unknown }).code)

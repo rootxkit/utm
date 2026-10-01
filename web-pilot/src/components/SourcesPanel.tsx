@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { ageSeconds } from "../format";
 import { useT } from "../i18n";
-import type { SourceGroup, SourceRow } from "../sources";
+import { type SourceGroup, type SourceRow, switchOutcome } from "../sources";
 
 export type SwitchSource = (
   sourceType: string,
@@ -108,7 +108,15 @@ function SwitchControl({ row, onSwitch }: { row: SourceRow; onSwitch: SwitchSour
       <button type="button" className="button small" onClick={() => setOpen(false)}>
         {t("cancel")}
       </button>
-      {refused && <span className="small muted">{t("reg_refused", { code: refused })}</span>}
+      {refused && (
+        <span className="small muted">
+          {switchOutcome(refused) === "pending"
+            ? t("source_switch_pending")
+            : switchOutcome(refused) === "unchanged"
+              ? t("source_switch_unavailable")
+              : t("reg_refused", { code: refused })}
+        </span>
+      )}
     </form>
   );
 }

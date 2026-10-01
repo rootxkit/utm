@@ -157,6 +157,8 @@ const en = {
   source_disable: "Disable",
   source_reason: "Reason (required)",
   cancel: "Cancel",
+  source_switch_pending: "recorded — propagation to the adapters pending",
+  source_switch_unavailable: "not changed — the control channel is unavailable; try again shortly",
   sources_unavailable: "source switches unavailable — states may be out of date",
   sources_admin_only: "Only an admin can switch sources.",
   source_disabled_track: "source disabled",
@@ -322,6 +324,8 @@ const ka: Partial<Record<Key, string>> = {
   source_disable: "გამორთვა",
   source_reason: "მიზეზი (სავალდებულო)",
   cancel: "გაუქმება",
+  source_switch_pending: "ჩაწერილია — ადაპტერებამდე გავრცელება მოლოდინშია",
+  source_switch_unavailable: "არ შეცვლილა — მართვის არხი მიუწვდომელია; სცადეთ მოგვიანებით",
   sources_unavailable:
     "წყაროების გადამრთველები მიუწვდომელია — მდგომარეობა შეიძლება მოძველებული იყოს",
   sources_admin_only: "წყაროების გადართვა მხოლოდ ადმინს შეუძლია.",

@@ -7,6 +7,7 @@ import {
   aircraftSourceDisabled,
   sourceGroups,
   switchPath,
+  switchOutcome,
   switchRequest,
   whyDisabled,
 } from "./sources";
@@ -185,6 +186,21 @@ describe("sourceGroups", () => {
     const reports = new Map([["remote_id", report("remote_id", [instance("rx", null)])]]);
     const types = sourceGroups(controls([]), reports, new Map(), NOW).map((g) => g.type.sourceType);
     expect(types).toEqual(["remote_id", "relay"]);
+  });
+});
+
+describe("switchOutcome", () => {
+  it("reads not_propagated as recorded and pending, not as refused", () => {
+    expect(switchOutcome("not_propagated")).toBe("pending");
+  });
+
+  it("reads an unavailable channel as nothing changed", () => {
+    expect(switchOutcome("control_channel_unavailable")).toBe("unchanged");
+  });
+
+  it("reads anything else as refused", () => {
+    expect(switchOutcome("reason_required")).toBe("refused");
+    expect(switchOutcome("403")).toBe("refused");
   });
 });
 
