@@ -65,6 +65,7 @@ from typing import Any
 
 import httpx
 import nats
+from nats.aio.msg import Msg
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from common import configure_logging, get_logger, load_settings
@@ -72,16 +73,25 @@ from common.bus import RECONNECT_FOREVER
 from common.geoid import GeoidGrid
 from common.sources import NETWORK_REMOTE_ID, follow, follower_from_settings
 from gateway.config import NetworkRidProvider, NetworkRidSettings
-from gateway.identification import Identification, resolve
+from gateway.identification import resolve, serial_conflict
 from gateway.network_rid import (
+    DEFAULT_DETAILS_CONCURRENCY,
     DEFAULT_DETAILS_TTL_S,
     DEFAULT_MAX_AGE_S,
+    DEFAULT_MAX_DETAILS_PER_POLL,
     DEFAULT_MAX_DIAGONAL_KM,
+    DEFAULT_MAX_FLIGHTS_PER_RESPONSE,
+    DEFAULT_MAX_TILES_PER_POLL,
+    DEFAULT_POLL_DEADLINE_S,
+    SOURCE,
     Area,
     AuthError,
+    Budget,
     Details,
     FlightState,
     FormatError,
+    OversizeError,
+    Page,
     ProviderError,
     ServiceProviderClient,
     TokenSource,
@@ -98,6 +108,14 @@ from gateway.remote_id import (
     DEFAULT_MIN_VERTICAL_ACCURACY,
     DEFAULT_TIME_TOLERANCE_S,
     Geoid,
+)
+from gateway.remote_id_match import (
+    DEFAULT_SPOOF_DISTANCE_M,
+    LinkFreshness,
+    Registered,
+    Verdict,
+    judge,
+    report_conflict,
 )
 from gateway.source_activity import SourceActivity, publish_periodically
 
@@ -122,6 +140,11 @@ class ProviderPoller:
     registry: Callable[[], RegistrySnapshot] = RegistrySnapshot
     # U-15. None: never switched off (a test, or no control channel).
     sources: SourceActivity | None = None
+    # When each of our aircraft last sent relay telemetry, and where: the
+    # same rule as direct Remote ID decides whether a flight speaks for it
+    # (`gateway/remote_id_match.py`, `judge`).
+    links: LinkFreshness = field(default_factory=LinkFreshness)
+    spoof_distance_m: float = DEFAULT_SPOOF_DISTANCE_M
     geoid: Geoid | None = None
     max_diagonal_km: float = DEFAULT_MAX_DIAGONAL_KM
     max_age_s: float = DEFAULT_MAX_AGE_S
@@ -129,6 +152,12 @@ class ProviderPoller:
     time_tolerance_s: float = DEFAULT_TIME_TOLERANCE_S
     max_latency_s: float = DEFAULT_MAX_LATENCY_S
     min_vertical_accuracy: int = DEFAULT_MIN_VERTICAL_ACCURACY
+    # What one poll may cost, whatever the provider sends.
+    max_flights_per_response: int = DEFAULT_MAX_FLIGHTS_PER_RESPONSE
+    max_tiles_per_poll: int = DEFAULT_MAX_TILES_PER_POLL
+    max_details_per_poll: int = DEFAULT_MAX_DETAILS_PER_POLL
+    details_concurrency: int = DEFAULT_DETAILS_CONCURRENCY
+    poll_deadline_s: float = DEFAULT_POLL_DEADLINE_S
     wall: Callable[[], datetime] = wall_clock
     clock_s: Callable[[], float] = time.monotonic
     failures: RateLimiter = field(default_factory=RateLimiter)
@@ -138,8 +167,15 @@ class ProviderPoller:
     provider_errors: int = field(default=0, init=False)
     auth_failures: int = field(default=0, init=False)
     format_errors: int = field(default=0, init=False)
+    oversize: int = field(default=0, init=False)
+    deadline_exceeded: int = field(default=0, init=False)
+    tiles_skipped: int = field(default=0, init=False)
+    flights_dropped: int = field(default=0, init=False)
     details_failures: int = field(default=0, init=False)
+    details_deferred: int = field(default=0, init=False)
     published: int = field(default=0, init=False)
+    withheld: int = field(default=0, init=False)
+    serial_conflicts: int = field(default=0, init=False)
     unchanged: int = field(default=0, init=False)
     too_old: int = field(default=0, init=False)
     time_notes: Counter[str] = field(default_factory=Counter, init=False)
@@ -149,58 +185,127 @@ class ProviderPoller:
     _details: dict[str, tuple[Details, float]] = field(default_factory=dict, init=False)
 
     async def poll(self) -> None:
-        """One pass over every area. Never raises for the provider's sake."""
+        """One pass over every area. Never raises for the provider's sake,
+        and never takes longer than `poll_deadline_s`."""
         if self.sources is not None and not self.sources.enabled(self.provider):
             # U-15: a disabled provider is not asked anything.
             self.skipped_disabled += 1
             self.sources.refuse(self.provider)
             return
         self.polls += 1
-        found: list[FlightState] = []
-        newest: datetime | None = None
-        try:
-            for area in self.areas:
-                for tile in area.tiles(self.max_diagonal_km):
-                    at, flights = await flights_in(self.client, tile)
-                    found.extend(flights)
-                    if at is not None and (newest is None or at > newest):
-                        newest = at
-        except AuthError as error:
-            self.auth_failures += 1
-            self._failed("auth", error)
+        deadline_s = self.clock_s() + self.poll_deadline_s
+        pages: list[Page] = []
+        if not await self._fetch(pages, deadline_s):
             return
-        except FormatError as error:
-            self.format_errors += 1
-            self._failed("format", error)
-            return
-        except ProviderError as error:
-            self.provider_errors += 1
-            self._failed("provider", error)
-            return
-        received_at = self.wall()
-        flights = list(unique(found))
+        flights = unique(pages)
         if self.sources is not None and not self.sources.admit(
             self.provider, len(flights)
         ):
             # Switched off while the poll was in flight.
             return
-        for flight in flights:
-            await self._take(flight, newest, received_at)
+        fresh = [(f, p) for f, p in flights if self._moved(f)]
+        await self._fetch_details([f.flight_id for f, _ in fresh], deadline_s)
+        for flight, page in fresh:
+            await self._take(flight, page)
         self._forget()
 
-    async def _take(
-        self, flight: FlightState, response_at: datetime | None, received_at: datetime
-    ) -> None:
+    async def _fetch(self, pages: list[Page], deadline_s: float) -> bool:
+        """Every tile, into `pages` as each answers. False when nothing is
+        to be taken from this poll; a deadline keeps what already arrived."""
+        budget = Budget(self.max_tiles_per_poll)
+        try:
+            async with asyncio.timeout(max(0.0, deadline_s - self.clock_s())):
+                for area in self.areas:
+                    for tile in area.tiles(self.max_diagonal_km):
+                        await flights_in(
+                            self.client,
+                            tile,
+                            wall=self.wall,
+                            budget=budget,
+                            pages=pages,
+                            max_flights=self.max_flights_per_response,
+                        )
+        except TimeoutError:
+            self.deadline_exceeded += 1
+            self._failed("deadline", TimeoutError(f"{self.poll_deadline_s} s"))
+        except AuthError as error:
+            self.auth_failures += 1
+            self._failed("auth", error)
+            return False
+        except OversizeError as error:
+            self.oversize += 1
+            self._failed("oversize", error)
+            return False
+        except FormatError as error:
+            self.format_errors += 1
+            self._failed("format", error)
+            return False
+        except ProviderError as error:
+            self.provider_errors += 1
+            self._failed("provider", error)
+            return False
+        dropped = sum(page.dropped for page in pages)
+        if budget.skipped:
+            self.tiles_skipped += budget.skipped
+            self._failed(
+                "tiles", ProviderError(f"{budget.skipped} tiles over the per-poll cap")
+            )
+        if dropped:
+            self.flights_dropped += dropped
+            self._failed(
+                "flights", ProviderError(f"{dropped} flights over the per-response cap")
+            )
+        return True
+
+    def _moved(self, flight: FlightState) -> bool:
+        """Whether the SP's state is newer than the one last taken."""
         self._last_seen_s[flight.flight_id] = self.clock_s()
         held = self._last_ts.get(flight.flight_id)
         if held is not None and flight.timestamp <= held:
-            # The SP's state has not moved since the last poll.
             self.unchanged += 1
+            return False
+        return True
+
+    async def _fetch_details(self, flight_ids: list[str], deadline_s: float) -> None:
+        """Details for flights without fresh ones: at most
+        `max_details_per_poll`, `details_concurrency` at a time, within the
+        poll's deadline. The rest use what is held, and wait for a later poll."""
+        now_s = self.clock_s()
+        due = [
+            flight_id
+            for flight_id in flight_ids
+            if (held := self._details.get(flight_id)) is None
+            or now_s - held[1] >= self.details_ttl_s
+        ]
+        if len(due) > self.max_details_per_poll:
+            self.details_deferred += len(due) - self.max_details_per_poll
+            due = due[: self.max_details_per_poll]
+        if not due:
             return
+        gate = asyncio.Semaphore(self.details_concurrency)
+
+        async def one(flight_id: str) -> None:
+            async with gate:
+                try:
+                    details = await self.client.details(flight_id)
+                except ProviderError as error:
+                    self.details_failures += 1
+                    self._failed("details", error)
+                    return
+                self._details[flight_id] = (details, self.clock_s())
+
+        try:
+            async with asyncio.timeout(max(0.0, deadline_s - self.clock_s())):
+                await asyncio.gather(*(one(flight_id) for flight_id in due))
+        except TimeoutError:
+            self.deadline_exceeded += 1
+            self._failed("deadline", TimeoutError("details"))
+
+    async def _take(self, flight: FlightState, page: Page) -> None:
         placement = place(
             flight,
-            response_at=response_at,
-            received_at=received_at,
+            response_at=page.response_at,
+            received_at=page.received_at,
             max_age_s=self.max_age_s,
             time_tolerance_s=self.time_tolerance_s,
             max_latency_s=self.max_latency_s,
@@ -211,23 +316,52 @@ class ProviderPoller:
         if placement.note is not None:
             self.time_notes[placement.note] += 1
         self._last_ts[flight.flight_id] = flight.timestamp
-        details = await self._details_of(flight.flight_id)
+        held = self._details.get(flight.flight_id)
+        details = None if held is None else held[0]
+        serial = None if details is None else details.serial
+        operator = None if details is None else details.operator_id
         snapshot = self.registry()
-        identification = resolve(
-            snapshot,
-            serial=None if details is None else details.serial,
-            operator_reg=None if details is None else details.operator_id,
+        facts = None if serial is None else snapshot.by_serial.get(serial)
+        judgement = judge(
+            None if facts is None else Registered(facts.drone_id, facts.label),
+            (flight.lat_deg, flight.lon_deg),
+            self.links,
+            now_s=self.clock_s(),
+            spoof_distance_m=self.spoof_distance_m,
         )
+        if judgement.verdict is Verdict.WITHHOLD:
+            # Our aircraft, its relay live and in agreement: the relay track
+            # is the better one (P1-15), whichever broadcast source this is.
+            self.withheld += 1
+            return
+        if judgement.verdict is Verdict.CONFLICT and serial is not None:
+            self.serial_conflicts += 1
+            identification = serial_conflict(serial, operator)
+            registered = None
+        else:
+            identification = resolve(snapshot, serial=serial, operator_reg=operator)
+            ours = judgement.aircraft
+            registered = None if ours is None else (ours.drone_id, ours.label)
         message = observation(
             flight,
             details,
             placement,
             provider=self.provider,
-            received_at=received_at,
+            received_at=page.received_at,
             geoid=self.geoid,
             min_vertical_accuracy=self.min_vertical_accuracy,
-            registered=_registered(snapshot, identification),
+            registered=registered,
         )
+        if judgement.verdict is Verdict.CONFLICT:
+            report_conflict(
+                self.failures,
+                judgement,
+                broadcast_drone_id=message["drone_id"],
+                station_id=self.provider,
+                source=SOURCE,
+                spoof_distance_m=self.spoof_distance_m,
+                serial_conflicts=self.serial_conflicts,
+            )
         message["identification"] = identification.as_dict()
         try:
             await self.bus.publish(
@@ -241,22 +375,6 @@ class ProviderPoller:
             return
         self.published += 1
         self.identified_as[identification.status.value] += 1
-
-    async def _details_of(self, flight_id: str) -> Details | None:
-        """The flight's details, fetched once per `details_ttl_s`. A failed
-        fetch keeps what was held, if anything."""
-        held = self._details.get(flight_id)
-        now_s = self.clock_s()
-        if held is not None and now_s - held[1] < self.details_ttl_s:
-            return held[0]
-        try:
-            details = await self.client.details(flight_id)
-        except ProviderError as error:
-            self.details_failures += 1
-            self._failed("details", error)
-            return None if held is None else held[0]
-        self._details[flight_id] = (details, now_s)
-        return details
 
     def _forget(self) -> None:
         """Flights the SP has not mentioned for `max_age_s` are dropped."""
@@ -285,12 +403,19 @@ class ProviderPoller:
             "polls": self.polls,
             "skipped_disabled": self.skipped_disabled,
             "published": self.published,
+            "withheld": self.withheld,
+            "serial_conflicts": self.serial_conflicts,
             "unchanged": self.unchanged,
             "too_old": self.too_old,
             "provider_errors": self.provider_errors,
             "auth_failures": self.auth_failures,
             "format_errors": self.format_errors,
+            "oversize": self.oversize,
+            "deadline_exceeded": self.deadline_exceeded,
+            "tiles_skipped": self.tiles_skipped,
+            "flights_dropped": self.flights_dropped,
             "details_failures": self.details_failures,
+            "details_deferred": self.details_deferred,
             "flights_held": len(self._last_seen_s),
         }
         for note in ("ahead_of_response", "clock_ahead", "too_old"):
@@ -298,17 +423,6 @@ class ProviderPoller:
         for status in ("registered", "suspended", "unknown_operator", "unidentified"):
             totals[f"identified_{status}"] = self.identified_as[status]
         return totals
-
-
-def _registered(
-    snapshot: RegistrySnapshot, identification: Identification
-) -> tuple[Any, str] | None:
-    """The registry's id and label for a flight whose serial it holds, so
-    the flight is the same aircraft on every source."""
-    if identification.drone_id is None:
-        return None
-    facts = snapshot.by_drone_id.get(identification.drone_id)
-    return None if facts is None else (facts.drone_id, facts.label)
 
 
 async def poll_periodically(
@@ -338,7 +452,10 @@ def build_poller(
     return ProviderPoller(
         provider=provider.id,
         client=ServiceProviderClient(
-            http=http, base_url=str(provider.base_url), tokens=tokens
+            http=http,
+            base_url=str(provider.base_url),
+            tokens=tokens,
+            max_body_bytes=settings.network_rid_max_body_bytes,
         ),
         areas=[Area(*box) for box in provider.areas],
         bus=bus,
@@ -347,6 +464,12 @@ def build_poller(
         details_ttl_s=settings.network_rid_details_ttl_s,
         time_tolerance_s=settings.network_rid_time_tolerance_s,
         max_latency_s=settings.network_rid_max_latency_s,
+        max_flights_per_response=settings.network_rid_max_flights_per_response,
+        max_tiles_per_poll=settings.network_rid_max_tiles_per_poll,
+        max_details_per_poll=settings.network_rid_max_details_per_poll,
+        details_concurrency=settings.network_rid_details_concurrency,
+        poll_deadline_s=settings.network_rid_poll_deadline_s,
+        spoof_distance_m=settings.remote_id_spoof_distance_m,
         **kwargs,
     )
 
@@ -394,6 +517,9 @@ async def run(settings: NetworkRidSettings) -> None:
     )
     control = await follow(bus, follower, subject=settings.source_control_subject)
     http = httpx.AsyncClient(timeout=settings.network_rid_http_timeout_s)
+    # Our aircraft's relay telemetry, for the rule that decides whether a
+    # flight speaks for one of them (`gateway/remote_id_match.py`).
+    links = LinkFreshness()
     pollers = [
         build_poller(
             provider,
@@ -403,9 +529,15 @@ async def run(settings: NetworkRidSettings) -> None:
             registry=lambda: registry.snapshot,
             sources=sources,
             geoid=geoid,
+            links=links,
         )
         for provider in providers
     ]
+
+    async def on_telemetry(message: Msg) -> None:
+        links.on_telemetry(message.data, now_s=time.monotonic())
+
+    await bus.subscribe("telemetry.*", cb=on_telemetry)
     if not pollers:
         _log.warning("no network remote id providers configured; nothing to poll")
     _log.info(

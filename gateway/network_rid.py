@@ -93,10 +93,11 @@ claim, like a broadcast.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -129,6 +130,14 @@ DEFAULT_MAX_DIAGONAL_KM = 7.0
 DEFAULT_MAX_AGE_S = 60.0
 DEFAULT_DETAILS_TTL_S = 60.0
 DEFAULT_SCOPE = "rid.display_provider"
+# What one poll of one provider may cost us, whatever the provider sends
+# (`NetworkRidSettings` makes each configurable).
+DEFAULT_MAX_BODY_BYTES = 1_048_576
+DEFAULT_MAX_FLIGHTS_PER_RESPONSE = 500
+DEFAULT_MAX_TILES_PER_POLL = 64
+DEFAULT_MAX_DETAILS_PER_POLL = 20
+DEFAULT_DETAILS_CONCURRENCY = 4
+DEFAULT_POLL_DEADLINE_S = 5.0
 # A tile the SP refuses as too large is split in four at most this often.
 MAX_SPLIT_DEPTH = 3
 # Renew a token this long before the provider says it expires.
@@ -154,6 +163,33 @@ _VERTICAL_ACCURACY = {
     "VA10m": 4,
     "VA3m": 5,
     "VA1m": 6,
+}
+# accuracy_h and speed_accuracy: F3411's enums list the ODID codes in order
+# (MAV_ODID_HOR_ACC 0-13, MAV_ODID_SPEED_ACC 0-4), so the index is the code.
+_HORIZONTAL_ACCURACY = {
+    name: code
+    for code, name in enumerate(
+        [
+            "HAUnknown",
+            "HA10NMPlus",
+            "HA10NM",
+            "HA4NM",
+            "HA2NM",
+            "HA1NM",
+            "HA05NM",
+            "HA03NM",
+            "HA01NM",
+            "HA005NM",
+            "HA30m",
+            "HA10m",
+            "HA3m",
+            "HA1m",
+        ]
+    )
+}
+_SPEED_ACCURACY = {
+    name: code
+    for code, name in enumerate(["SAUnknown", "SA10mps", "SA3mps", "SA1mps", "SA03mps"])
 }
 _STATUS = {
     "Undeclared": odid.Status.UNDECLARED,
@@ -194,9 +230,9 @@ class Area:
         if not (-180 <= self.lon_min < self.lon_max <= 180):
             raise ValueError(f"longitudes out of order or range: {self}")
 
-    def diagonal_km(self) -> float:
-        """An upper bound on the box's diagonal: its east-west side measured
-        at the latitude where a degree of longitude is longest."""
+    def sides_km(self) -> tuple[float, float]:
+        """North-south and east-west sides; the latter measured at the
+        latitude where a degree of longitude is longest (an upper bound)."""
         widest = (
             0.0
             if self.lat_min <= 0 <= self.lat_max
@@ -208,7 +244,11 @@ class Area:
             * _KM_PER_DEG_LAT
             * math.cos(math.radians(widest))
         )
-        return math.hypot(dx, dy)
+        return dy, dx
+
+    def diagonal_km(self) -> float:
+        """An upper bound on the box's diagonal."""
+        return math.hypot(*self.sides_km())
 
     def view(self) -> str:
         """The `view` query parameter: lat1,lng1,lat2,lng2."""
@@ -228,10 +268,14 @@ class Area:
         """Tiles covering the area, each no larger than `max_diagonal_km`."""
         if max_diagonal_km <= 0:
             raise ValueError("max_diagonal_km must be positive")
-        # Each of n x n tiles is at most 1/n of the box's diagonal bound.
-        n = max(1, math.ceil(self.diagonal_km() / max_diagonal_km))
-        dlat = (self.lat_max - self.lat_min) / n
-        dlon = (self.lon_max - self.lon_min) / n
+        # Square tiles of side max/sqrt(2), as many each way as that side
+        # needs: a long thin area is a row of tiles, not a grid of slivers.
+        side_km = max_diagonal_km / math.sqrt(2)
+        height_km, width_km = self.sides_km()
+        rows = max(1, math.ceil(height_km / side_km))
+        cols = max(1, math.ceil(width_km / side_km))
+        dlat = (self.lat_max - self.lat_min) / rows
+        dlon = (self.lon_max - self.lon_min) / cols
         return [
             Area(
                 self.lat_min + i * dlat,
@@ -239,8 +283,8 @@ class Area:
                 self.lat_min + (i + 1) * dlat,
                 self.lon_min + (j + 1) * dlon,
             )
-            for i in range(n)
-            for j in range(n)
+            for i in range(rows)
+            for j in range(cols)
         ]
 
 
@@ -333,6 +377,8 @@ class FlightState:
     alt_hae_m: float | None
     alt_pressure_m: float | None
     vertical_accuracy: int
+    horizontal_accuracy: int
+    speed_accuracy: int
     extrapolated: bool
     height_m: float | None
     height_reference: str | None
@@ -341,24 +387,28 @@ class FlightState:
     vertical_speed_ms: float | None
 
 
-def parse_flights(body: Any) -> tuple[datetime | None, list[FlightState]]:
-    """A GetFlightsResponse: its own timestamp, and each flight with a
-    current state. A flight without one (the SP knows it, but has no
-    position to give) is left out."""
+def parse_flights(
+    body: Any, *, max_flights: int = DEFAULT_MAX_FLIGHTS_PER_RESPONSE
+) -> tuple[datetime | None, list[FlightState], int]:
+    """A GetFlightsResponse: its own timestamp, each flight with a current
+    state, and how many flights past `max_flights` were not taken. A flight
+    without a state (the SP knows it, but has no position to give) is left
+    out."""
     if not isinstance(body, dict):
         raise FormatError("not a JSON object")
     flights = body.get("flights", [])
     if not isinstance(flights, list):
         raise FormatError("flights is not a list")
+    dropped = max(0, len(flights) - max_flights)
     out = []
-    for raw in flights:
+    for raw in flights[:max_flights]:
         if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
             raise FormatError(f"a flight without an id: {raw!r}")
         state = raw.get("current_state")
         if state is None:
             continue
         out.append(_parse_state(raw, state))
-    return parse_time(body.get("timestamp")), out
+    return parse_time(body.get("timestamp")), out, dropped
 
 
 def _parse_state(flight: dict[str, Any], state: Any) -> FlightState:
@@ -391,6 +441,10 @@ def _parse_state(flight: dict[str, Any], state: Any) -> FlightState:
         alt_hae_m=_unknown(_number(position, "alt"), _UNKNOWN_ALT_M),
         alt_pressure_m=_unknown(_number(position, "pressure_altitude"), _UNKNOWN_ALT_M),
         vertical_accuracy=_VERTICAL_ACCURACY.get(str(position.get("accuracy_v")), 0),
+        horizontal_accuracy=_HORIZONTAL_ACCURACY.get(
+            str(position.get("accuracy_h")), 0
+        ),
+        speed_accuracy=_SPEED_ACCURACY.get(str(state.get("speed_accuracy")), 0),
         extrapolated=position.get("extrapolated") is True,
         height_m=_number(height, "distance"),
         height_reference=_text(height.get("reference")),
@@ -463,6 +517,40 @@ class TokenSource:
         return token
 
 
+class OversizeError(ProviderError):
+    """A response body larger than the client accepts."""
+
+
+@dataclass(frozen=True, slots=True)
+class Reply:
+    """A response, read no further than `max_body_bytes`."""
+
+    status_code: int
+    body: bytes
+
+    def json(self) -> Any:
+        try:
+            return json.loads(self.body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise FormatError("response is not JSON") from error
+
+
+async def read_capped(response: httpx.Response, max_bytes: int) -> bytes:
+    """The body, refusing one over `max_bytes` without reading the rest:
+    a provider is authenticated, not trusted with our memory."""
+    declared = response.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > max_bytes:
+        raise OversizeError(f"body of {declared} bytes, more than {max_bytes}")
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > max_bytes:
+            raise OversizeError(f"body over {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @dataclass
 class ServiceProviderClient:
     """GETs against one SP, authenticated, for one Display Provider."""
@@ -470,72 +558,111 @@ class ServiceProviderClient:
     http: httpx.AsyncClient
     base_url: str
     tokens: TokenSource
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
 
-    async def _get(
-        self, path: str, params: dict[str, str] | None = None
-    ) -> httpx.Response:
+    async def _get(self, path: str, params: dict[str, str] | None = None) -> Reply:
         url = f"{self.base_url.rstrip('/')}{path}"
         for attempt in (1, 2):
             token = await self.tokens.token()
             try:
-                response = await self.http.get(
-                    url, params=params, headers={"Authorization": f"Bearer {token}"}
-                )
+                async with self.http.stream(
+                    "GET",
+                    url,
+                    params=params,
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as response:
+                    if response.status_code == 401 and attempt == 1:
+                        # The token may have been revoked or expired early.
+                        self.tokens.drop()
+                        continue
+                    body = await read_capped(response, self.max_body_bytes)
+                    return Reply(response.status_code, body)
             except httpx.HTTPError as error:
                 raise ProviderError(f"{path}: {error!r}") from error
-            if response.status_code == 401 and attempt == 1:
-                # The token may have been revoked or expired early.
-                self.tokens.drop()
-                continue
-            return response
         raise AuthError(f"{path}: refused with a fresh token")  # pragma: no cover
 
-    async def flights(self, area: Area) -> httpx.Response:
+    async def flights(self, area: Area) -> Reply:
         return await self._get("/uss/flights", {"view": area.view()})
 
     async def details(self, flight_id: str) -> Details:
-        response = await self._get(f"/uss/flights/{flight_id}/details")
-        if response.status_code == 401:
+        reply = await self._get(f"/uss/flights/{flight_id}/details")
+        if reply.status_code == 401:
             raise AuthError("details refused with a fresh token")
-        if response.status_code != 200:
-            raise ProviderError(f"details answered {response.status_code}")
-        try:
-            return parse_details(response.json())
-        except ValueError as error:
-            raise FormatError("details response is not JSON") from error
+        if reply.status_code != 200:
+            raise ProviderError(f"details answered {reply.status_code}")
+        return parse_details(reply.json())
 
 
 class TooLargeError(ProviderError):
     """The SP refused a view as too large (413)."""
 
 
+@dataclass(frozen=True, slots=True)
+class Page:
+    """One /uss/flights response: its flights, the SP's own time for it,
+    and when we received it, on our clock."""
+
+    flights: list[FlightState]
+    response_at: datetime | None
+    received_at: datetime
+    # Flights beyond `max_flights` in this response, not taken.
+    dropped: int = 0
+
+
+@dataclass
+class Budget:
+    """Requests one poll may still make; what it could not."""
+
+    remaining: int
+    skipped: int = 0
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            self.skipped += 1
+            return False
+        self.remaining -= 1
+        return True
+
+
 async def flights_in(
-    client: ServiceProviderClient, area: Area, *, depth: int = 0
-) -> tuple[datetime | None, list[FlightState]]:
-    """The flights in one tile, splitting it while the SP says 413."""
-    response = await client.flights(area)
-    if response.status_code == 413:
+    client: ServiceProviderClient,
+    area: Area,
+    *,
+    wall: Callable[[], datetime],
+    budget: Budget,
+    pages: list[Page],
+    max_flights: int = DEFAULT_MAX_FLIGHTS_PER_RESPONSE,
+    depth: int = 0,
+) -> None:
+    """The flights in one tile, appended to `pages` as each response
+    arrives, splitting the tile while the SP says 413. A tile the budget
+    no longer covers is skipped and counted in it."""
+    if not budget.take():
+        return
+    reply = await client.flights(area)
+    received_at = wall()
+    if reply.status_code == 413:
         if depth >= MAX_SPLIT_DEPTH:
             raise TooLargeError(
                 f"view still too large after {depth} splits: {area.view()}"
             )
-        newest: datetime | None = None
-        found: list[FlightState] = []
         for quarter in area.quarters():
-            at, flights = await flights_in(client, quarter, depth=depth + 1)
-            found.extend(flights)
-            if at is not None and (newest is None or at > newest):
-                newest = at
-        return newest, found
-    if response.status_code == 401:
+            await flights_in(
+                client,
+                quarter,
+                wall=wall,
+                budget=budget,
+                pages=pages,
+                max_flights=max_flights,
+                depth=depth + 1,
+            )
+        return
+    if reply.status_code == 401:
         raise AuthError("flights refused with a fresh token")
-    if response.status_code != 200:
-        raise ProviderError(f"flights answered {response.status_code}")
-    try:
-        body = response.json()
-    except ValueError as error:
-        raise FormatError("flights response is not JSON") from error
-    return parse_flights(body)
+    if reply.status_code != 200:
+        raise ProviderError(f"flights answered {reply.status_code}")
+    response_at, flights, dropped = parse_flights(reply.json(), max_flights=max_flights)
+    pages.append(Page(flights, response_at, received_at, dropped))
 
 
 # --- mapping ------------------------------------------------------------------
@@ -608,10 +735,10 @@ def to_location(state: FlightState) -> odid.Location:
             else odid.HeightReference.OVER_GROUND
         ),
         height_m=state.height_m,
-        horiz_accuracy=0,
+        horiz_accuracy=state.horizontal_accuracy,
         vert_accuracy=state.vertical_accuracy,
         baro_accuracy=0,
-        speed_accuracy=0,
+        speed_accuracy=state.speed_accuracy,
         ts_accuracy=0,
         seconds_after_hour=None,
     )
@@ -699,6 +826,11 @@ def observation(
             "operator_lon_deg": None if details is None else details.operator_lon_deg,
             "time_source": placement.time_source,
             "ts_accuracy_s": state.timestamp_accuracy_s,
+            # ODID accuracy codes (MAV_ODID_HOR_ACC, _VER_ACC, _SPEED_ACC);
+            # 0 is unknown.
+            "horizontal_accuracy": state.horizontal_accuracy,
+            "vertical_accuracy": state.vertical_accuracy,
+            "speed_accuracy": state.speed_accuracy,
         },
     }
 
@@ -710,11 +842,13 @@ def _velocity(state: FlightState) -> tuple[float | None, float | None]:
     return state.speed_ms * math.cos(track), state.speed_ms * math.sin(track)
 
 
-def unique(flights: list[FlightState]) -> Iterator[FlightState]:
-    """One state per flight id, the newest, across overlapping tiles."""
-    newest: dict[str, FlightState] = {}
-    for flight in flights:
-        held = newest.get(flight.flight_id)
-        if held is None or flight.timestamp > held.timestamp:
-            newest[flight.flight_id] = flight
-    return iter(newest.values())
+def unique(pages: list[Page]) -> list[tuple[FlightState, Page]]:
+    """One state per flight id, the newest, across overlapping tiles, with
+    the response it came in (whose times place it)."""
+    newest: dict[str, tuple[FlightState, Page]] = {}
+    for page in pages:
+        for flight in page.flights:
+            held = newest.get(flight.flight_id)
+            if held is None or flight.timestamp > held[0].timestamp:
+                newest[flight.flight_id] = (flight, page)
+    return list(newest.values())

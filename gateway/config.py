@@ -26,9 +26,15 @@ from common import (
 )
 from common.sources import INSTANCE_ID_PATTERN
 from gateway.network_rid import (
+    DEFAULT_DETAILS_CONCURRENCY,
     DEFAULT_DETAILS_TTL_S,
     DEFAULT_MAX_AGE_S,
+    DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_DETAILS_PER_POLL,
     DEFAULT_MAX_DIAGONAL_KM,
+    DEFAULT_MAX_FLIGHTS_PER_RESPONSE,
+    DEFAULT_MAX_TILES_PER_POLL,
+    DEFAULT_POLL_DEADLINE_S,
     Area,
 )
 from gateway.network_rid import DEFAULT_SCOPE as DEFAULT_NETWORK_RID_SCOPE
@@ -318,6 +324,47 @@ class NetworkRidSettings(
     )
     network_rid_http_timeout_s: float = Field(
         default=5.0, gt=0, validation_alias="NETWORK_RID_HTTP_TIMEOUT_S"
+    )
+    # What one poll of one provider may cost us, whatever it sends: a body
+    # over this is refused unread; flights past the cap in one response,
+    # tiles past the cap in one poll (413 splits included) and details past
+    # the cap are counted and left; details are fetched this many at a time;
+    # a poll stops at its deadline and keeps what had arrived.
+    network_rid_max_body_bytes: int = Field(
+        default=DEFAULT_MAX_BODY_BYTES,
+        ge=1024,
+        validation_alias="NETWORK_RID_MAX_BODY_BYTES",
+    )
+    network_rid_max_flights_per_response: int = Field(
+        default=DEFAULT_MAX_FLIGHTS_PER_RESPONSE,
+        ge=1,
+        validation_alias="NETWORK_RID_MAX_FLIGHTS_PER_RESPONSE",
+    )
+    network_rid_max_tiles_per_poll: int = Field(
+        default=DEFAULT_MAX_TILES_PER_POLL,
+        ge=1,
+        validation_alias="NETWORK_RID_MAX_TILES_PER_POLL",
+    )
+    network_rid_max_details_per_poll: int = Field(
+        default=DEFAULT_MAX_DETAILS_PER_POLL,
+        ge=1,
+        validation_alias="NETWORK_RID_MAX_DETAILS_PER_POLL",
+    )
+    network_rid_details_concurrency: int = Field(
+        default=DEFAULT_DETAILS_CONCURRENCY,
+        ge=1,
+        validation_alias="NETWORK_RID_DETAILS_CONCURRENCY",
+    )
+    network_rid_poll_deadline_s: float = Field(
+        default=DEFAULT_POLL_DEADLINE_S,
+        gt=0,
+        validation_alias="NETWORK_RID_POLL_DEADLINE_S",
+    )
+    # S-10: the same guard as the Remote ID ingest's, for flights of ours.
+    remote_id_spoof_distance_m: float = Field(
+        default=DEFAULT_SPOOF_DISTANCE_M,
+        gt=0,
+        validation_alias="REMOTE_ID_SPOOF_DISTANCE_M",
     )
     # Only when a response carries no timestamp of its own: how far the
     # state's time may be ahead of ours, or behind, and still place it.

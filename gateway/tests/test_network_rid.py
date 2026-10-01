@@ -21,6 +21,7 @@ from gateway.network_rid import (
     Area,
     AuthError,
     FormatError,
+    Reply,
     ServiceProviderClient,
     TokenSource,
     flight_aircraft_id,
@@ -544,7 +545,7 @@ def test_v19_details_are_read_too() -> None:
 
 
 def test_unknown_values_are_none_not_numbers() -> None:
-    at, [state] = parse_flights(
+    at, [state], _ = parse_flights(
         {
             "timestamp": {"value": "2026-10-01T12:00:00Z", "format": "RFC3339"},
             "flights": [
@@ -622,7 +623,7 @@ def test_times_must_carry_a_zone() -> None:
 
 
 def test_placement_without_a_response_time_falls_back_to_our_clock() -> None:
-    _, [state] = parse_flights(
+    _, [state], _ = parse_flights(
         {
             "flights": [
                 {
@@ -704,7 +705,7 @@ async def test_a_provider_switched_off_mid_poll_publishes_nothing() -> None:
     assert isinstance(holder, _Holder)
     real = sp.poller.client.flights
 
-    async def then_switch_off(area: Area) -> httpx.Response:
+    async def then_switch_off(area: Area) -> Reply:
         response = await real(area)
         holder.state = disabled()
         return response
