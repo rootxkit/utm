@@ -6,8 +6,11 @@ aircraft raises:
 - a **critical conflict** alert when a pair's closest point of approach
   (`ARCHITECTURE.md` §6.2) is within `t_cpa_max_s`, closer than
   `d_horizontal_min_m` horizontally and `d_vertical_min_m` vertically;
-- a **zone** alert when an aircraft is inside a `no_fly` (critical) or
-  `restricted` (warning) zone of `airspace_zones`, within its AMSL band;
+- a **zone** alert when an aircraft is inside an ED-269 zone of
+  `airspace_zones` that applies at that moment (U-03, below): critical for
+  PROHIBITED, a warning for REQ_AUTHORISATION, info or warning for
+  CONDITIONAL (`airspace_policy.conditional_zone_severity`), nothing for
+  NO_RESTRICTION;
 - a **height** warning (P5-19) when an aircraft is more than
   `max_height_agl_m` above the ground under it. Height above ground is its
   AMSL altitude minus the DEM (P5-00). Where the ground elevation is unknown,
@@ -37,6 +40,64 @@ not be evaluated. Zones and the height limit are re-read every minute:
 ```sql
 UPDATE airspace_policy SET max_height_agl_m = 150;   -- NULL: no limit
 ```
+
+## Geographical zones (U-03)
+
+Zones follow EUROCAE ED-269 (`airspace/ed269.py`; migration
+`0006_geo_awareness`). Each has an identifier, a restriction, reasons, a
+message, the authority, when it applies (permanent, or dates and a weekly
+schedule) and one volume: a polygon or a circle between a lower and an upper
+limit, each limit with its own reference.
+
+| Limit reference | Compared with | Needs |
+|---|---|---|
+| AMSL | the aircraft's AMSL altitude | nothing |
+| AGL | AMSL less the ground under it (DEM) | `TERRAIN_DIR` |
+| WGS84 | AMSL plus the geoid undulation (height above the ellipsoid) | `GEOID_PATH` |
+
+Where a zone the aircraft is horizontally inside has a limit whose data is
+missing, it is **not evaluated** for that aircraft: no alert, an active one
+is neither refreshed nor cleared, and `zone_checks_not_evaluated` in the
+status line counts it. At start-up and on every reload the service logs
+which zones cannot be judged and what they need. Applicability is judged in
+UTC at the track's placed time (`captured_at`).
+
+Zones are written three ways, every change audited in `events`:
+
+- the console's **Zones** tab: draw a polygon or a circle on the map, set
+  the fields, save (admin; U-13 adds the regulator);
+- **ED-269 import**: `POST /airspace/zones/import?dry_run=true` with the file
+  as the body reports what would be created and replaced; without
+  `dry_run` it imports, all or nothing, by identifier. The console does the
+  same from a file. A refusal names each field and why;
+- **airspace.gov.ge**, which publishes no feed: `tools/gov_ge_zones.py`
+  converts saved copies of its `points.js` and page with a rules file from
+  the authority (restriction, limits and times per kind of zone, which the
+  site does not publish) into an ED-269 file to import.
+
+`GET /airspace/zones/export` writes every geozone as ED-269. The monitor
+re-reads zones every 60 s (`ZONE_REFRESH_S`), so a change alerts within a
+minute.
+
+### Verified in SITL, 2026-10-01
+
+SYSID 3 on Remote ID only, through the U-16 bridge (flat 15.9 m geoid grid
+on both sides; no DEM installed), hovering at 685.1 m AMSL and flown east
+and west along one line at 10 m/s. The ingest, the monitor and the API ran
+from the branch. Zones were created through the API in the editor's shape,
+and one was drawn and edited in the console itself. From the bus, in UTC:
+
+| Run | Zone state | Inside U03AMSL (20 samples each run) | Alert |
+|---|---|---|---|
+| 1 | U03AMSL, PROHIBITED, 600-800 m AMSL, permanent | 01:22:55-01:23:14 | critical raised 01:22:54.9, cleared (resolved) 01:23:16.9 |
+| 2 | the same zone, window 1-30 September | 01:25:17-01:25:37 | none |
+| 3 | permanent again | 01:27:12-01:27:31 | critical raised 01:27:11.9, cleared 01:27:33.9 |
+| 4 | plus U03UI, drawn in the console, CONDITIONAL, edited there to 600-800 m AMSL | 01:33:31-01:33:50 | U03UI warning raised 01:33:21.9, cleared 01:33:34.9; U03AMSL critical raised 01:33:30.9, cleared 01:33:53.9 |
+
+A third zone, 0-120 m AGL over the same square, raised nothing in every
+run and was counted as not evaluated (20 checks a pass), with the log
+naming `TERRAIN_DIR`. Zones were created at 01:20:55 and loaded at
+01:21:43, inside the 60 s refresh. Each transition is an `events` row.
 
 ## Result, 2026-09-29
 
