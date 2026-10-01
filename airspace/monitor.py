@@ -65,11 +65,13 @@ minimum. Compared as AMSL it could hide a conflict or invent one. Such a
 track's vertical position is unknown: a pair with one is judged on the
 horizontal criteria alone, as though the vertical minimum were not met, and
 the alert says `vertical_separation_known: false` with `d_alt_at_cpa_m`
-null. A zone's altitude band is widened by `pressure_uncertainty_m` (250 m)
-each way for it, and the height limit is exceeded only if it still is with
-that margin taken off; either alert is then a warning, whatever the zone,
-and says `vertical_known: false`. Zones without altitude limits are judged
-as for anyone. Each such message is counted (`vertical_unknown`, in the
+null. A zone with an altitude band raises as usual when the indicated
+altitude is inside the band, a no-fly zone at critical; inside the band
+widened by `pressure_uncertainty_m` (250 m) each way only, it raises a
+warning. The height limit is judged on the indicated height. Each of those
+alerts says `vertical_known: false`, with the margin. Zones without
+altitude limits are judged as for anyone. An active alert whose severity
+changes is raised again under its key, never changed silently in place. Each such message is counted (`vertical_unknown`, in the
 status line) and the first of a run per aircraft is logged.
 
 Two Remote ID tracks with the same transmitter address, one of them
@@ -722,13 +724,19 @@ class AirspaceMonitor:
         raised: list[Alert] = []
         for zone in self.zones:
             key = zone_key(track.drone_id, zone)
-            # S-33: with the altitude a pressure altitude, the band is
-            # widened by its uncertainty, conservatively, and the alert is
-            # a warning that says the altitude is approximate.
+            # S-33: with the altitude a pressure altitude, the band is also
+            # widened by its uncertainty, conservatively. Indicated inside
+            # the band itself keeps the zone's severity; inside the widened
+            # band alone is a warning. Either says the altitude is
+            # approximate.
             approximate = not track.vertical_known and zone.has_altitude_limits
             margin_m = self.pressure_uncertainty_m if approximate else 0.0
-            if not zone.contains(
-                track.lat_deg, track.lon_deg, track.alt_amsl_m, margin_m=margin_m
+            inside = zone.contains(track.lat_deg, track.lon_deg, track.alt_amsl_m)
+            if not inside and not (
+                approximate
+                and zone.contains(
+                    track.lat_deg, track.lon_deg, track.alt_amsl_m, margin_m=margin_m
+                )
             ):
                 continue
             detail: dict[str, Any] = {
@@ -740,23 +748,45 @@ class AirspaceMonitor:
             if approximate:
                 detail["vertical_known"] = False
                 detail["pressure_uncertainty_m"] = margin_m
+                detail["within_band"] = inside
             alert = Alert(
                 key=key,
                 kind=AlertKind.ZONE,
                 severity=(
                     Severity.CRITICAL
-                    if zone.type is ZoneType.NO_FLY and not approximate
+                    if zone.type is ZoneType.NO_FLY and inside
                     else Severity.WARNING
                 ),
                 drone_ids=(track.drone_id,),
                 labels=(self._labels.get(track.drone_id),),
                 detail=detail,
             )
-            self._last_true_s[key] = now_s
-            if key not in self._active:
-                raised.append(alert)
-            self._active[key] = alert
+            raised.extend(self._refresh(alert, now_s))
         return raised
+
+    def _refresh(self, alert: Alert, now_s: float) -> list[Alert]:
+        """Hold `alert` active, refreshed with its latest numbers; return
+        it when that is a transition the bus and audit log must carry: newly
+        true, or true at another severity. A severity change is raised again
+        under the same key, never changed silently in place (S-33)."""
+        key = alert.key
+        self._last_true_s[key] = now_s
+        previous = self._active.get(key)
+        self._active[key] = alert
+        if previous is None:
+            return [alert]
+        if previous.severity is not alert.severity:
+            _log.info(
+                "alert severity changed",
+                extra={
+                    "key": key,
+                    "drone_id": str(alert.drone_ids[0]),
+                    "before": previous.severity.value,
+                    "after": alert.severity.value,
+                },
+            )
+            return [alert]
+        return []
 
     def _check_height(self, track: Track, now_s: float) -> list[Alert]:
         if self.terrain is None or self.max_height_agl_m is None:
@@ -765,10 +795,9 @@ class AirspaceMonitor:
         if ground is None:
             return []
         height_agl_m = track.alt_amsl_m - ground.elevation_m
-        # S-33: a pressure altitude is over the limit only if it still is
-        # with its whole uncertainty taken off.
-        margin_m = 0.0 if track.vertical_known else self.pressure_uncertainty_m
-        if height_agl_m - margin_m <= self.max_height_agl_m:
+        # S-33: a pressure altitude is judged as indicated, and the alert
+        # says it is approximate, to within the uncertainty margin.
+        if height_agl_m <= self.max_height_agl_m:
             return []
         key = height_key(track.drone_id)
         detail: dict[str, Any] = {
@@ -780,7 +809,7 @@ class AirspaceMonitor:
         }
         if not track.vertical_known:
             detail["vertical_known"] = False
-            detail["pressure_uncertainty_m"] = margin_m
+            detail["pressure_uncertainty_m"] = self.pressure_uncertainty_m
         alert = Alert(
             key=key,
             kind=AlertKind.HEIGHT,
@@ -789,11 +818,8 @@ class AirspaceMonitor:
             labels=(self._labels.get(track.drone_id),),
             detail=detail,
         )
-        self._last_true_s[key] = now_s
-        raised = [] if key in self._active else [alert]
         # Refreshed either way: the height changes as the aircraft climbs.
-        self._active[key] = alert
-        return raised
+        return self._refresh(alert, now_s)
 
     # --- clearing --------------------------------------------------------------
 

@@ -56,10 +56,12 @@ address for instance, are judged like any pair.
 A track whose altitude is a Remote ID pressure altitude (`alt_source:
 "pressure"`, S-33) has no known vertical position. Conflicts with it are
 judged on the horizontal criteria alone, and say
-`vertical_separation_known: false`. Zone altitude bands are widened by
-`PRESSURE_UNCERTAINTY_M` (250 m) for it, and the height limit is exceeded
-only if it still is with that margin taken off; those alerts are warnings
-saying `vertical_known: false`. Messages are counted in `vertical_unknown`.
+`vertical_separation_known: false`. Inside a zone's altitude band as
+indicated, it raises as anyone would, a no-fly zone at critical; inside the
+band widened by `PRESSURE_UNCERTAINTY_M` (250 m) only, a warning. The
+height limit is judged on the indicated height. Those alerts say
+`vertical_known: false`. Messages are counted in `vertical_unknown`. An
+alert whose severity changes is raised again, not changed in place.
 
 Rejected messages, failed checks, unreadable tiles and audit-queue losses are
 counted and logged in the `airspace monitor status` line every minute.

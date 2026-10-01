@@ -63,8 +63,9 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     )
     # S-33. How far a Remote ID pressure altitude may be from AMSL: about
     # 8 m per hPa between the local QNH and 1013.25 hPa, so 250 m covers a
-    # 30 hPa day. Zone bands are widened by it, and the height limit is
-    # judged with it taken off, for an aircraft on pressure altitude.
+    # 30 hPa day. For an aircraft on pressure altitude, a zone's band is
+    # widened by it (inside the widened band only: a warning), and alerts
+    # say the altitude is approximate to within it.
     pressure_uncertainty_m: float = Field(
         default=250.0, ge=0, validation_alias="PRESSURE_UNCERTAINTY_M"
     )
