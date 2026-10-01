@@ -8,8 +8,14 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from airspace.policy import PolicyMissingError, load_height_limit, load_policy
-from airspace.zones import ZoneType, load_zones
+from airspace.ed269 import Restriction, VerticalReference
+from airspace.policy import (
+    PolicyMissingError,
+    load_conditional_zone_severity,
+    load_height_limit,
+    load_policy,
+)
+from airspace.zones import Limit, load_zones
 
 pytestmark = pytest.mark.postgres
 
@@ -19,14 +25,22 @@ SQUARE = "POLYGON((44.80 41.70, 44.82 41.70, 44.82 41.72, 44.80 41.72, 44.80 41.
 @pytest.fixture
 async def zones(relational_engine: AsyncEngine) -> AsyncIterator[None]:
     async with relational_engine.begin() as connection:
-        for name, kind in (("pg-no-fly", "no_fly"), ("pg-corridor", "corridor")):
+        for name, kind, restriction, identifier in (
+            ("pg-no-fly", "geozone", "PROHIBITED", "PGNOFLY"),
+            ("pg-info", "geozone", "NO_RESTRICTION", "PGINFO"),
+            ("pg-corridor", "corridor", "NO_RESTRICTION", "PGCORR"),
+        ):
             await connection.execute(
                 sa.text(
                     "INSERT INTO airspace_zones "
-                    "(name, type, geom, min_alt_amsl_m, max_alt_amsl_m) "
-                    "VALUES (:n, :t, ST_GeomFromText(:w, 4326), 400, 700)"
+                    "(name, type, geom, identifier, country, ed269_type, "
+                    " restriction, zone_authority, applicability, uom_dimensions, "
+                    " lower_limit, lower_reference, upper_limit, upper_reference) "
+                    "VALUES (:n, :t, ST_GeomFromText(:w, 4326), :i, 'GEO', "
+                    " 'COMMON', :r, '[]', '[{\"permanent\": \"YES\"}]', 'M', "
+                    " 400, 'AMSL', 700, 'AMSL')"
                 ),
-                {"n": name, "t": kind, "w": SQUARE},
+                {"n": name, "t": kind, "w": SQUARE, "r": restriction, "i": identifier},
             )
     yield
     async with relational_engine.begin() as connection:
@@ -119,16 +133,47 @@ async def test_a_missing_policy_is_refused_rather_than_guessed(
             )
 
 
-async def test_zones_load_with_their_band_and_only_enforceable_types(
+async def test_zones_load_with_their_limits_and_only_those_that_restrict(
     relational_engine: AsyncEngine, zones: None
 ) -> None:
     loaded = [
-        z for z in await load_zones(relational_engine) if z.name.startswith("pg-")
+        z
+        for z in await load_zones(relational_engine)
+        if (z.name or "").startswith("pg-")
     ]
 
+    # NO_RESTRICTION zones and corridors are drawn, never alerted on.
     assert [z.name for z in loaded] == ["pg-no-fly"]
     zone = loaded[0]
-    assert zone.type is ZoneType.NO_FLY
-    assert (zone.min_alt_amsl_m, zone.max_alt_amsl_m) == (400, 700)
-    assert zone.contains(41.71, 44.81, 500)
-    assert not zone.contains(41.71, 44.81, 800)
+    assert zone.restriction is Restriction.PROHIBITED
+    assert zone.lower == Limit(400.0, VerticalReference.AMSL)
+    assert zone.upper == Limit(700.0, VerticalReference.AMSL)
+    assert zone.contains_horizontally(41.71, 44.81)
+    assert not zone.contains_horizontally(41.73, 44.81)
+
+
+async def test_the_conditional_zone_severity_is_seeded_warning_and_can_be_info(
+    relational_engine: AsyncEngine,
+) -> None:
+    assert await load_conditional_zone_severity(relational_engine) == "warning"
+    try:
+        async with relational_engine.begin() as connection:
+            await connection.execute(
+                sa.text("UPDATE airspace_policy SET conditional_zone_severity = 'info'")
+            )
+        assert await load_conditional_zone_severity(relational_engine) == "info"
+        with pytest.raises(sa.exc.IntegrityError):
+            async with relational_engine.begin() as connection:
+                await connection.execute(
+                    sa.text(
+                        "UPDATE airspace_policy "
+                        "SET conditional_zone_severity = 'critical'"
+                    )
+                )
+    finally:
+        async with relational_engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    "UPDATE airspace_policy SET conditional_zone_severity = 'warning'"
+                )
+            )

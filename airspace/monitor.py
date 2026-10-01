@@ -85,6 +85,27 @@ the service logs it at start-up. The DEM is a surface model accurate to a few
 metres (`docs/runbooks/p5-00-terrain.md`), so an aircraft near the limit over
 trees or roofs can be flagged a few metres early.
 
+## Geographical zones (P5-15, U-03)
+
+Zones are ED-269 zones (`airspace/zones.py`). An aircraft is in one when the
+zone applies at the track's placed time (`captured_at`, in UTC), the
+aircraft is inside it horizontally, and every vertical limit that can be
+judged includes it. What it raises depends on the zone's restriction:
+
+| restriction | alert |
+|---|---|
+| PROHIBITED | critical |
+| REQ_AUTHORISATION | warning; none for an aircraft U-05 authorised (the `authorisations` seam, empty until U-05) |
+| CONDITIONAL | info or warning, as `airspace_policy.conditional_zone_severity` says |
+| NO_RESTRICTION | none |
+
+A limit above the ground needs the DEM, and one above the ellipsoid needs the
+geoid. Where either is missing, a zone the aircraft is horizontally inside
+is **not evaluated** for that aircraft, exactly as the height limit is not:
+no alert is raised, an active one is neither refreshed nor cleared, and the
+count (`zone_checks_not_evaluated`) is in the status line, logged once per
+zone and aircraft until it can be judged again.
+
 ## Stage 0: an alert, not a resolution
 
 The alert names both aircraft, the time to closest approach and the distance.
@@ -104,10 +125,11 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from airspace.cpa import Approach, SeparationPolicy, Track, closest_approach
+from airspace.ed269 import Restriction, VerticalReference
 from airspace.neighbours import NeighbourIndex
-from airspace.zones import Zone, ZoneType
+from airspace.zones import Undulation, Zone
 from common import get_logger
-from common.terrain import Elevation
+from common.terrain import Elevation, TerrainFileError
 
 _log = get_logger(__name__)
 
@@ -115,6 +137,8 @@ _log = get_logger(__name__)
 class Severity(StrEnum):
     CRITICAL = "critical"
     WARNING = "warning"
+    # A CONDITIONAL zone, when policy says so (U-03).
+    INFO = "info"
 
 
 class AlertKind(StrEnum):
@@ -127,6 +151,14 @@ class GroundElevation(Protocol):
     """`common.terrain.Terrain`, or anything that answers like it."""
 
     def elevation(self, lat_deg: float, lon_deg: float) -> Elevation | None: ...
+
+
+class Authorisations(Protocol):
+    """Whether an aircraft is authorised to be in a REQ_AUTHORISATION zone at
+    a time. The seam for U-05's flight authorisations: until U-05 there is
+    no implementation, and every such incursion is a warning."""
+
+    def authorised(self, drone_id: UUID, zone: Zone, at: datetime) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +308,26 @@ def height_key(drone_id: UUID) -> str:
     return f"height:{drone_id}"
 
 
+def _limits_detail(
+    zone: Zone, heights: dict[VerticalReference, float | None]
+) -> dict[str, Any]:
+    """The zone's limits in metres with their references, and the aircraft's
+    height in each, for the operator reading the alert."""
+    detail: dict[str, Any] = {}
+    for name, limit in (("lower", zone.lower), ("upper", zone.upper)):
+        if limit is not None:
+            detail[f"{name}_limit_m"] = round(limit.value_m, 1)
+            detail[f"{name}_reference"] = limit.reference.value
+    names = {
+        VerticalReference.AGL: "height_agl_m",
+        VerticalReference.WGS84: "alt_hae_m",
+    }
+    for reference, height in heights.items():
+        if reference in names and height is not None:
+            detail[names[reference]] = round(height, 1)
+    return detail
+
+
 @dataclass
 class AirspaceMonitor:
     policy: SeparationPolicy
@@ -283,6 +335,13 @@ class AirspaceMonitor:
     # Both needed for the height limit; with either missing it is not checked.
     terrain: GroundElevation | None = None
     max_height_agl_m: float | None = None
+    # For zone limits above the ellipsoid (WGS84); without it they are not
+    # evaluated (U-03).
+    geoid: Undulation | None = None
+    # What a CONDITIONAL zone raises: airspace_policy.conditional_zone_severity.
+    conditional_severity: Severity = Severity.WARNING
+    # U-05's seam; see `Authorisations`.
+    authorisations: Authorisations | None = None
     stale_after_s: float = 15.0
     clear_after_s: float = 3.0
     # S-11; the defaults match `airspace.config.AirspaceSettings`.
@@ -311,6 +370,12 @@ class AirspaceMonitor:
     # Checks that raised instead of answering (S-12). Each is logged with its
     # traceback; the count is here so a test, or a health report, can see it.
     check_failures: int = field(default=0, init=False)
+    # Zone checks that could not be judged: the aircraft was inside a zone
+    # horizontally and a limit needed terrain or the geoid that was missing.
+    zone_checks_not_evaluated: int = field(default=0, init=False)
+    _zone_unevaluated_logged: set[str] = field(default_factory=set, init=False)
+    # Whether the caller could read the terrain under this message (S-13).
+    _height_available: bool = field(default=True, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     # The latest (`ts`, `rx_ts`) each source gave for each aircraft, so a
@@ -375,6 +440,7 @@ class AirspaceMonitor:
         """
         drone_id = UUID(str(message["drone_id"]))
         self._labels[drone_id] = message.get("label")
+        self._height_available = height_available
         track = (
             track_from_telemetry(message, arrived_at_s=now_s)
             if _flying(message)
@@ -600,34 +666,143 @@ class AirspaceMonitor:
             },
         )
 
+    def zone_severity(self, zone: Zone) -> Severity | None:
+        """What being in this zone raises; None for a zone that raises nothing."""
+        if zone.restriction is Restriction.PROHIBITED:
+            return Severity.CRITICAL
+        if zone.restriction is Restriction.REQ_AUTHORISATION:
+            return Severity.WARNING
+        if zone.restriction is Restriction.CONDITIONAL:
+            return self.conditional_severity
+        return None
+
     def _check_zones(self, track: Track, now_s: float) -> list[Alert]:
+        """`now_s` is the track's placed time; a zone's applicability is
+        judged at it, in UTC, not at the monitor's wall clock."""
         raised: list[Alert] = []
+        at = datetime.fromtimestamp(now_s, tz=UTC)
         for zone in self.zones:
-            if not zone.contains(track.lat_deg, track.lon_deg, track.alt_amsl_m):
+            severity = self.zone_severity(zone)
+            if severity is None:
+                continue
+            if not zone.applies_at(at):
+                continue
+            if not zone.contains_horizontally(track.lat_deg, track.lon_deg):
                 continue
             key = zone_key(track.drone_id, zone)
+            inside, heights = self._vertically_inside(zone, track)
+            if inside is None:
+                self._zone_not_evaluated(key, zone, track, heights)
+                continue
+            self._zone_unevaluated_logged.discard(key)
+            if not inside:
+                continue
+            if (
+                zone.restriction is Restriction.REQ_AUTHORISATION
+                and self.authorisations is not None
+                and self.authorisations.authorised(track.drone_id, zone, at)
+            ):
+                continue
             alert = Alert(
                 key=key,
                 kind=AlertKind.ZONE,
-                severity=(
-                    Severity.CRITICAL
-                    if zone.type is ZoneType.NO_FLY
-                    else Severity.WARNING
-                ),
+                severity=severity,
                 drone_ids=(track.drone_id,),
                 labels=(self._labels.get(track.drone_id),),
                 detail={
                     "zone_id": str(zone.zone_id),
+                    "identifier": zone.identifier,
                     "zone_name": zone.name,
-                    "zone_type": zone.type.value,
+                    "restriction": zone.restriction.value,
+                    "reason": list(zone.reason),
+                    "message": zone.message,
                     "alt_amsl_m": round(track.alt_amsl_m, 1),
+                    **_limits_detail(zone, heights),
                 },
             )
             self._last_true_s[key] = now_s
             if key not in self._active:
                 raised.append(alert)
+            # Refreshed either way: the heights change as the aircraft moves.
             self._active[key] = alert
         return raised
+
+    def _vertically_inside(
+        self, zone: Zone, track: Track
+    ) -> tuple[bool | None, dict[VerticalReference, float | None]]:
+        """Whether the zone's limits include the aircraft: None when a limit
+        that would decide cannot be judged. Also the aircraft's height in
+        each reference the zone uses (None where unknown)."""
+        heights = {
+            reference: self._height_in(reference, track)
+            for reference in zone.references
+        }
+        undecided = False
+        for limit, is_lower in ((zone.lower, True), (zone.upper, False)):
+            if limit is None:
+                continue
+            height_m = heights[limit.reference]
+            if height_m is None:
+                undecided = True
+                continue
+            if (is_lower and height_m < limit.value_m) or (
+                not is_lower and height_m > limit.value_m
+            ):
+                return False, heights
+        return (None if undecided else True), heights
+
+    def _height_in(self, reference: VerticalReference, track: Track) -> float | None:
+        """The aircraft's height in a zone limit's reference, from its AMSL
+        altitude; None where the terrain or the geoid needed is unknown."""
+        if reference is VerticalReference.AMSL:
+            return track.alt_amsl_m
+        if reference is VerticalReference.AGL:
+            ground = self._ground(track)
+            return None if ground is None else track.alt_amsl_m - ground.elevation_m
+        if self.geoid is None:
+            return None
+        return track.alt_amsl_m + self.geoid.undulation_m(track.lat_deg, track.lon_deg)
+
+    def _ground(self, track: Track) -> Elevation | None:
+        """The ground under the aircraft, or None when it is not known: no
+        terrain, a tile the service could not read for this message, or a
+        cell that was never fetched. Never zero for unknown."""
+        if self.terrain is None or not self._height_available:
+            return None
+        try:
+            return self.terrain.elevation(track.lat_deg, track.lon_deg)
+        except TerrainFileError:
+            return None
+
+    def _zone_not_evaluated(
+        self,
+        key: str,
+        zone: Zone,
+        track: Track,
+        heights: dict[VerticalReference, float | None],
+    ) -> None:
+        self._unevaluated_keys.add(key)
+        self.zone_checks_not_evaluated += 1
+        if key in self._zone_unevaluated_logged:
+            return
+        self._zone_unevaluated_logged.add(key)
+        missing = sorted(ref.value for ref, height in heights.items() if height is None)
+        _log.warning(
+            "zone not evaluated: a limit needs a height that is not known here",
+            extra={
+                "drone_id": str(track.drone_id),
+                "zone_id": str(zone.zone_id),
+                "identifier": zone.identifier,
+                "missing_references": missing,
+                "needs": [
+                    "terrain (TERRAIN_DIR)" if ref == "AGL" else "geoid (GEOID_PATH)"
+                    for ref in missing
+                ],
+                "lat_deg": track.lat_deg,
+                "lon_deg": track.lon_deg,
+                "zone_checks_not_evaluated": self.zone_checks_not_evaluated,
+            },
+        )
 
     def _check_height(self, track: Track, now_s: float) -> list[Alert]:
         if self.terrain is None or self.max_height_agl_m is None:

@@ -19,7 +19,9 @@ from airspace.monitor import (
     Severity,
     conflict_key,
 )
-from airspace.zones import zone_from_geojson
+from airspace.tests.zone_helpers import square
+from airspace.tests.zone_helpers import zone as make_zone
+from airspace.zones import Zone
 
 A = UUID(int=1)
 B = UUID(int=2)
@@ -185,21 +187,15 @@ def test_a_message_without_velocity_places_nothing() -> None:
     assert len(monitor.index) == 0
 
 
-def zone(kind: str) -> Any:
-    square = [
-        [LON0 - 0.01, LAT0 - 0.01],
-        [LON0 + 0.01, LAT0 - 0.01],
-        [LON0 + 0.01, LAT0 + 0.01],
-        [LON0 - 0.01, LAT0 + 0.01],
-        [LON0 - 0.01, LAT0 - 0.01],
-    ]
-    return zone_from_geojson(
-        zone_id=UUID(int=77),
+def zone(kind: str) -> Zone:
+    """A permanent square around LAT0, LON0 from the ground up: `no_fly` is
+    PROHIBITED and `restricted` REQ_AUTHORISATION, as migration 0006 maps
+    the zones that existed before U-03."""
+    restriction = {"no_fly": "PROHIBITED", "restricted": "REQ_AUTHORISATION"}[kind]
+    return make_zone(
         name="Parliament",
-        zone_type=kind,
-        geojson=json.dumps({"type": "Polygon", "coordinates": [square]}),
-        min_alt_amsl_m=None,
-        max_alt_amsl_m=None,
+        restriction=restriction,
+        coordinates=square(LAT0, LON0),
     )
 
 
