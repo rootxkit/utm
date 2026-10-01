@@ -144,7 +144,7 @@ Do not add a dependency without a one-line justification in the commit body.
   | Tree | Database | Owns |
   |---|---|---|
   | `infra/migrations/telemetry/` | TimescaleDB | ingest index, archive index, `ingest_events`, `drone_state` (P1-04), `drone_firmware` (P1-11) |
-  | `infra/migrations/relational/` | PostgreSQL + PostGIS | `ARCHITECTURE.md` §5: `bases`, `drones`, `pilots`, `airspace_zones`, `events` (P2-01); `uas_operators`, `pilot_competencies` (U-01); `incidents` (M-02) not yet |
+  | `infra/migrations/relational/` | PostgreSQL + PostGIS | `ARCHITECTURE.md` §5: `bases`, `drones`, `pilots`, `airspace_zones`, `events` (P2-01); `uas_operators`, `pilot_competencies` (U-01); `source_controls` (U-15); `incidents` (M-02) not yet |
 
   They are separate databases with separate version tables
   (`alembic_version_telemetry`, `alembic_version_relational`) and separate

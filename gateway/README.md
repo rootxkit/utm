@@ -10,6 +10,16 @@ observations arrive through `python -m gateway.remote_id_ingest`.
 
 Safety-relevant: `mypy --strict` and an 80% coverage target apply here.
 
+## Sources switched off (U-15)
+
+Each relay station, each Remote ID receiver, and each type as a whole can be
+switched off without a restart. Both adapters follow the switches the API
+publishes on NATS (`common/sources.py`), never the relational database. A
+disabled station is refused at the upgrade with 503 and closed with 1013;
+a disabled receiver's datagrams are dropped. Both count what they refuse
+and publish `source.<type>`. `docs/runbooks/u15-source-control.md` has the
+whole path.
+
 ## Time on the bus (`telemetry.<drone_id>`)
 
 Remote ID observations also say whether they are identified

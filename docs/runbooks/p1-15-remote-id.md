@@ -347,6 +347,13 @@ signed datagrams. Every position was compared with the same vehicle's
   the laptop, so both processes used a flat 15.9 m grid. The HAE to AMSL
   round trip is checked; EGM2008 itself is not.
 
+## Receivers switched off (U-15)
+
+A receiver, or Remote ID as a whole, switched off through the API has its
+datagrams dropped after authentication and before the tracker: nothing is
+stored or published, and `dropped_source_disabled` in the status line
+counts them. `docs/runbooks/u15-source-control.md`.
+
 ## Our own aircraft broadcasting
 
 Register the serial its Remote ID module broadcasts. Through the API,
