@@ -20,6 +20,17 @@ import {
 
 type Kind = "operators" | "aircraft" | "pilots";
 const PAGE = 200;
+// How long typing must pause before the list is asked for again.
+const SEARCH_DEBOUNCE_MS = 300;
+
+function useDebounced<T>(value: T, delayMs: number): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSettled(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [value, delayMs]);
+  return settled;
+}
 
 function StatusPill({ value }: { value: Standing }) {
   const { t } = useI18n();
@@ -50,17 +61,23 @@ export function RegistryView({ isAdmin, now }: Props) {
   const [revision, setRevision] = useState(0);
 
   const reload = useCallback(() => setRevision((n) => n + 1), []);
+  const settledQuery = useDebounced(query, SEARCH_DEBOUNCE_MS);
 
   useEffect(() => {
-    const filters = registryQuery({ q: query, status, limit: PAGE });
+    // A slower, older answer must not overwrite a newer one.
+    let current = true;
+    const filters = registryQuery({ q: settledQuery, status, limit: PAGE });
     const load =
       kind === "operators"
-        ? apiGet("/uas/operators", filters).then(setOperators)
+        ? apiGet("/uas/operators", filters).then((rows) => current && setOperators(rows))
         : kind === "aircraft"
-          ? apiGet("/uas/aircraft", filters).then(setAircraft)
-          : apiGet("/uas/pilots", filters).then(setPilots);
-    load.then(() => setFailed(false)).catch(() => setFailed(true));
-  }, [kind, query, status, revision]);
+          ? apiGet("/uas/aircraft", filters).then((rows) => current && setAircraft(rows))
+          : apiGet("/uas/pilots", filters).then((rows) => current && setPilots(rows));
+    load.then(() => current && setFailed(false)).catch(() => current && setFailed(true));
+    return () => {
+      current = false;
+    };
+  }, [kind, settledQuery, status, revision]);
 
   return (
     <div className="registry">
@@ -103,15 +120,18 @@ export function RegistryView({ isAdmin, now }: Props) {
           </select>
         </div>
         {failed && <p className="muted">{t("reg_unavailable")}</p>}
-        {kind === "operators" && (
-          <OperatorTable operators={operators} now={now} onSelect={setSelected} />
-        )}
-        {kind === "aircraft" && (
-          <AircraftTable aircraft={aircraft} isAdmin={isAdmin} onChanged={reload} />
-        )}
-        {kind === "pilots" && (
-          <PilotTable pilots={pilots} now={now} isAdmin={isAdmin} onChanged={reload} />
-        )}
+        {/* After a failed read the last list is dimmed: it no longer answers the filter. */}
+        <div className={failed ? "stale" : undefined} aria-busy={failed}>
+          {kind === "operators" && (
+            <OperatorTable operators={operators} now={now} onSelect={setSelected} />
+          )}
+          {kind === "aircraft" && (
+            <AircraftTable aircraft={aircraft} isAdmin={isAdmin} onChanged={reload} />
+          )}
+          {kind === "pilots" && (
+            <PilotTable pilots={pilots} now={now} isAdmin={isAdmin} onChanged={reload} />
+          )}
+        </div>
       </div>
       {selected && (
         <OperatorDetail
@@ -413,9 +433,16 @@ function OperatorDetail({
     [t("reg_type"), t(`type_${operator.operator_type}`)],
     [
       t("reg_contact"),
-      [operator.contact_email, operator.contact_phone].filter(Boolean).join(" · ") || DASH,
+      operator.contact
+        ? [operator.contact.contact_email, operator.contact.contact_phone]
+            .filter(Boolean)
+            .join(" · ") || DASH
+        : t("reg_contact_hidden"),
     ],
-    [t("reg_address"), operator.postal_address ?? DASH],
+    [
+      t("reg_address"),
+      operator.contact ? (operator.contact.postal_address ?? DASH) : t("reg_contact_hidden"),
+    ],
     [t("reg_valid_until"), date(operator.valid_until)],
     [t("reg_source"), t(`source_${operator.source}`)],
   ];

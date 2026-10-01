@@ -469,6 +469,9 @@ button.link {
   color: var(--muted);
   font-weight: normal;
 }
+.registry .stale {
+  opacity: 0.45;
+}
 .registry-lookup {
   margin-bottom: 12px;
 }
