@@ -6,10 +6,22 @@ from pathlib import Path
 
 from pydantic import Field
 
-from common import NatsSettings, PostgresSettings, RedisSettings, ServiceSettings
+from common import (
+    NatsSettings,
+    PostgresSettings,
+    RedisSettings,
+    ServiceSettings,
+    SourceControlSettings,
+)
 
 
-class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSettings):
+class AirspaceSettings(
+    ServiceSettings,
+    PostgresSettings,
+    RedisSettings,
+    NatsSettings,
+    SourceControlSettings,
+):
     """Everything the airspace monitor needs to start.
 
     Separation minima, height limits and alert thresholds are not here. They
