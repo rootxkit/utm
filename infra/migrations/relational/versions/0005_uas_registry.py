@@ -70,6 +70,15 @@ label was never recorded. MTOM is in grams, like `max_payload_g`.
 One row per pilot and competency (A1/A3, A2, STS-01, STS-02), with the
 certificate reference and its expiry. Recording a competency again replaces
 its row; the history is in `events`.
+
+## What a downgrade discards
+
+Everything U-01 registered, except its audit trail: `uas_operators` and
+`pilot_competencies` are dropped, and `drones` and `pilots` lose their
+operator, class label, MTOM and registration status. Third-party UAS and
+remote pilots stay as rows in `drones` and `pilots`, where they can no longer
+be told from the fleet, and UAS stay in `known_drones`. `events` keeps every
+row about them. Export the registry first (`/uas`) if it is to be restored.
 """
 
 from __future__ import annotations

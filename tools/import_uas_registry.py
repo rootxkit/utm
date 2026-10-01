@@ -49,10 +49,13 @@ UAS, keyed by `serial`:
   partial; revoking what it leaves out would be a guess.
 - **Revoked is final.** A revoked record the file lists as anything else is
   refused, not reactivated.
-- Each record is its own transaction, audited in `events` like a change
-  through the API, as done by the `import` actor named by `--by`. A refused
-  record is reported and the rest are still imported. Operators go first, so
-  a UAS may name an operator from the same run.
+- Records are written through the registry, as changes through the API
+  are, and audited in `events` as done by the `import` actor named by
+  `--by`. A record is up to two transactions, not one: its field changes,
+  then its status change. If the second fails, the first stands and the
+  record is reported refused; running the import again finishes it. A
+  refused record does not stop the rest. Operators go first, so a UAS may
+  name an operator from the same run.
 - **`--dry-run` writes nothing** and reports what would be done. It checks
   everything this tool checks, but not what only the database refuses (a
   duplicate label, say); those surface on the real run.
