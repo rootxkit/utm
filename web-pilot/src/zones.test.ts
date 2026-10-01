@@ -10,6 +10,7 @@ import {
   featureFromForm,
   formFromFeature,
   limitsText,
+  simpleRing,
   zoneStyle,
 } from "./zones";
 
@@ -205,6 +206,52 @@ describe("formFromFeature", () => {
     const { form: edited, shape } = formFromFeature(circle);
     expect(shape).toEqual({ kind: "circle", center: [44.9, 41.75], radius: 250.5 });
     expect(featureFromForm(edited, shape).feature).toEqual(circle);
+  });
+});
+
+describe("simpleRing", () => {
+  it("accepts a square, closed or open", () => {
+    expect(simpleRing(SQUARE)).toBe(true);
+    expect(simpleRing(closeRing(SQUARE))).toBe(true);
+  });
+
+  it("refuses a bow tie and collinear corners", () => {
+    const bowTie: LonLat[] = [
+      [44.8, 41.7],
+      [44.81, 41.71],
+      [44.81, 41.7],
+      [44.8, 41.71],
+    ];
+    const collinear: LonLat[] = [
+      [44.8, 41.7],
+      [44.805, 41.7],
+      [44.81, 41.7],
+    ];
+    expect(simpleRing(bowTie)).toBe(false);
+    expect(simpleRing(collinear)).toBe(false);
+  });
+
+  it("refuses a ring whose edge runs back along another", () => {
+    const spike: LonLat[] = [
+      [44.8, 41.7],
+      [44.81, 41.7],
+      [44.81, 41.71],
+      [44.805, 41.7],
+    ];
+    expect(simpleRing(spike)).toBe(false);
+  });
+
+  it("is what the form says about a drawn bow tie", () => {
+    const { errors } = featureFromForm(form(), {
+      kind: "polygon",
+      points: [
+        [44.8, 41.7],
+        [44.81, 41.71],
+        [44.81, 41.7],
+        [44.8, 41.71],
+      ],
+    });
+    expect(errors.map((e) => e.key)).toEqual(["zone_error_self_intersecting"]);
   });
 });
 

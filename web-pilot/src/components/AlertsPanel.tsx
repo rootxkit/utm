@@ -119,6 +119,16 @@ export function AlertsPanel({
                   {d.height_agl_m !== undefined && ` · ${num(d.height_agl_m, 0, "m AGL")}`}
                   {d.alt_hae_m !== undefined && ` · ${num(d.alt_hae_m, 0, "m WGS84")}`}
                 </div>
+                {d.limit_not_judged && (
+                  <div className="small">
+                    {t("zone_limit_not_judged", { refs: (d.not_judged ?? []).join(", ") })}
+                  </div>
+                )}
+                {d.vertical_known === false && d.pressure_uncertainty_m !== undefined && (
+                  <div className="small">
+                    {t("zone_pressure_altitude", { m: d.pressure_uncertainty_m })}
+                  </div>
+                )}
                 {d.message && <div className="small">{d.message}</div>}
               </>
             )}

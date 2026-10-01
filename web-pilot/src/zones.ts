@@ -82,6 +82,7 @@ export type FormErrorKey =
   | "zone_error_band"
   | "zone_error_no_shape"
   | "zone_error_polygon"
+  | "zone_error_self_intersecting"
   | "zone_error_radius"
   | "zone_error_window"
   | "zone_error_schedule"
@@ -238,6 +239,8 @@ export function featureFromForm(
     errors.push({ key: "zone_error_no_shape", field: "geometry" });
   } else if (shape.kind === "polygon" && distinct(shape.points) < 3) {
     errors.push({ key: "zone_error_polygon", field: "geometry" });
+  } else if (shape.kind === "polygon" && !simpleRing(shape.points)) {
+    errors.push({ key: "zone_error_self_intersecting", field: "geometry" });
   } else if (shape.kind === "circle" && !(shape.radius > 0)) {
     errors.push({ key: "zone_error_radius", field: "geometry" });
   }
@@ -314,6 +317,59 @@ function applicability(form: ZoneForm, errors: FormError[]): Ed269Zone["applicab
     errors.push({ key: "zone_error_never", field: "applicability" });
   }
   return period;
+}
+
+// Whether an open ring (as drawn) encloses an area without crossing itself:
+// no zero area (collinear corners) and no two non-adjacent edges touching (a
+// bow tie). The API checks again with PostGIS; this says so before a save.
+export function simpleRing(points: LonLat[]): boolean {
+  const ring = closeRing(points);
+  const n = ring.length - 1;
+  if (n < 3) return false;
+  let twiceArea = 0;
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = ring[i] as LonLat;
+    const [x2, y2] = ring[i + 1] as LonLat;
+    twiceArea += x1 * y2 - x2 * y1;
+  }
+  if (Math.abs(twiceArea) < 1e-14) return false;
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      // Edges sharing a corner touch there by construction.
+      if (j === i + 1 || (i === 0 && j === n - 1)) continue;
+      const [a, b, c, d] = [ring[i], ring[i + 1], ring[j], ring[j + 1]];
+      if (a && b && c && d && segmentsMeet(a, b, c, d)) return false;
+    }
+  }
+  return true;
+}
+
+function orientation(a: LonLat, b: LonLat, c: LonLat): number {
+  const value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+  return value > 0 ? 1 : value < 0 ? -1 : 0;
+}
+
+function onSegment(a: LonLat, b: LonLat, p: LonLat): boolean {
+  return (
+    Math.min(a[0], b[0]) <= p[0] &&
+    p[0] <= Math.max(a[0], b[0]) &&
+    Math.min(a[1], b[1]) <= p[1] &&
+    p[1] <= Math.max(a[1], b[1])
+  );
+}
+
+function segmentsMeet(p1: LonLat, p2: LonLat, q1: LonLat, q2: LonLat): boolean {
+  const o1 = orientation(p1, p2, q1);
+  const o2 = orientation(p1, p2, q2);
+  const o3 = orientation(q1, q2, p1);
+  const o4 = orientation(q1, q2, p2);
+  if (o1 !== o2 && o3 !== o4) return true;
+  return (
+    (o1 === 0 && onSegment(p1, p2, q1)) ||
+    (o2 === 0 && onSegment(p1, p2, q2)) ||
+    (o3 === 0 && onSegment(q1, q2, p1)) ||
+    (o4 === 0 && onSegment(q1, q2, p2))
+  );
 }
 
 function distinct(points: LonLat[]): number {

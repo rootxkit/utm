@@ -111,6 +111,10 @@ export interface Alert {
     vertical_known?: boolean;
     pressure_uncertainty_m?: number;
     within_band?: boolean;
+    // A zone limit above the ground with no terrain to judge it (U-03): the
+    // alert is a warning that may be false, never a missed critical.
+    limit_not_judged?: boolean;
+    not_judged?: string[];
     d_horizontal_now_m?: number;
     // Zones (U-03): the ED-269 zone and the aircraft's height in each
     // reference its limits use.
