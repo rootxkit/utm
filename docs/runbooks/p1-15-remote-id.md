@@ -103,6 +103,25 @@ python -m tools.sitl_remote_id --count 3 --serial 'SITLRID{sysid:04d}' \
   late, signed when it is sent. `--spoof-serial <serial>` broadcasts
   someone else's serial number (U-02).
 
+## Pressure altitude
+
+The AMSL altitude comes from the broadcast's geodetic (ellipsoid) altitude
+through the geoid. When that altitude is missing, or the broadcast flags it
+as poor, the pressure altitude is used instead (S-33).
+
+- **Flagged poor:** its declared vertical accuracy is known and below
+  `REMOTE_ID_MIN_VERTICAL_ACCURACY`. The codes are the standard's, from 1
+  (under 150 m) to 6 (under 1 m). The default is 2, under 45 m, so only
+  "under 150 m" is flagged. An unknown accuracy is not a flag.
+- **Marked:** every observation carries `alt_source` (`geodetic`,
+  `pressure`, or null with no AMSL altitude) and the raw `alt_pressure_m`.
+- **Pressure altitude is not AMSL.** It is referenced to 1013.25 hPa, not
+  to the local QNH, and is off by about 8 m per hPa of difference. Two
+  aircraft both on pressure altitude compare well; one on pressure and one
+  geodetic do not.
+- **Without a geoid**, there is still no AMSL altitude: pressure replaces a
+  poor geodetic altitude, not a missing geoid.
+
 ## Time
 
 The aircraft is placed at the time its Location says it was measured, not
@@ -165,7 +184,8 @@ half second. A row holds:
 - the broadcast identity;
 - the claimed position;
 - both heights: the ellipsoid height as broadcast, and the AMSL height with
-  the geoid model that produced it;
+  the geoid model that produced it, or `pressure altitude, ISA 1013.25 hPa`
+  when it came from the pressure altitude (below);
 - the receiver and transmitter;
 - the raw frame, so the decode can be checked later.
 

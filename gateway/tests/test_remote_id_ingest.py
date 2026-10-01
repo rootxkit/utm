@@ -362,10 +362,12 @@ def test_the_tracker_takes_its_limits_from_the_environment(
     monkeypatch.setenv("REMOTE_ID_BIND_HOST", "127.0.0.1")
     monkeypatch.setenv("REMOTE_ID_TIME_TOLERANCE_S", "0.5")
     monkeypatch.setenv("REMOTE_ID_MAX_LATENCY_S", "2.5")
+    monkeypatch.setenv("REMOTE_ID_MIN_VERTICAL_ACCURACY", "4")
 
     tracker = tracker_from_settings(RemoteIdSettings(_env_file=None), None)  # type: ignore[call-arg]
 
     assert (tracker.time_tolerance_s, tracker.max_latency_s) == (0.5, 2.5)
+    assert tracker.min_vertical_accuracy == 4
 
 
 # --- one of ours broadcasting (serial match) --------------------------------------

@@ -57,6 +57,21 @@ them. `alt_amsl_m` is filled only through a geoid model. Without one it is None,
 which needs an AMSL altitude, does not consider the aircraft: a separation
 computed on a 16 to 23 m error would be a confident wrong answer.
 
+### Pressure altitude (S-33)
+
+When the geodetic altitude is missing (the broadcast's unknown value) or
+flagged inaccurate, its vertical accuracy known and worse than
+`min_vertical_accuracy` (MAV_ODID_VER_ACC: default 2, under 45 m), the
+broadcast's pressure altitude is used for `alt_amsl_m` instead. Pressure
+altitude is referenced to the standard 1013.25 hPa, not to the local QNH,
+so it is AMSL only on a standard day: off by about 8 m per hPa of
+difference. That is why `alt_source` says which was used, `geodetic` or
+`pressure` (None when there is no AMSL altitude), and the raw
+`alt_pressure_m` is carried beside it. An unknown accuracy is not a flag:
+the geodetic altitude is kept. Without a geoid, a usable geodetic altitude
+still gives no AMSL altitude; pressure is a substitute for a bad geodetic
+altitude, not for a missing geoid.
+
 ## Flying
 
 MAVLink telemetry says `armed`; Remote ID says `status`. An observation
@@ -98,6 +113,18 @@ _TS_ACCURACY_STEP_S = 0.1
 
 TIME_SOURCE_BROADCAST = "broadcast"
 TIME_SOURCE_RECEIVER = "receiver"
+
+# S-33. Vertical accuracy codes (MAV_ODID_VER_ACC, pinned against pymavlink
+# in the tests): 0 unknown, then 1 to 6 for under 150, 45, 25, 10, 3 and
+# 1 m. A geodetic altitude whose known accuracy is below this code is not
+# used.
+DEFAULT_MIN_VERTICAL_ACCURACY = 2
+_VERTICAL_ACCURACY_UNKNOWN = 0
+ALT_SOURCE_GEODETIC = "geodetic"
+ALT_SOURCE_PRESSURE = "pressure"
+# What a stored row names as the model behind an AMSL height taken from
+# pressure altitude (`remote_id_observations.geoid_model`).
+PRESSURE_ALTITUDE_MODEL = "pressure altitude, ISA 1013.25 hPa"
 
 
 class Geoid(Protocol):
@@ -142,6 +169,34 @@ def ts_accuracy_s(location: odid.Location) -> float | None:
     if location.ts_accuracy == 0:
         return None
     return location.ts_accuracy * _TS_ACCURACY_STEP_S
+
+
+def geodetic_usable(location: odid.Location, *, min_vertical_accuracy: int) -> bool:
+    """A geodetic altitude is there, and its accuracy is not flagged poor."""
+    if location.alt_hae_m is None:
+        return False
+    accuracy = location.vert_accuracy
+    return accuracy == _VERTICAL_ACCURACY_UNKNOWN or accuracy >= min_vertical_accuracy
+
+
+def amsl(
+    location: odid.Location,
+    geoid: Geoid | None,
+    *,
+    min_vertical_accuracy: int = DEFAULT_MIN_VERTICAL_ACCURACY,
+) -> tuple[float | None, str | None]:
+    """The AMSL altitude and which broadcast altitude it came from (S-33)."""
+    hae_m = location.alt_hae_m
+    if hae_m is not None and geodetic_usable(
+        location, min_vertical_accuracy=min_vertical_accuracy
+    ):
+        if geoid is None or location.lat_deg is None or location.lon_deg is None:
+            return None, None
+        undulation_m = geoid.undulation_m(location.lat_deg, location.lon_deg)
+        return hae_m - undulation_m, ALT_SOURCE_GEODETIC
+    if location.alt_baro_m is not None:
+        return location.alt_baro_m, ALT_SOURCE_PRESSURE
+    return None, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +271,8 @@ class RemoteIdTracker:
     # S-27: see "Time" above.
     time_tolerance_s: float = DEFAULT_TIME_TOLERANCE_S
     max_latency_s: float = DEFAULT_MAX_LATENCY_S
+    # S-33: see "Pressure altitude" above.
+    min_vertical_accuracy: int = DEFAULT_MIN_VERTICAL_ACCURACY
     # Observations whose `captured_at` fell back to the receive time, by
     # reason: unknown, invalid, future, too_old.
     time_fallbacks: Counter[str] = field(default_factory=Counter, init=False)
@@ -268,16 +325,9 @@ class RemoteIdTracker:
         frame: Frame,
     ) -> dict[str, Any]:
         vn, ve, vd = _velocity_ned(location)
-        alt_amsl = None
-        if (
-            self.geoid is not None
-            and location.alt_hae_m is not None
-            and location.lat_deg is not None
-            and location.lon_deg is not None
-        ):
-            alt_amsl = location.alt_hae_m - self.geoid.undulation_m(
-                location.lat_deg, location.lon_deg
-            )
+        alt_amsl, alt_source = amsl(
+            location, self.geoid, min_vertical_accuracy=self.min_vertical_accuracy
+        )
         over_takeoff = location.height_reference == odid.HeightReference.OVER_TAKEOFF
         system = state.system
         placed = place(
@@ -306,7 +356,11 @@ class RemoteIdTracker:
             "lat_deg": location.lat_deg,
             "lon_deg": location.lon_deg,
             "alt_amsl_m": alt_amsl,
+            # S-33: which broadcast altitude `alt_amsl_m` came from.
+            "alt_source": alt_source,
             "alt_hae_m": location.alt_hae_m,
+            # Referenced to 1013.25 hPa, as broadcast: not AMSL.
+            "alt_pressure_m": location.alt_baro_m,
             # Only when the broadcast's height is over the take-off point;
             # height over the ground is a different quantity (P5-00).
             "alt_above_home_m": location.height_m if over_takeoff else None,

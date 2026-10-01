@@ -14,7 +14,11 @@ from common import (
     ServiceSettings,
     TelemetryDatabaseSettings,
 )
-from gateway.remote_id import DEFAULT_MAX_LATENCY_S, DEFAULT_TIME_TOLERANCE_S
+from gateway.remote_id import (
+    DEFAULT_MAX_LATENCY_S,
+    DEFAULT_MIN_VERTICAL_ACCURACY,
+    DEFAULT_TIME_TOLERANCE_S,
+)
 
 
 class GatewaySettings(
@@ -125,6 +129,15 @@ class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings)
         default=DEFAULT_MAX_LATENCY_S,
         gt=0,
         validation_alias="REMOTE_ID_MAX_LATENCY_S",
+    )
+    # S-33. The poorest declared vertical accuracy (MAV_ODID_VER_ACC code,
+    # 1 to 6 for under 150, 45, 25, 10, 3 and 1 m) at which a broadcast's
+    # geodetic altitude is used; below it, its pressure altitude is.
+    remote_id_min_vertical_accuracy: int = Field(
+        default=DEFAULT_MIN_VERTICAL_ACCURACY,
+        ge=1,
+        le=6,
+        validation_alias="REMOTE_ID_MIN_VERTICAL_ACCURACY",
     )
 
     @model_validator(mode="after")

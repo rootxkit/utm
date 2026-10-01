@@ -235,6 +235,7 @@ def tracker_from_settings(
         geoid=geoid,
         time_tolerance_s=settings.remote_id_time_tolerance_s,
         max_latency_s=settings.remote_id_max_latency_s,
+        min_vertical_accuracy=settings.remote_id_min_vertical_accuracy,
     )
 
 
