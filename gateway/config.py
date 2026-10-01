@@ -12,9 +12,11 @@ from common import (
     NatsSettings,
     RedisSettings,
     ServiceSettings,
+    Settings,
     SourceControlSettings,
     TelemetryDatabaseSettings,
 )
+from gateway.registry_projection import DEFAULT_REFRESH_S
 from gateway.remote_id import (
     DEFAULT_IDENTIFY_WITHIN_S,
     DEFAULT_IDENTITY_TTL_S,
@@ -24,6 +26,17 @@ from gateway.remote_id import (
     DEFAULT_PRESSURE_HOLD_S,
     DEFAULT_TIME_TOLERANCE_S,
 )
+from gateway.remote_id_match import DEFAULT_SPOOF_DISTANCE_M
+
+
+class RegistryProjectionSettings(Settings):
+    """How often an adapter re-reads the registry projection (U-02,
+    `gateway/registry_projection.py`): a registry change reaches its
+    resolver within this, plus the API's transaction."""
+
+    registry_refresh_s: float = Field(
+        default=DEFAULT_REFRESH_S, gt=0, validation_alias="REGISTRY_REFRESH_S"
+    )
 
 
 class GatewaySettings(
@@ -32,6 +45,7 @@ class GatewaySettings(
     RedisSettings,
     NatsSettings,
     SourceControlSettings,
+    RegistryProjectionSettings,
 ):
     """Everything the Gateway needs to start.
 
@@ -99,7 +113,11 @@ class GatewaySettings(
 
 
 class RemoteIdSettings(
-    ServiceSettings, NatsSettings, TelemetryDatabaseSettings, SourceControlSettings
+    ServiceSettings,
+    NatsSettings,
+    TelemetryDatabaseSettings,
+    SourceControlSettings,
+    RegistryProjectionSettings,
 ):
     """Remote ID ingest (P1-15): receiver datagrams in, telemetry out.
 
@@ -174,6 +192,14 @@ class RemoteIdSettings(
         default=DEFAULT_IDENTIFY_WITHIN_S,
         ge=0,
         validation_alias="REMOTE_ID_IDENTIFY_WITHIN_S",
+    )
+    # S-10 (U-02). How far a broadcast of one of our serials may be from
+    # where that aircraft's live relay telemetry places it and still be it;
+    # beyond, it is a separate unverified track (`gateway/remote_id_match.py`).
+    remote_id_spoof_distance_m: float = Field(
+        default=DEFAULT_SPOOF_DISTANCE_M,
+        gt=0,
+        validation_alias="REMOTE_ID_SPOOF_DISTANCE_M",
     )
 
     @model_validator(mode="after")

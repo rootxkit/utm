@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from common import get_logger
@@ -50,6 +51,9 @@ from gateway.stage_timing import StageTimings, shared_timings
 from gateway.state_buffer import RowWriter
 
 _log = get_logger(__name__)
+
+# U-02: a drone_id to its `identification` (`gateway/identification.py`).
+Identify = Callable[[UUID], dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +102,9 @@ class IngestPipeline:
     live_state: LiveState | None = None
     # P1-11. Optional for the same reason as live state.
     firmware: FirmwareRegistry | None = None
+    # U-02. The registry's verdict on a bound aircraft, put on every row
+    # published; None publishes `identification: null`.
+    identify: Identify | None = None
     # The Gateway's wall clock, stamped on each batch as `rx_ts` (S-11): one
     # trusted clock for every station, unlike the relays' own.
     wall: Callable[[], datetime] = _now_utc
@@ -247,6 +254,7 @@ class IngestPipeline:
                         rx_ts=rx_ts,
                         backlog=backlog,
                         captured_at=captured_at,
+                        identifications=self._identifications(rows),
                     )
             except Exception as error:
                 _log.error(
@@ -282,6 +290,23 @@ class IngestPipeline:
         except Exception as error:
             _log.warning(
                 "could not read drone labels",
+                extra={"station_id": self.station_id, "error": repr(error)},
+            )
+            return {}
+
+    def _identifications(self, rows: list[DroneStateRow]) -> dict[UUID, dict[str, Any]]:
+        """U-02: each bound aircraft as the registry sees it. Like a label,
+        decoration on a position: a failure costs the field, never the row."""
+        if self.identify is None:
+            return {}
+        try:
+            return {
+                drone_id: self.identify(drone_id)
+                for drone_id in {row.drone_id for row in rows}
+            }
+        except Exception as error:
+            _log.warning(
+                "could not identify drones",
                 extra={"station_id": self.station_id, "error": repr(error)},
             )
             return {}
@@ -509,6 +534,7 @@ class StationPipelines:
     publisher: TelemetryPublisher
     live_state: LiveState | None = None
     firmware: FirmwareRegistry | None = None
+    identify: Identify | None = None
 
     pipelines: dict[str, IngestPipeline] = field(default_factory=dict)
 
@@ -522,6 +548,7 @@ class StationPipelines:
                 publisher=self.publisher,
                 live_state=self.live_state,
                 firmware=self.firmware,
+                identify=self.identify,
             )
             self.pipelines[station_id] = pipeline
         return pipeline

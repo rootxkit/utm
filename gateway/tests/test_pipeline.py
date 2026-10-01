@@ -121,6 +121,7 @@ class FakePublisher:
         self.rx_ts: list[datetime | None] = []
         self.backlog: list[bool] = []
         self.captured_at: list[datetime | None] = []
+        self.identifications: dict[UUID, dict[str, Any]] = {}
 
     async def publish_rows(
         self,
@@ -132,8 +133,10 @@ class FakePublisher:
         rx_ts: datetime | None = None,
         backlog: list[bool] | None = None,
         captured_at: list[datetime] | None = None,
+        identifications: dict[UUID, dict[str, Any]] | None = None,
     ) -> None:
         self.rows.extend(rows)
+        self.identifications = identifications or {}
         self.labels = labels or {}
         self.links = links or {}
         self.firmware = firmware or {}
@@ -609,6 +612,63 @@ async def test_a_row_is_still_published_when_the_label_lookup_fails() -> None:
     assert writer.written == rows
     assert publisher.rows == rows
     assert publisher.labels == {}
+
+
+# --- identification (U-02) ------------------------------------------------
+
+
+async def test_each_row_carries_how_the_registry_sees_its_aircraft() -> None:
+    pipeline, _, _, publisher = build()
+    pipeline.identify = lambda drone_id: {"status": "suspended", "id": str(drone_id)}
+
+    await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position(), offset_ns=300_000_000)]
+    )
+
+    assert publisher.identifications == {
+        DRONE: {"status": "suspended", "id": str(DRONE)}
+    }
+
+
+async def test_without_a_registry_rows_carry_no_identification() -> None:
+    pipeline, _, _, publisher = build()
+
+    rows = await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position(), offset_ns=300_000_000)]
+    )
+
+    assert publisher.rows == rows
+    assert publisher.identifications == {}
+
+
+async def test_a_failed_identification_costs_the_field_not_the_row() -> None:
+    pipeline, _, _, publisher = build()
+
+    def broken(_: UUID) -> dict[str, Any]:
+        raise RuntimeError("registry gone")
+
+    pipeline.identify = broken
+
+    rows = await pipeline.process(
+        EPOCH, [record(0, heartbeat()), record(1, position(), offset_ns=300_000_000)]
+    )
+
+    assert rows
+    assert publisher.rows == rows
+    assert publisher.identifications == {}
+
+
+def test_station_pipelines_pass_identification_on() -> None:
+    def identify(drone_id: UUID) -> dict[str, Any]:
+        return {"status": "registered"}
+
+    pipelines = StationPipelines(
+        resolver=cast(Any, FakeResolver()),
+        writer=cast(Any, FakeWriter()),
+        publisher=cast(Any, FakePublisher()),
+        identify=identify,
+    )
+    assert pipelines.for_station(STATION).identify is identify
 
 
 # --- bindings are read per batch (P1-13) -----------------------------------

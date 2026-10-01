@@ -33,6 +33,8 @@ import contextlib
 import signal
 import sys
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import nats
 import redis.asyncio
@@ -50,10 +52,12 @@ from gateway.archive import RawArchive
 from gateway.binding import BindingResolver
 from gateway.config import GatewaySettings
 from gateway.firmware_store import FirmwareRegistry
+from gateway.identification import resolve_bound
 from gateway.ingest_store_pg import TimescaleIngestStore
 from gateway.live_state import LiveState
 from gateway.pipeline import StationPipelines
 from gateway.publisher import TelemetryPublisher
+from gateway.registry_projection import RegistryFollower
 from gateway.relay_server import RelayServer
 from gateway.retention import BYTES_PER_GIB, ArchiveRetention, RetentionSchedule
 from gateway.source_activity import SourceActivity, publish_periodically
@@ -165,6 +169,14 @@ async def run(args: argparse.Namespace) -> int:
         flush_rows=settings.state_flush_rows,
         flush_interval_s=settings.state_flush_interval_s,
     )
+    # U-02. Every relay row says how the registry sees its aircraft, from
+    # the projection the API keeps in this database.
+    registry = RegistryFollower(engine=engine, refresh_s=settings.registry_refresh_s)
+    await registry.refresh()
+
+    def identify(drone_id: UUID) -> dict[str, Any]:
+        return resolve_bound(registry.snapshot, drone_id).as_dict()
+
     pipelines = StationPipelines(
         resolver=BindingResolver(engine=engine),
         writer=state_writer,
@@ -173,6 +185,7 @@ async def run(args: argparse.Namespace) -> int:
         live_state=LiveState(
             redis=redis_client, link_timeout_s=settings.link_timeout_s
         ),
+        identify=identify,
     )
 
     server = RelayServer(
@@ -218,6 +231,7 @@ async def run(args: argparse.Namespace) -> int:
     announcer = asyncio.create_task(
         publish_periodically(server.sources, publisher.bus, stopping)
     )
+    registry_task = asyncio.create_task(registry.run(stopping))
 
     # S-07. Retention had no caller: the archive was bounded by policy on
     # paper and by the disk in practice.
@@ -274,6 +288,7 @@ async def run(args: argparse.Namespace) -> int:
                     "retention task ended with an error", extra={"error": repr(error)}
                 )
         await announcer
+        await registry_task
         await follower.stop()
         await control.unsubscribe()
         await server.stop()
