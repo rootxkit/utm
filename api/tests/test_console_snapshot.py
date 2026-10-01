@@ -164,6 +164,22 @@ def test_a_cleared_alert_is_not_replayed() -> None:
     assert drain(hub.attach()) == []
 
 
+def test_source_activity_is_replayed_latest_first_per_type() -> None:
+    """U-15: a console opened after a receiver was switched off still sees
+    it as disabled, from the adapter's latest word on its type."""
+    hub = ConsoleHub()
+    publish(hub, "source.remote_id", source_type="remote_id", enabled=True)
+    publish(hub, "source.remote_id", source_type="remote_id", enabled=False)
+    publish(hub, "source.relay", source_type="relay", enabled=True)
+
+    replayed = drain(hub.attach())
+
+    assert [(m["kind"], m["name"], m["data"]["enabled"]) for m in replayed] == [
+        ("source", "remote_id", False),
+        ("source", "relay", True),
+    ]
+
+
 def test_a_cleared_alert_still_reaches_a_console_already_attached() -> None:
     hub = ConsoleHub()
     queue = hub.attach()

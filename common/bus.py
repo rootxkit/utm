@@ -30,7 +30,15 @@ from __future__ import annotations
 
 from typing import Protocol
 
-__all__ = ["BusClient", "round_trip"]
+__all__ = ["RECONNECT_FOREVER", "BusClient", "round_trip"]
+
+# `max_reconnect_attempts` for every long-running service. nats-py's
+# default, 60 attempts about 2 s apart, closes the client for good after a
+# broker outage of about two minutes: the process keeps running and never
+# publishes or hears anything again until it is restarted. -1 keeps trying.
+# It also applies to the first connection, so a process started while the
+# broker is down waits for it, saying so in its log, rather than exiting.
+RECONNECT_FOREVER = -1
 
 
 class BusClient(Protocol):

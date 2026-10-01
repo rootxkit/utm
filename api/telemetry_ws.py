@@ -55,13 +55,13 @@ from nats.aio.msg import Msg
 from api.assets import STATIC, mount_map_assets
 from api.auth import FEED_COOKIE, verify_feed_ticket, wall_clock_s
 from common import get_logger
-from common.bus import round_trip
+from common.bus import RECONNECT_FOREVER, round_trip
 
 _log = get_logger(__name__)
 
 # Everything the console needs, and nothing it does not. `>` would also carry
 # subjects added later for services that are not a browser.
-SUBSCRIBED_SUBJECTS = ("telemetry.*", "station.*", "events.*", "alert.*")
+SUBSCRIBED_SUBJECTS = ("telemetry.*", "station.*", "events.*", "alert.*", "source.*")
 
 # Subjects that carry *state* - the latest message on one of these replaces the
 # previous one, so the latest is a complete picture and is worth replaying to a
@@ -76,7 +76,11 @@ SUBSCRIBED_SUBJECTS = ("telemetry.*", "station.*", "events.*", "alert.*")
 # `alert` is state too (P6-03): an alert is active until the airspace monitor
 # publishes it cleared, and a console opened after it was raised must still
 # see it. A cleared alert is removed from the snapshot rather than replayed.
-SNAPSHOT_KINDS = frozenset({"telemetry", "station", "alert"})
+#
+# `source` is state as well (U-15): each adapter says, every few seconds,
+# what every instance of its source type is doing and whether it is switched
+# on (`gateway/source_activity.py`); the latest says it all.
+SNAPSHOT_KINDS = frozenset({"telemetry", "station", "alert", "source"})
 
 # A bound on the snapshot, which is otherwise one entry per distinct drone and
 # station the process has ever seen. In a fleet that is small; over a long
@@ -262,7 +266,8 @@ def create_app(
         client: NatsClient | None = None
         try:
             client = await asyncio.wait_for(
-                nats.connect(nats_url), timeout=connect_timeout_s
+                nats.connect(nats_url, max_reconnect_attempts=RECONNECT_FOREVER),
+                timeout=connect_timeout_s,
             )
         except Exception as error:
             # A console that will not load because the bus is down is worse

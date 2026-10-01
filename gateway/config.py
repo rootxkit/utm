@@ -12,6 +12,7 @@ from common import (
     NatsSettings,
     RedisSettings,
     ServiceSettings,
+    SourceControlSettings,
     TelemetryDatabaseSettings,
 )
 from gateway.remote_id import (
@@ -26,7 +27,11 @@ from gateway.remote_id import (
 
 
 class GatewaySettings(
-    ServiceSettings, TelemetryDatabaseSettings, RedisSettings, NatsSettings
+    ServiceSettings,
+    TelemetryDatabaseSettings,
+    RedisSettings,
+    NatsSettings,
+    SourceControlSettings,
 ):
     """Everything the Gateway needs to start.
 
@@ -93,7 +98,9 @@ class GatewaySettings(
     )
 
 
-class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings):
+class RemoteIdSettings(
+    ServiceSettings, NatsSettings, TelemetryDatabaseSettings, SourceControlSettings
+):
     """Remote ID ingest (P1-15): receiver datagrams in, telemetry out.
 
     Needs the bus, and the telemetry database, where it keeps what it heard

@@ -28,6 +28,9 @@ interface Props {
   layers: Layers;
   selected: string | null;
   onSelect: (droneId: string) => void;
+  // U-15: aircraft whose source is switched off, drawn faded where they
+  // were last placed, so they read as out of the picture, not as current.
+  sourceDisabled: Set<string>;
 }
 
 // Colours by zone type, as in the minimal map. Not flight data: a display choice.
@@ -205,7 +208,16 @@ function makeMarker(droneId: string, onSelect: (id: string) => void): MarkerEntr
   };
 }
 
-export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSelect }: Props) {
+export function MapView({
+  aircraft,
+  alerts,
+  zones,
+  bases,
+  layers,
+  selected,
+  onSelect,
+  sourceDisabled,
+}: Props) {
   const { lang, t } = useI18n();
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibre | null>(null);
@@ -356,13 +368,16 @@ export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSe
       entry.label.textContent = layers.labels ? (item.data.label ?? id.slice(0, 8)) : "";
       entry.element.dataset.alert = inConflict.get(id) ?? "";
       entry.element.dataset.selected = String(id === selected);
-      entry.element.title = item.data.label ?? t("unnamed");
+      const disabled = sourceDisabled.has(id);
+      entry.element.dataset.sourceDisabled = String(disabled);
+      entry.element.title =
+        (item.data.label ?? t("unnamed")) + (disabled ? ` · ${t("source_disabled_track")}` : "");
       if (!fittedToAircraft.current) {
         map.easeTo({ center: lngLat, zoom: 14 });
         fittedToAircraft.current = true;
       }
     }
-  }, [aircraft, alerts, selected, layers.labels, t]);
+  }, [aircraft, alerts, selected, layers.labels, t, sourceDisabled]);
 
   return (
     <div className="map-wrap">

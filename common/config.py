@@ -164,6 +164,40 @@ class NatsSettings(Settings):
     nats_url: NatsDsn = Field(validation_alias="NATS_URL")
 
 
+class SourceControlSettings(Settings):
+    """Where the source switches travel (U-15, `common/sources.py`).
+
+    Every adapter, the airspace monitor and the API must agree on these, so
+    they are one mixin with one set of names. The defaults are what a
+    deployment uses; tests point them at a bucket of their own.
+    """
+
+    source_control_bucket: str = Field(
+        default="source_control",
+        pattern=r"^[A-Za-z0-9_-]+$",
+        validation_alias="SOURCE_CONTROL_BUCKET",
+    )
+    source_control_subject: str = Field(
+        default="control.sources",
+        pattern=r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$",
+        validation_alias="SOURCE_CONTROL_SUBJECT",
+    )
+    # How often a follower re-reads the bucket, as the backstop for a pushed
+    # change it missed. A switch normally takes effect within a round trip.
+    source_control_poll_s: float = Field(
+        default=5.0, gt=0, validation_alias="SOURCE_CONTROL_POLL_S"
+    )
+    # At start, how many times a failed read of the bucket is tried, the
+    # first wait between tries (doubling), before the service starts with
+    # the switch state unknown and every source enabled.
+    source_control_start_attempts: int = Field(
+        default=3, ge=1, le=20, validation_alias="SOURCE_CONTROL_START_ATTEMPTS"
+    )
+    source_control_start_backoff_s: float = Field(
+        default=0.5, gt=0, le=30, validation_alias="SOURCE_CONTROL_START_BACKOFF_S"
+    )
+
+
 def _describe(error: ValidationError) -> str:
     """Turn a pydantic error into something readable at 3am."""
     lines: list[str] = []

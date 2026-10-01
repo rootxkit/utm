@@ -38,6 +38,18 @@ export async function apiLookup<P extends keyof paths>(
   return (await response.json()) as GetResponse<P>;
 }
 
+// A PUT with a JSON body, as `apiPost`: the same header, the same 401.
+export async function apiPut(path: string, body: unknown): Promise<Response> {
+  const response = await fetch(path, {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", "X-Courier-Request": "1" },
+    body: JSON.stringify(body),
+  });
+  if (response.status === 401) toSignIn();
+  return response;
+}
+
 // State changes carry X-Courier-Request, which a form on another site cannot
 // send (api/auth.py). The API refuses a cookie-authenticated change without it.
 export async function apiPost(path: string, body?: unknown): Promise<Response> {

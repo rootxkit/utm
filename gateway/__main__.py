@@ -15,6 +15,10 @@ The order matters and is the same order the data takes:
            -> DroneStateWriter  the hypertable
            -> TelemetryPublisher  the bus, for the console
 
+U-15: each station, and relays as a whole, can be switched off without a
+restart. The switches come from the bucket the API writes (`common/sources.py`),
+never from the relational database; a change closes the sessions it disables.
+
 Tokens are read from a file, one `station_id: token` per line, because spec
 §12 question 1 - where station tokens live, how they are issued and revoked -
 is still open. This is deliberately the simplest thing that is not a hardcoded
@@ -35,6 +39,13 @@ import redis.asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from common import configure_logging, get_logger, load_settings
+from common.bus import RECONNECT_FOREVER
+from common.sources import (
+    RELAY,
+    SourceControlState,
+    follow,
+    follower_from_settings,
+)
 from gateway.archive import RawArchive
 from gateway.binding import BindingResolver
 from gateway.config import GatewaySettings
@@ -45,6 +56,7 @@ from gateway.pipeline import StationPipelines
 from gateway.publisher import TelemetryPublisher
 from gateway.relay_server import RelayServer
 from gateway.retention import BYTES_PER_GIB, ArchiveRetention, RetentionSchedule
+from gateway.source_activity import SourceActivity, publish_periodically
 from gateway.state_buffer import BufferedStateWriter
 from gateway.state_writer import DroneStateWriter
 
@@ -102,6 +114,11 @@ class FileAuthenticator:
     async def station_for_token(self, token: str) -> str | None:
         return self._by_token.get(token)
 
+    @property
+    def stations(self) -> set[str]:
+        """Every station with a token: the relays this Gateway can serve."""
+        return set(self._by_token.values())
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="gateway", description=__doc__)
@@ -132,7 +149,9 @@ async def run(args: argparse.Namespace) -> int:
     archive = RawArchive(root=settings.archive_root)
     store = TimescaleIngestStore(engine=engine, archive=archive)
 
-    bus = await nats.connect(str(settings.nats_url))
+    bus = await nats.connect(
+        str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
+    )
     # One publisher, two producers. The pipeline publishes what it parsed out
     # of the datagrams; the relay server publishes the health of the link that
     # carried them. The console needs both, and a station with no aircraft on
@@ -165,16 +184,40 @@ async def run(args: argparse.Namespace) -> int:
         host=args.host,
         port=args.port,
     )
+
+    async def on_switch(_: SourceControlState, __: SourceControlState) -> None:
+        closed = await server.apply_source_control()
+        if closed:
+            _log.info("relay sessions closed by a switch", extra={"closed": closed})
+
+    follower = follower_from_settings(bus, settings, on_change=on_switch)
+    server.sources = SourceActivity(
+        source_type=RELAY,
+        switch=follower,
+        known=authenticator.stations,
+        connected=server.connected_stations,
+    )
+    # Before the server listens, so a station disabled before this start
+    # is refused from its first attempt - provided the bucket could be read.
+    # If it could not, after a few tries, the Gateway serves anyway with
+    # every station enabled and says so (`follower.start`), rather than
+    # refusing every station because the switches are unknown.
+    control = await follow(bus, follower, subject=settings.source_control_subject)
     await server.start()
     _log.info(
         "gateway listening",
         extra={
             "relay_url": f"ws://{args.host}:{server.port_in_use}/relay/v1",
             "archive_root": str(settings.archive_root),
+            "source_control_version": follower.state.version,
+            "disabled": [f"{t}/{i or '*'}" for t, i in follower.state.disabled()],
         },
     )
 
     stopping = asyncio.Event()
+    announcer = asyncio.create_task(
+        publish_periodically(server.sources, publisher.bus, stopping)
+    )
 
     # S-07. Retention had no caller: the archive was bounded by policy on
     # paper and by the disk in practice.
@@ -230,6 +273,9 @@ async def run(args: argparse.Namespace) -> int:
                 _log.error(
                     "retention task ended with an error", extra={"error": repr(error)}
                 )
+        await announcer
+        await follower.stop()
+        await control.unsubscribe()
         await server.stop()
         # After the server, so no batch can arrive once the last flush ran.
         await state_writer.close()

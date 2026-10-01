@@ -1,22 +1,33 @@
 // The operator console (P6-01, P6-02, P6-03): map, aircraft, alerts, stations.
 // It reads the console feed and the API, never a database.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { SignInRequired, apiGet, apiPost } from "./api/client";
+import { SignInRequired, apiGet, apiPost, apiPut } from "./api/client";
 import { AircraftList } from "./components/AircraftList";
 import { AlertsPanel } from "./components/AlertsPanel";
 import { DronePanel } from "./components/DronePanel";
 import { RegistryView } from "./components/RegistryView";
+import { SourcesPanel } from "./components/SourcesPanel";
 import { StationsPanel, UnclaimedPanel } from "./components/StationsPanel";
 import { type Me, TopBar, type View } from "./components/TopBar";
 import { useFeed } from "./feed";
 import { I18n, type Lang, translator } from "./i18n";
 import { type Base, type Layers, MapView, type Zone } from "./map/MapView";
+import {
+  type SourcesOut,
+  aircraftSourceDisabled,
+  sourceGroups,
+  switchPath,
+  switchRequest,
+} from "./sources";
 
-type Tab = "aircraft" | "alerts" | "stations" | "unclaimed";
+type Tab = "aircraft" | "alerts" | "stations" | "sources" | "unclaimed";
 
 const LANG_KEY = "courier.lang";
 // How often zones and bases are re-read. A display choice, not flight data.
 const REGISTRY_REFRESH_MS = 30_000;
+// U-15. How often the source switches are re-read. A switch made from another
+// console shows here within this; one made here shows at once.
+const SOURCES_REFRESH_MS = 5_000;
 
 function storedLang(): Lang {
   try {
@@ -66,6 +77,8 @@ export function App() {
   const [zones, setZones] = useState<Zone[]>([]);
   const [zonesFailed, setZonesFailed] = useState(false);
   const [bases, setBases] = useState<Base[]>([]);
+  const [controls, setControls] = useState<SourcesOut | null>(null);
+  const [controlsFailed, setControlsFailed] = useState(false);
   const [tab, setTab] = useState<Tab>("aircraft");
   const [selected, setSelected] = useState<string | null>(null);
   const [acknowledged, setAcknowledged] = useState<Set<string>>(new Set());
@@ -120,6 +133,54 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [me]);
 
+  const loadSources = useCallback(async () => {
+    try {
+      setControls(await apiGet("/sources"));
+      setControlsFailed(false);
+    } catch (error) {
+      if (!(error instanceof SignInRequired)) setControlsFailed(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!me) return;
+    void loadSources();
+    const timer = window.setInterval(() => void loadSources(), SOURCES_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [me, loadSources]);
+
+  const switchSource = useCallback(
+    async (
+      sourceType: string,
+      instanceId: string | null,
+      enabled: boolean,
+      reason: string,
+    ): Promise<string | null> => {
+      const body = switchRequest(enabled, reason);
+      if (!body) return "reason_required";
+      const response = await apiPut(switchPath(sourceType, instanceId), body);
+      // Re-read either way: what is shown must be what the API holds,
+      // whether or not this switch took.
+      await loadSources();
+      if (response.ok) return null;
+      const detail = ((await response.json().catch(() => ({}))) as { detail?: unknown }).detail;
+      return typeof detail === "object" && detail !== null && "code" in detail
+        ? String((detail as { code: unknown }).code)
+        : String(response.status);
+    },
+    [loadSources],
+  );
+
+  const sourceDisabled = useMemo(
+    () =>
+      new Set(
+        [...state.aircraft.entries()]
+          .filter(([, item]) => aircraftSourceDisabled(item.data, controls))
+          .map(([id]) => id),
+      ),
+    [state.aircraft, controls],
+  );
+
   // Acknowledgements of alerts that have cleared are forgotten, so the same
   // pair converging again sounds again.
   const activeAcks = useMemo(
@@ -156,10 +217,16 @@ export function App() {
   const selectedAlerts = selected
     ? [...state.alerts.values()].filter((a) => a.drone_ids.includes(selected))
     : [];
+  const groups = sourceGroups(controls, state.sources, state.stations, now);
+  const disabledSources = groups
+    .flatMap((group) => [group.type, ...group.instances])
+    .filter((row) => row.state === "disabled").length;
   const tabs: [Tab, string, number][] = [
     ["aircraft", t("aircraft"), state.aircraft.size],
     ["alerts", t("alerts"), state.alerts.size],
     ["stations", t("stations"), state.stations.size],
+    // U-15: the count is of what is switched off, the thing to notice.
+    ["sources", t("sources"), disabledSources],
     ["unclaimed", t("unclaimed"), state.unclaimed.size],
   ];
 
@@ -201,6 +268,7 @@ export function App() {
                     selected={selected}
                     now={now}
                     onSelect={select}
+                    sourceDisabled={sourceDisabled}
                   />
                 )}
                 {tab === "alerts" && (
@@ -214,6 +282,15 @@ export function App() {
                   />
                 )}
                 {tab === "stations" && <StationsPanel stations={state.stations} />}
+                {tab === "sources" && (
+                  <SourcesPanel
+                    groups={groups}
+                    isAdmin={me.role === "admin"}
+                    controlsFailed={controlsFailed}
+                    now={now}
+                    onSwitch={switchSource}
+                  />
+                )}
                 {tab === "unclaimed" && <UnclaimedPanel unclaimed={state.unclaimed} />}
               </div>
               <fieldset className="layers">
@@ -240,6 +317,7 @@ export function App() {
                 layers={layers}
                 selected={selected}
                 onSelect={select}
+                sourceDisabled={sourceDisabled}
               />
             </main>
             {selected ? (
@@ -249,6 +327,7 @@ export function App() {
                 alerts={selectedAlerts}
                 now={now}
                 onClose={() => setSelected(null)}
+                sourceDisabled={sourceDisabled.has(selected)}
               />
             ) : (
               <aside className="detail muted pad">{t("select_hint")}</aside>

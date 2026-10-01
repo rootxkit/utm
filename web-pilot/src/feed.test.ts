@@ -7,6 +7,7 @@ const empty = (): FeedState => ({
   stations: new Map(),
   alerts: new Map(),
   unclaimed: new Map(),
+  sources: new Map(),
 });
 
 const telemetry = { drone_id: "d1", batt_pct: 80, alt_above_home_m: 12 } as Telemetry;
@@ -26,6 +27,20 @@ describe("apply", () => {
   it("stores a station", () => {
     const next = apply(empty(), { kind: "station", name: "s", data: station });
     expect(next.stations.get("s1")).toBe(station);
+  });
+
+  it("keeps each adapter's latest source report, by type", () => {
+    const report = (enabled: boolean) => ({
+      source_type: "remote_id",
+      enabled,
+      control_version: 1,
+      published_at: "2026-10-01T12:00:00+00:00",
+      instances: [],
+    });
+    const first = apply(empty(), { kind: "source", name: "remote_id", data: report(true) });
+    const second = apply(first, { kind: "source", name: "remote_id", data: report(false) });
+    expect(second.sources.size).toBe(1);
+    expect(second.sources.get("remote_id")?.data.enabled).toBe(false);
   });
 
   it("raises and clears an alert", () => {

@@ -92,6 +92,13 @@ and a reason, and the console shows each source's state (enabled, disabled,
 healthy, stale). An instance disabled by the authority is different from one
 that is merely silent, and the console says which.
 
+The API is the only writer: a switch is a `source_controls` row and an
+`events` row in one transaction, then the whole state is published to a
+NATS key-value bucket (the read path, durable on the broker) and a control
+subject (the push). Adapters and the airspace monitor follow both, so the
+Gateway learns of a switch without reaching the relational database
+(`docs/runbooks/u15-source-control.md`).
+
 **Operator relays** are the richest source and the only one with a flight
 record complete enough for incident investigation: the relay forwards every
 datagram, unparsed and unfiltered, and buffers through internet outages (§3,

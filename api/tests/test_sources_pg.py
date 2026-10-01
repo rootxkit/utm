@@ -1,0 +1,607 @@
+"""Source switches against the real relational database. U-15.
+
+Every switch must leave a `source_controls` row and an `events` row with the
+admin and the reason, in one transaction, and only then be published. The
+bus is a recording fake here; `test_sources_nats.py` drives the real one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from typing import Any
+from uuid import uuid4
+
+import pytest
+import sqlalchemy as sa
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+from api.app import create_api_app
+from api.sources import SourceControlService, SourceControlStore
+from api.tests.auth_fakes import ADMIN, ADMIN_HEADERS, VIEWER_HEADERS, api_kwargs
+from api.tests.conftest import migrate_relational
+from common.sources import RELAY, REMOTE_ID, SourceControlState
+
+pytestmark = pytest.mark.postgres
+
+
+class RecordingChannel:
+    """The bucket and the subject, in memory. `published` is every state
+    written to the bucket; `fail` makes the bucket refuse writes, as
+    JetStream does when it is off or full."""
+
+    def __init__(self) -> None:
+        self.published: list[SourceControlState] = []
+        self.announced: list[SourceControlState] = []
+        self.fail = False
+        self.closed = False
+
+    async def load(self) -> SourceControlState | None:
+        if self.fail:
+            raise ConnectionError("no JetStream")
+        return self.published[-1] if self.published else None
+
+    async def store(self, state: SourceControlState) -> None:
+        if self.fail:
+            raise ConnectionError("no JetStream")
+        self.published.append(state)
+
+    async def announce(self, state: SourceControlState) -> None:
+        self.announced.append(state)
+
+
+def build(service: SourceControlService | None) -> Any:
+    return create_api_app(None, sources=service, **api_kwargs())  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def channel() -> RecordingChannel:
+    return RecordingChannel()
+
+
+@pytest.fixture
+def service(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> SourceControlService:
+    return SourceControlService(
+        store=SourceControlStore(engine=relational_engine), channel=channel
+    )
+
+
+@pytest.fixture
+async def client(service: SourceControlService) -> AsyncIterator[AsyncClient]:
+    async with AsyncClient(
+        transport=ASGITransport(app=build(service)),
+        base_url="http://test",
+        headers=ADMIN_HEADERS,
+    ) as http:
+        yield http
+
+
+def station() -> str:
+    return f"station-{uuid4().hex[:8]}"
+
+
+async def events_for(engine: AsyncEngine, entity_id: str) -> list[Any]:
+    async with engine.connect() as connection:
+        return list(
+            await connection.execute(
+                sa.text(
+                    "SELECT actor_type, actor_id, event_type, payload FROM events "
+                    "WHERE entity_type = 'source' AND entity_id = :id ORDER BY id"
+                ),
+                {"id": entity_id},
+            )
+        )
+
+
+async def test_switching_a_station_off_is_recorded_audited_and_published(
+    client: AsyncClient, relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    name = station()
+    response = await client.put(
+        f"/sources/relay/instances/{name}",
+        json={"enabled": False, "reason": "operator licence suspended"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["instance_id"] == name
+    assert body["enabled"] is False
+    assert body["changed_by"] == ADMIN.username
+
+    [event] = await events_for(relational_engine, f"relay/{name}")
+    assert (event.actor_type, event.actor_id) == ("operator", str(ADMIN.id))
+    assert event.event_type == "source_disabled"
+    assert event.payload["reason"] == "operator licence suspended"
+    assert event.payload["previous_enabled"] is None
+
+    published = channel.published[-1]
+    assert not published.enabled(RELAY, name)
+    assert published.enabled(RELAY, station())
+
+
+async def test_switching_it_back_on_is_a_second_event_and_a_newer_state(
+    client: AsyncClient, relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    name = station()
+    path = f"/sources/relay/instances/{name}"
+    await client.put(path, json={"enabled": False, "reason": "test off"})
+    off = channel.published[-1]
+    response = await client.put(path, json={"enabled": True, "reason": "test on"})
+
+    assert response.status_code == 200
+    events = await events_for(relational_engine, f"relay/{name}")
+    assert [e.event_type for e in events] == ["source_disabled", "source_enabled"]
+    assert events[1].payload["previous_enabled"] is False
+    on = channel.published[-1]
+    assert on.version > off.version
+    assert on.enabled(RELAY, name)
+
+
+async def test_a_switch_to_the_state_already_held_writes_no_event(
+    client: AsyncClient, relational_engine: AsyncEngine
+) -> None:
+    name = station()
+    path = f"/sources/relay/instances/{name}"
+    await client.put(path, json={"enabled": False, "reason": "first"})
+    again = await client.put(path, json={"enabled": False, "reason": "second"})
+
+    assert again.status_code == 200
+    assert again.json()["reason"] == "first"
+    assert len(await events_for(relational_engine, f"relay/{name}")) == 1
+
+
+async def test_a_whole_type_is_switched_and_listed(
+    client: AsyncClient, channel: RecordingChannel
+) -> None:
+    response = await client.put(
+        "/sources/remote_id", json={"enabled": False, "reason": "receiver spoofing"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["instance_id"] is None
+    assert not channel.published[-1].enabled(REMOTE_ID, "any-receiver")
+
+    listing = (await client.get("/sources")).json()
+    assert REMOTE_ID in listing["source_types"]
+    assert {
+        (c["source_type"], c["instance_id"], c["enabled"]) for c in listing["controls"]
+    } >= {(REMOTE_ID, None, False)}
+
+    # Restored, so the other tests in this database see Remote ID on.
+    await client.put("/sources/remote_id", json={"enabled": True, "reason": "cleared"})
+    assert channel.published[-1].enabled(REMOTE_ID, "any-receiver")
+
+
+async def test_a_viewer_lists_and_cannot_switch(service: SourceControlService) -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=build(service)),
+        base_url="http://test",
+        headers=VIEWER_HEADERS,
+    ) as viewer:
+        assert (await viewer.get("/sources")).status_code == 200
+        refused = await viewer.put(
+            f"/sources/relay/instances/{station()}",
+            json={"enabled": False, "reason": "not mine to switch"},
+        )
+    assert refused.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "code"),
+    [
+        (
+            "/sources/radar/instances/x",
+            {"enabled": False, "reason": "r"},
+            "unknown_source_type",
+        ),
+        (
+            "/sources/relay/instances/-bad",
+            {"enabled": False, "reason": "r"},
+            "invalid_instance_id",
+        ),
+        (
+            "/sources/relay/instances/ok-1",
+            {"enabled": False, "reason": "   "},
+            "reason_required",
+        ),
+    ],
+)
+async def test_a_bad_switch_is_refused_with_a_stable_code(
+    client: AsyncClient, path: str, body: dict[str, Any], code: str
+) -> None:
+    response = await client.put(path, json=body)
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == code
+
+
+async def test_a_switch_without_a_reason_is_refused(client: AsyncClient) -> None:
+    response = await client.put(
+        f"/sources/relay/instances/{station()}", json={"enabled": False}
+    )
+    assert response.status_code == 422
+
+
+async def test_without_the_bus_nothing_is_changed(
+    relational_engine: AsyncEngine,
+) -> None:
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine), channel=None
+    )
+    name = station()
+    async with AsyncClient(
+        transport=ASGITransport(app=build(service)),
+        base_url="http://test",
+        headers=ADMIN_HEADERS,
+    ) as http:
+        response = await http.put(
+            f"/sources/relay/instances/{name}",
+            json={"enabled": False, "reason": "no bus"},
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "control_channel_unavailable"
+    assert await events_for(relational_engine, f"relay/{name}") == []
+
+
+async def rows_for(engine: AsyncEngine, instance_id: str) -> list[Any]:
+    async with engine.connect() as connection:
+        return list(
+            await connection.execute(
+                sa.text("SELECT * FROM source_controls WHERE instance_id = :i"),
+                {"i": instance_id},
+            )
+        )
+
+
+async def test_a_bucket_that_refuses_the_write_leaves_nothing_changed(
+    client: AsyncClient,
+    relational_engine: AsyncEngine,
+    channel: RecordingChannel,
+    service: SourceControlService,
+) -> None:
+    """JetStream off or full: the switch is refused, and neither the row nor
+    the audit event is written, so the database and the adapters agree."""
+    name = station()
+    channel.fail = True
+    response = await client.put(
+        f"/sources/relay/instances/{name}",
+        json={"enabled": False, "reason": "JetStream down"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "control_channel_unavailable"
+    assert await events_for(relational_engine, f"relay/{name}") == []
+    assert await rows_for(relational_engine, name) == []
+    assert service.publish_failures == 1
+
+    # The paired presence: the same switch once the bucket takes writes.
+    channel.fail = False
+    again = await client.put(
+        f"/sources/relay/instances/{name}",
+        json={"enabled": False, "reason": "JetStream back"},
+    )
+    assert again.status_code == 200
+    assert not channel.published[-1].enabled(RELAY, name)
+    assert channel.announced[-1] == channel.published[-1]
+
+
+async def test_versions_rise_when_the_clock_steps_back(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    """The version is a database sequence, not the newest change time: a
+    clock that steps back an hour still gives the next state a higher one."""
+    times = iter(
+        [
+            datetime(2026, 10, 1, 12, 0, tzinfo=UTC),
+            datetime(2026, 10, 1, 11, 0, tzinfo=UTC),
+            datetime(2026, 10, 1, 11, 0, tzinfo=UTC),
+        ]
+    )
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine, clock=lambda: next(times)),
+        channel=channel,
+    )
+    name = station()
+    for enabled in (False, True, False):
+        await service.switch(
+            RELAY,
+            name,
+            enabled=enabled,
+            reason="clock",
+            actor=ADMIN.actor,
+            actor_name="a",
+        )
+    versions = [state.version for state in channel.published[-3:]]
+    assert versions[0] < versions[1] < versions[2]
+    assert not channel.published[-1].enabled(RELAY, name)
+
+
+async def test_a_republish_of_the_same_switches_keeps_the_version(
+    service: SourceControlService, channel: RecordingChannel
+) -> None:
+    assert await service.publish_current()
+    held = channel.published[-1]
+    assert await service.publish_current()
+
+    assert channel.published[-1] is held
+    assert channel.announced[-1] == held
+
+
+async def test_a_changed_default_gets_a_new_version(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    store = SourceControlStore(engine=relational_engine)
+    allow = SourceControlService(store=store, channel=channel)
+    assert await allow.publish_current()
+    before = channel.published[-1]
+    deny = SourceControlService(store=store, channel=channel, default_deny=True)
+    assert await deny.publish_current()
+
+    assert channel.published[-1].version > before.version
+    assert channel.published[-1].default_deny
+
+
+class ClosingChannel(RecordingChannel):
+    """A channel whose client gave up, as nats-py's does after its
+    reconnect attempts run out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = True
+
+
+async def test_a_channel_that_gave_up_is_replaced_and_the_republish_succeeds(
+    relational_engine: AsyncEngine,
+) -> None:
+    """A broker away for longer than the client's reconnect limit leaves a
+    closed client. The next republish makes a new channel and succeeds."""
+    fresh = RecordingChannel()
+    made: list[RecordingChannel] = []
+
+    async def connect() -> RecordingChannel:
+        made.append(fresh)
+        return fresh
+
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine),
+        channel=ClosingChannel(),
+        connect=connect,
+    )
+    assert await service.publish_current()
+    assert made == [fresh]
+    assert fresh.published
+
+
+async def test_with_no_channel_the_republish_fails_loudly_and_retries(
+    relational_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    attempts = 0
+
+    async def connect() -> RecordingChannel:
+        nonlocal attempts
+        attempts += 1
+        raise ConnectionError("broker away")
+
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine),
+        channel=None,
+        connect=connect,
+    )
+    with caplog.at_level(logging.ERROR, logger="api.sources"):
+        assert not await service.publish_current()
+        assert not await service.publish_current()
+
+    assert attempts == 2
+    assert service.publish_failures == 2
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "source switches not published: no control channel (NATS)" in messages
+
+
+async def test_the_published_state_carries_default_deny(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine),
+        channel=channel,
+        default_deny=True,
+    )
+    assert await service.publish_current()
+    assert channel.published[-1].default_deny
+    assert not channel.published[-1].enabled(RELAY, station())
+
+
+async def test_two_switches_at_once_are_both_recorded_and_published_in_order(
+    service: SourceControlService, channel: RecordingChannel
+) -> None:
+    first, second = station(), station()
+    await asyncio.gather(
+        service.switch(
+            RELAY, first, enabled=False, reason="a", actor=ADMIN.actor, actor_name="a"
+        ),
+        service.switch(
+            RELAY, second, enabled=False, reason="b", actor=ADMIN.actor, actor_name="b"
+        ),
+    )
+    last = channel.published[-1]
+    assert not last.enabled(RELAY, first)
+    assert not last.enabled(RELAY, second)
+    versions = [state.version for state in channel.published]
+    assert versions == sorted(versions)
+
+
+async def test_the_database_refuses_a_switch_without_a_reason(
+    relational_engine: AsyncEngine,
+) -> None:
+    with pytest.raises(IntegrityError):
+        async with relational_engine.begin() as connection:
+            await connection.execute(
+                sa.text(
+                    "INSERT INTO source_controls "
+                    "(source_type, instance_id, enabled, reason, changed_by) "
+                    "VALUES ('relay', 'x-1', false, '  ', 'someone')"
+                )
+            )
+
+
+async def test_the_migration_goes_down_and_up(
+    prepared_relational_database: str, relational_engine: AsyncEngine
+) -> None:
+    await asyncio.to_thread(
+        migrate_relational, prepared_relational_database, "0005_uas_registry", down=True
+    )
+    async with relational_engine.connect() as connection:
+        tables: set[str] = set(
+            (
+                await connection.execute(
+                    sa.text(
+                        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                    )
+                )
+            ).scalars()
+        )
+    assert "source_controls" not in tables
+    await asyncio.to_thread(migrate_relational, prepared_relational_database, "head")
+
+
+async def test_a_bucket_ahead_of_the_sequence_starts_a_new_epoch(
+    service: SourceControlService, channel: RecordingChannel
+) -> None:
+    """A database restored from a backup: the bucket holds a version the
+    sequence has not reached, under the database's own epoch. The next
+    publish starts a new epoch, so followers take it."""
+    assert await service.publish_current()
+    current = channel.published[-1]
+    channel.published.append(
+        SourceControlState(
+            version=current.version + 1_000_000,
+            epoch=current.epoch,
+            controls=current.controls,
+            default_deny=not current.default_deny,
+        )
+    )
+
+    assert await service.publish_current()
+
+    repaired = channel.published[-1]
+    assert repaired.epoch != current.epoch
+    assert repaired.version < current.version + 1_000_000
+    assert repaired.default_deny == current.default_deny
+
+
+class FailingCommitStore(SourceControlStore):
+    """The bucket write succeeds and then the transaction fails, as a commit
+    that the database refuses would."""
+
+    async def set(self, *args: Any, **kwargs: Any) -> tuple[dict[str, Any], bool]:
+        hook = kwargs.pop("before_commit")
+
+        async def then_fail(connection: Any) -> None:
+            await hook(connection)
+            raise RuntimeError("commit refused")
+
+        return await super().set(*args, before_commit=then_fail, **kwargs)
+
+
+async def test_a_commit_that_fails_after_the_bucket_write_is_repaired_at_once(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    service = SourceControlService(
+        store=FailingCommitStore(engine=relational_engine), channel=channel
+    )
+    name = station()
+    with pytest.raises(RuntimeError, match="commit refused"):
+        await service.switch(
+            RELAY, name, enabled=False, reason="x", actor=ADMIN.actor, actor_name="a"
+        )
+
+    # The switch reached the bucket before the failure, and was taken back
+    # out of it before the call returned.
+    assert any(not s.enabled(RELAY, name) for s in channel.published)
+    assert channel.published[-1].enabled(RELAY, name)
+    assert await rows_for(relational_engine, name) == []
+
+
+async def test_two_api_processes_serialise_their_switches(
+    prepared_relational_database: str, channel: RecordingChannel
+) -> None:
+    """Two stores on two engines, as two API replicas: each holds the
+    advisory lock from its first statement to its commit, so their bucket
+    writes never interleave."""
+    engines = [create_async_engine(prepared_relational_database) for _ in range(2)]
+    spans: list[tuple[str, float, float]] = []
+
+    class SlowChannel(RecordingChannel):
+        async def store(self, state: SourceControlState) -> None:
+            started = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.3)
+            await super().store(state)
+            spans.append((str(len(spans)), started, asyncio.get_running_loop().time()))
+
+    try:
+        channels = [SlowChannel(), SlowChannel()]
+        services = [
+            SourceControlService(
+                store=SourceControlStore(engine=engine), channel=channel
+            )
+            for engine, channel in zip(engines, channels, strict=True)
+        ]
+        names = [station(), station()]
+        await asyncio.gather(
+            *(
+                svc.switch(
+                    RELAY,
+                    name,
+                    enabled=False,
+                    reason="r",
+                    actor=ADMIN.actor,
+                    actor_name="a",
+                )
+                for svc, name in zip(services, names, strict=True)
+            )
+        )
+    finally:
+        for engine in engines:
+            await engine.dispose()
+
+    (_, _first_start, first_end), (_, second_start, _) = sorted(
+        spans, key=lambda s: s[1]
+    )
+    assert second_start >= first_end
+    # The later one saw the earlier one's switch: its state has both.
+    last = max(
+        (state for channel in channels for state in channel.published),
+        key=lambda state: state.version,
+    )
+    assert not last.enabled(RELAY, names[0])
+    assert not last.enabled(RELAY, names[1])
+
+
+async def test_without_the_lock_the_writes_would_interleave(
+    prepared_relational_database: str,
+) -> None:
+    """The paired presence: the same timing with the lock taken on a key
+    nobody else uses shows the writes overlapping, so the test above
+    measures the lock and not the event loop."""
+    engines = [create_async_engine(prepared_relational_database) for _ in range(2)]
+    spans: list[tuple[float, float]] = []
+
+    async def write(engine: AsyncEngine, key: int) -> None:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text("SELECT pg_advisory_xact_lock(:k)"), {"k": key}
+            )
+            started = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.3)
+            spans.append((started, asyncio.get_running_loop().time()))
+
+    try:
+        await asyncio.gather(write(engines[0], 1), write(engines[1], 2))
+    finally:
+        for engine in engines:
+            await engine.dispose()
+    (_first_start, first_end), (second_start, _) = sorted(spans)
+    assert second_start < first_end

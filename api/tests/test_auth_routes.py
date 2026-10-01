@@ -66,6 +66,8 @@ VIEWER_ROUTES = {
     ("GET", "/uas/aircraft"),
     ("GET", "/uas/aircraft/lookup"),
     ("GET", "/uas/aircraft/{drone_id}"),
+    # U-15: every viewer sees the source switches; only an admin switches.
+    ("GET", "/sources"),
 }
 
 

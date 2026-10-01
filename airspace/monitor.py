@@ -92,6 +92,18 @@ stale, and is cleared then with the reason `stale` ("no longer tracked"),
 not `resolved`. Every clear carries its reason (`Cleared.reason`), and the
 service publishes and audits it.
 
+## A source switched off is not judged (U-15)
+
+Each source can be switched off without a deploy (`common/sources.py`). A
+message from a disabled source is counted (`rejected_source_disabled`) and
+not evaluated, whatever it says. An aircraft whose track came from a source
+that is switched off is dropped at once, not left to go stale, and every
+alert it is part of is cleared with the reason `source_disabled`: neither
+`resolved`, since nothing showed the condition false, nor `stale`, since
+the aircraft was not lost but deliberately put out of the picture. The
+same aircraft heard through a source still on (a relay aircraft that also
+broadcasts Remote ID) is tracked from that source's next message.
+
 ## Height above ground (P5-19)
 
 An aircraft is too high when its AMSL altitude minus the ground elevation
@@ -128,6 +140,7 @@ from airspace.cpa import Approach, SeparationPolicy, Track, closest_approach
 from airspace.neighbours import NeighbourIndex
 from airspace.zones import Zone, ZoneType
 from common import get_logger
+from common.sources import source_of_telemetry
 from common.terrain import Elevation
 
 _log = get_logger(__name__)
@@ -175,6 +188,8 @@ class ClearReason(StrEnum):
     RESOLVED = "resolved"
     # An aircraft involved is no longer tracked; nothing showed it clear.
     STALE = "stale"
+    # An aircraft involved came from a source that was switched off (U-15).
+    SOURCE_DISABLED = "source_disabled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +385,9 @@ class AirspaceMonitor:
     live_max_age_s: float = 10.0
     neighbour_max_age_s: float = 10.0
     source_state_max: int = 4096
+    # U-15. Whether a `(source_type, instance_id)` is switched on; None:
+    # every source is (`common.sources.SourceControlFollower.enabled`).
+    source_enabled: Callable[[str, str], bool] | None = None
 
     index: NeighbourIndex = field(init=False)
     # Messages not evaluated: the Gateway flagged a replayed backlog; the
@@ -400,6 +418,13 @@ class AirspaceMonitor:
     # between the local QNH and 1013.25 hPa. The default covers 30 hPa.
     pressure_uncertainty_m: float = DEFAULT_PRESSURE_UNCERTAINTY_M
     _vertical_unknown_logged: set[UUID] = field(default_factory=set, init=False)
+    # U-15. Messages from a source switched off, not evaluated; and aircraft
+    # dropped because their source was switched off.
+    rejected_source_disabled: int = field(default=0, init=False)
+    dropped_source_disabled: int = field(default=0, init=False)
+    _source_disabled_logged: set[UUID] = field(default_factory=set, init=False)
+    # The source each tracked aircraft's track came from.
+    _track_source: dict[UUID, tuple[str, str]] = field(default_factory=dict, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
     # The latest (`ts`, `rx_ts`) each source gave for each aircraft, so a
@@ -463,6 +488,10 @@ class AirspaceMonitor:
         height limit is not evaluated by this message, the other checks are.
         """
         drone_id = UUID(str(message["drone_id"]))
+        source = source_of_telemetry(message)
+        if not self._enabled(source):
+            return self._refuse_disabled(drone_id, source, now_s=now_s)
+        self._source_disabled_logged.discard(drone_id)
         self._labels[drone_id] = message.get("label")
         track = (
             track_from_telemetry(message, arrived_at_s=now_s)
@@ -476,12 +505,78 @@ class AirspaceMonitor:
             self._last_seen_s.pop(drone_id, None)
             for key in [k for k in self._last_by_source_s if k[0] == drone_id]:
                 del self._last_by_source_s[key]
+            self._track_source.pop(drone_id, None)
         elif not self._rejects(track, message, now_s=now_s):
             self._note_missing_times(track, message)
+            self._track_source[drone_id] = source
             raised = self._evaluate(track, height_available=height_available)
 
         cleared = self._expire(now_s)
         return Change(raised=raised, cleared=cleared)
+
+    def _enabled(self, source: tuple[str, str]) -> bool:
+        return self.source_enabled is None or self.source_enabled(*source)
+
+    def _refuse_disabled(
+        self, drone_id: UUID, source: tuple[str, str], *, now_s: float
+    ) -> Change:
+        """A message from a source switched off: counted, not evaluated, and
+        the aircraft dropped if its track came from that source."""
+        self.rejected_source_disabled += 1
+        if drone_id not in self._source_disabled_logged:
+            self._source_disabled_logged.add(drone_id)
+            _log.info(
+                "telemetry not evaluated: source disabled",
+                extra={
+                    "drone_id": str(drone_id),
+                    "source_type": source[0],
+                    "station_id": source[1],
+                    "rejected_source_disabled": self.rejected_source_disabled,
+                },
+            )
+        cleared: list[Cleared] = []
+        if self._track_source.get(drone_id) == source:
+            cleared = self._drop_disabled({drone_id})
+        return Change(raised=[], cleared=cleared + self._expire(now_s))
+
+    def apply_sources(self, *, now_s: float) -> Change:
+        """Drop every aircraft whose source is now switched off, clearing its
+        alerts as `source_disabled`. Called when the switches change, and on
+        every tick, so a change is applied even if its notice was missed."""
+        disabled = {
+            drone_id
+            for drone_id, source in self._track_source.items()
+            if not self._enabled(source)
+        }
+        cleared = self._drop_disabled(disabled) if disabled else []
+        return Change(raised=[], cleared=cleared + self._expire(now_s))
+
+    def _drop_disabled(self, drone_ids: set[UUID]) -> list[Cleared]:
+        for drone_id in drone_ids:
+            source = self._track_source.pop(drone_id, None)
+            self._labels.pop(drone_id, None)
+            self.index.remove(drone_id)
+            self._last_seen_s.pop(drone_id, None)
+            for by_source in [k for k in self._last_by_source_s if k[0] == drone_id]:
+                del self._last_by_source_s[by_source]
+            self.dropped_source_disabled += 1
+            _log.info(
+                "aircraft dropped: source disabled",
+                extra={
+                    "drone_id": str(drone_id),
+                    "source_type": None if source is None else source[0],
+                    "station_id": None if source is None else source[1],
+                    "dropped_source_disabled": self.dropped_source_disabled,
+                },
+            )
+        cleared: list[Cleared] = []
+        for key, alert in list(self._active.items()):
+            if any(drone_id in drone_ids for drone_id in alert.drone_ids):
+                cleared.append(Cleared(alert=alert, reason=ClearReason.SOURCE_DISABLED))
+                del self._active[key]
+                self._last_true_s.pop(key, None)
+                self._last_false_s.pop(key, None)
+        return cleared
 
     def _evaluate(self, track: Track, *, height_available: bool) -> list[Alert]:
         at_s = track.captured_at_s
@@ -828,6 +923,7 @@ class AirspaceMonitor:
             if now_s - seen_s > self.stale_after_s:
                 self.index.remove(drone_id)
                 del self._last_seen_s[drone_id]
+                self._track_source.pop(drone_id, None)
 
         tracked = set(self._last_seen_s)
         cleared: list[Cleared] = []

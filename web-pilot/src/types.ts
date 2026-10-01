@@ -121,6 +121,30 @@ export interface Alert {
   };
 }
 
+// U-15. What one adapter says about its sources, every few seconds
+// (gateway/source_activity.py, on `source.<type>`). Times are the adapter's.
+export type DisabledBy = "type" | "instance" | "default_deny";
+
+export interface SourceInstanceActivity {
+  instance_id: string;
+  enabled: boolean;
+  disabled_by: DisabledBy | null;
+  last_seen_at: string | null;
+  accepted: number;
+  refused_disabled: number;
+  last_refused_at: string | null;
+  // Null for an adapter without connections (Remote ID receivers).
+  connected: boolean | null;
+}
+
+export interface SourceActivity {
+  source_type: string;
+  enabled: boolean;
+  control_version: number;
+  published_at: string;
+  instances: SourceInstanceActivity[];
+}
+
 export interface Unclaimed {
   station_id: string;
   sysid: number;
@@ -133,7 +157,14 @@ export type FeedMessage =
   | { kind: "telemetry"; name: string; data: Telemetry }
   | { kind: "station"; name: string; data: Station }
   | { kind: "alert"; name: string; data: Alert }
-  | { kind: "events"; name: string; data: Omit<Unclaimed, "rejected"> };
+  | { kind: "events"; name: string; data: Omit<Unclaimed, "rejected"> }
+  | { kind: "source"; name: string; data: SourceActivity };
+
+export interface SourceReport {
+  data: SourceActivity;
+  // Browser clock when it arrived: an adapter that stopped reporting is stale.
+  receivedAt: number;
+}
 
 export interface Aircraft {
   data: Telemetry;
