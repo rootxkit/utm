@@ -1058,6 +1058,25 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
 - [x] **S-33** The Remote ID ingest uses the broadcast's pressure altitude
       where the geodetic one is missing or flagged inaccurate.
 
+- [ ] **S-34** One transmitter address carrying two serials (PR #17's
+      `address_conflicts`) is shown in the console: observations from that
+      address carry `remote_id.contested: true` while the anomaly is fresh,
+      and the track is badged. Not an airspace alert kind.
+
+- [ ] **S-35** A Location published under an identity lent by another
+      receiver records which receiver lent it (`identity_receiver`) and is
+      counted, so a spoofer reusing a victim's address in another
+      receiver's coverage is visible.
+
+- [ ] **S-36** The U-16 bridge can mark its geodetic altitude invalid or
+      poor (`--vertical-accuracy`), so pressure-altitude handling can be
+      exercised in SITL without changing the ingest's thresholds.
+
+- [ ] **S-37** A PROHIBITED zone whose only unjudged limit is WGS84 (no
+      geoid) raises the same `limit_not_judged` WARNING as an unjudged AGL
+      limit, and `prohibited_zones_without_terrain` counts zones whose
+      tiles are missing even when `TERRAIN_DIR` is set.
+
 - [ ] **S-14** *(optional, last)* Rename the `courier_*` databases, users,
       volumes and environment names, with a migration runbook. Until then
       they stay as they are, because staging depends on them.
