@@ -22,12 +22,18 @@ API (registry writes) ──same transaction──▶ known_drones.registration_
 |---|---|---|
 | `registered` | serial registered and active, owner active, and the operator ID broadcast is the owner's (case-insensitive) | `matched`; `fleet` (our own aircraft, no UAS operator, matched on serial alone); `relay_binding` (a relay track) |
 | `suspended` | the serial is registered and the UAS or its operator is suspended or revoked, whatever operator ID is broadcast | `uas_suspended`, `uas_revoked`, `operator_suspended`, `operator_revoked` |
-| `unknown_operator` | serial not registered (even if the operator is), or operator ID absent, not registered, or not the owner's | `serial_unknown`, `not_a_serial` (a CAA registration or session id as Basic ID), `operator_absent`, `operator_mismatch`, `owner_unknown`, `serial_conflict` (S-10) |
+| `unknown_operator` | serial not registered (even if the operator is), or operator ID absent, not registered, or not the owner's | `serial_unknown`, `not_a_serial` (a CAA registration or session id as Basic ID), `operator_absent`, `operator_mismatch`, `owner_unknown`, `not_in_registry` (in `known_drones` only, no relational aircraft; relay tracks too), `serial_conflict` (S-10) |
 | `unidentified` | no serial at all: S-32's unidentified transmitters, and network flights whose details could not be read | `no_serial` |
 
 `mismatch: true` whenever a registered serial comes with an operator ID that
 is not its owner's (and for `serial_conflict`); such a track is never
-`registered`. The table and its edge decisions are in
+`registered`. Operator numbers are compared on their public part,
+case-insensitively: an EU number given with its hyphen and three secret
+characters (`FIN87astrdge12k8-xyz`) is its owner's number.
+
+`registered` rests on what was broadcast: the console's hint says "as
+broadcast and unverified", and for our own fleet (`fleet`) that the serial
+alone matched. The table and its edge decisions are in
 `gateway/identification.py`.
 
 **Relay tracks (our fleet).** A relay authenticates its station and a
@@ -44,7 +50,16 @@ owner on `known_drones`, and `known_uas_operators` (registration number,
 status). It writes them inside the relational transaction of every registry
 change (a failed projection write rolls the change back), and re-projects
 everything at start and every `REGISTRY_PROJECTION_SYNC_S` (300 s), which
-repairs a lost write. Each adapter re-reads the projection every
+repairs a lost write. The re-projection marks a `known_drones` row with no
+relational aircraft `unregistered` (migration 0010), never leaving it to
+read as registered, and a failed pass, whatever the error, is logged and
+retried at the next.
+
+Every transaction that writes the projection takes a transaction-scoped
+advisory lock (`api/registry.py`, `PROJECTION_LOCK_KEY`), and the
+re-projection holds it from its read of the registry to the end of its
+write: a change made while it runs waits for it, then lands, and is never
+written over with the state read before it. Each adapter re-reads the projection every
 `REGISTRY_REFRESH_S` (5 s); a failed read keeps what it holds.
 
 Why not a NATS bucket, as U-15 does for the switches: the registry grows
@@ -62,7 +77,12 @@ identity from every source at once.
 ## The spoofing guard (S-10, absorbed)
 
 While one of our aircraft's relay telemetry is live, a broadcast of its
-serial is normally its own and is withheld (P1-15). If the broadcast is
+serial is normally its own and is withheld (P1-15). Only live relay rows
+count: a row the Gateway flagged `backlog`, or one captured more than 5 s
+before the Gateway received it, is history (a relay draining its queue
+after an outage) and neither makes the link live nor moves the position.
+The same rule (`gateway/remote_id_match.py`, `judge`) applies to network
+Remote ID flights. If the broadcast is
 more than `REMOTE_ID_SPOOF_DISTANCE_M` (300 m) from where the relay last
 placed the aircraft, it is not: it is published as a separate, unverified
 track under the broadcast's own id, `unknown_operator` with `mismatch` and
@@ -75,7 +95,7 @@ over as that aircraft (P1-15), still marked as a broadcast.
 | kind | when | severity (config) |
 |---|---|---|
 | `identification` | an `unidentified` or `unknown_operator` aircraft inside a PROHIBITED or REQ_AUTHORISATION zone, beside the zone alert | `IDENTIFICATION_ALERT_SEVERITY`, critical |
-| `identification_mismatch` | a track whose identification says `mismatch` | `IDENTIFICATION_MISMATCH_SEVERITY`, warning |
+| `identification_mismatch` | a message whose identification says `mismatch`: any live message, on the ground or without an AMSL altitude too | `IDENTIFICATION_MISMATCH_SEVERITY`, warning |
 
 Every zone alert also carries `detail.identification`. Both kinds raise
 once, clear with the usual hysteresis (or `stale`, `source_disabled`), and
@@ -110,6 +130,18 @@ this host.
   minute per kind, retried at the next poll.
 - U-15: `network_remote_id` as a type, or one provider, switched off is not
   polled at all (`skipped_disabled`, `refused_source_disabled`).
+- An SP is authenticated, not trusted. A body over
+  `NETWORK_RID_MAX_BODY_BYTES` (1 MiB) is refused unread (`oversize`);
+  flights past `NETWORK_RID_MAX_FLIGHTS_PER_RESPONSE` (500), tiles past
+  `NETWORK_RID_MAX_TILES_PER_POLL` (64, 413 splits included) and details
+  past `NETWORK_RID_MAX_DETAILS_PER_POLL` (20) are counted and left
+  (`flights_dropped`, `tiles_skipped`, `details_deferred`); details are
+  fetched `NETWORK_RID_DETAILS_CONCURRENCY` (4) at a time; a poll stops at
+  `NETWORK_RID_POLL_DEADLINE_S` (5 s) keeping what arrived
+  (`deadline_exceeded`). Each response is placed at its own receive time.
+- A flight whose serial is one of ours follows the direct Remote ID rule:
+  withheld while our relay is live and agrees, split off as
+  `serial_conflict` when it does not, ours while the relay is quiet.
 - Tracks: `source: network_remote_id`, `trust: provider`,
   `authenticated: false`, provider as `station_id`. A flight whose serial is
   registered is published under the registry's id, so the same aircraft on
