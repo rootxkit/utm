@@ -1047,6 +1047,17 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       the old ones stop.
       *Done when:* a deploy of main shows no non-2xx/3xx on a 1 s probe.
 
+- [ ] **S-32** Remote ID identity is kept per transmitter address for 60 s,
+      so a Location frame from a reused address can attach to the previous
+      serial when the new Basic ID was lost (found by U-16's drop-rate run).
+      Expire the identity when a different Basic ID or a long silence is
+      seen, and never carry it across a reboot of the transmitter.
+      *Done when:* the U-16 bridge's drop-rate run after a serial change
+      stores no Location under the old serial.
+
+- [ ] **S-33** The Remote ID ingest uses the broadcast's pressure altitude
+      where the geodetic one is missing or flagged inaccurate.
+
 - [ ] **S-14** *(optional, last)* Rename the `courier_*` databases, users,
       volumes and environment names, with a migration runbook. Until then
       they stay as they are, because staging depends on them.
@@ -1152,6 +1163,21 @@ optional there and can be made mandatory by the authority.
       feeds `make demo` (D-01).
       *Done when:* a SITL aircraft seen on both sources is one track, and
       disabling either source leaves it visible through the other.
+
+- [ ] **U-17** Operator-facing interoperability, in both directions, on
+      ASTM F3411 network Remote ID. Operators and USSPs (the first is the
+      delivery platform, `rootxkit/courier`) authenticate as service
+      accounts (OAuth 2 client credentials, per-client scopes, audited).
+      *In:* they publish their own aircraft as network Remote ID, which U-02
+      ingests as a source. *Out:* they read the traffic picture around them,
+      every other aircraft in a bounding box with its identification status
+      (U-02), trust level and age, as a Display Provider query and a live
+      stream. Only what 2021/664 Art. 8 and 11 give an operator is exposed,
+      never registry PII.
+      *Done when:* a test client publishes one SITL aircraft (U-16) and, in
+      another bounding box query, sees a second aircraft from Remote ID with
+      its status; a client without the read scope is refused; every call is
+      in `events`.
 
 - [ ] **U-01** UAS operator registry (2019/947 Art. 14): operators distinct
       from console users, with a registration number, contact and status;
@@ -1301,7 +1327,8 @@ Wave 0   Remove the delivery scope        P-01 → P-04
 Wave S   Stability and security           S-A … S-F in parallel,
                                           then S-09; S-14 optional, last
 Wave M   Monitoring features              M-01, M-02, M-05, M-07, M-09
-Wave U   U-space services (EU model)      U-15 → U-16 → U-01 → U-02 → U-03
+Wave U   U-space services (EU model)      U-15 → U-16 → U-01 → U-02 → U-17
+                                          → U-03
                                           → U-12 → U-05 → U-06
                                           → U-07 → U-04 → U-13 → U-08
                                           → U-09 → U-11; U-10, U-14 last
