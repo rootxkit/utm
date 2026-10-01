@@ -85,8 +85,8 @@ class RegistryError(RuntimeError):
 
 
 class NotFoundError(RegistryError):
-    def __init__(self, message: str) -> None:
-        super().__init__("not_found", message)
+    def __init__(self, message: str, *, code: str = "not_found") -> None:
+        super().__init__("not_found", message, code=code)
 
 
 class ConflictError(RegistryError):
@@ -414,7 +414,10 @@ class FleetRegistry:
     async def list_pilots(self) -> list[dict[str, Any]]:
         async with self.engine.connect() as connection:
             rows = await connection.execute(
-                sa.text(f"SELECT {_PILOT_COLUMNS} FROM pilots ORDER BY name")
+                sa.text(
+                    f"SELECT {_PILOT_COLUMNS} FROM pilots "
+                    "WHERE uas_operator_id IS NULL ORDER BY name"
+                )
             )
             return [_row(row) for row in rows]
 
@@ -422,6 +425,7 @@ class FleetRegistry:
         self, pilot_id: UUID, status: PilotStatus, *, actor: Actor = SYSTEM
     ) -> dict[str, Any]:
         async with self.engine.begin() as connection:
+            await _fleet_only(connection, "pilots", "pilot", pilot_id)
             updated = (
                 await connection.execute(
                     sa.text(
@@ -505,18 +509,24 @@ class FleetRegistry:
         async with self.engine.connect() as connection:
             found = (
                 await connection.execute(
-                    sa.text(f"SELECT {_DRONE_COLUMNS} FROM drones WHERE id = :id"),
+                    sa.text(
+                        f"SELECT {_DRONE_COLUMNS} FROM drones "
+                        "WHERE id = :id AND uas_operator_id IS NULL"
+                    ),
                     {"id": str(drone_id)},
                 )
             ).one_or_none()
         if found is None:
-            raise NotFoundError(f"no drone {drone_id}")
+            # A third-party UAS is not found here either; /uas/aircraft has it.
+            raise NotFoundError(f"no fleet drone {drone_id}")
         return await self._with_status(_row(found))
 
     async def list_drones(
         self, *, include_retired: bool = False
     ) -> list[dict[str, Any]]:
-        where = "" if include_retired else "WHERE retired_at IS NULL"
+        where = "WHERE uas_operator_id IS NULL" + (
+            "" if include_retired else " AND retired_at IS NULL"
+        )
         async with self.engine.connect() as connection:
             rows = await connection.execute(
                 sa.text(f"SELECT {_DRONE_COLUMNS} FROM drones {where} ORDER BY label")
@@ -539,6 +549,7 @@ class FleetRegistry:
         self, drone_id: UUID, in_maintenance: bool, *, actor: Actor = SYSTEM
     ) -> dict[str, Any]:
         async with self.engine.begin() as connection:
+            await _fleet_only(connection, "drones", "drone", drone_id)
             updated = (
                 await connection.execute(
                     sa.text(
@@ -581,6 +592,7 @@ class FleetRegistry:
         """
         at = self._now()
         async with self.engine.begin() as connection:
+            await _fleet_only(connection, "drones", "drone", drone_id)
             updated = (
                 await connection.execute(
                     sa.text(
@@ -680,6 +692,33 @@ def _set_status(
         live=live,
     )
     return drone
+
+
+async def _fleet_only(
+    connection: AsyncConnection, table: str, entity: str, entity_id: UUID
+) -> None:
+    """Refuse a fleet change to a row that belongs to a UAS operator (U-01).
+
+    `drones` and `pilots` hold both our fleet and third-party UAS and remote
+    pilots (migration 0005_uas_registry). The fleet routes change only the
+    fleet: retiring a third-party UAS here would drop it from `known_drones`
+    behind the UAS registry's back. Locked `FOR SHARE`, so an operator cannot
+    be attached to the row between this check and the change.
+    """
+    owner = (
+        await connection.execute(
+            sa.text(f"SELECT uas_operator_id FROM {table} WHERE id = :id FOR SHARE"),
+            {"id": str(entity_id)},
+        )
+    ).one_or_none()
+    if owner is None:
+        raise NotFoundError(f"no {entity} {entity_id}")
+    if owner.uas_operator_id is not None:
+        raise ConflictError(
+            f"{entity} {entity_id} belongs to a UAS operator; change it through "
+            "the UAS registry (/uas)",
+            code="not_fleet",
+        )
 
 
 def _opt(value: UUID | None) -> str | None:
