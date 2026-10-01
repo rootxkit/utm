@@ -56,7 +56,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import nats
 from nats.aio.msg import Msg
@@ -72,7 +71,7 @@ from gateway.identification import resolve_remote_id, serial_conflict
 from gateway.publisher import Bus
 from gateway.rate_limit import RateLimiter
 from gateway.registry_projection import RegistryFollower, RegistrySnapshot
-from gateway.remote_id import Frame, RemoteIdTracker
+from gateway.remote_id import SOURCE, Frame, RemoteIdTracker
 from gateway.remote_id_auth import (
     AuthenticationError,
     ReceiverAuthenticator,
@@ -83,9 +82,10 @@ from gateway.remote_id_match import (
     DEFAULT_SPOOF_DISTANCE_M,
     FleetSerials,
     LinkFreshness,
-    Registered,
+    Verdict,
     as_registered,
-    distance_m,
+    judge,
+    report_conflict,
 )
 from gateway.remote_id_store import PendingRows, RemoteIdWriter, row_from_observation
 from gateway.source_activity import SourceActivity, publish_periodically
@@ -209,11 +209,28 @@ class RemoteIdIngest:
             return
         if observation is None:
             return
-        ours = self.fleet.match(observation)
-        conflict = ours is not None and self._elsewhere(ours, observation)
+        lat, lon = observation.get("lat_deg"), observation.get("lon_deg")
+        judgement = judge(
+            self.fleet.match(observation),
+            None if lat is None or lon is None else (float(lat), float(lon)),
+            self.links,
+            now_s=self.clock_s(),
+            spoof_distance_m=self.spoof_distance_m,
+        )
+        conflict = judgement.verdict is Verdict.CONFLICT
         if conflict:
             # S-10: not our aircraft, whatever serial it claims.
-            ours = None
+            self.serial_conflicts += 1
+            report_conflict(
+                self.refusals,
+                judgement,
+                broadcast_drone_id=observation["drone_id"],
+                station_id=observation.get("station_id"),
+                source=SOURCE,
+                spoof_distance_m=self.spoof_distance_m,
+                serial_conflicts=self.serial_conflicts,
+            )
+        ours = None if conflict else judgement.aircraft
         if self.store is not None:
             # Before publishing: a bus failure must not lose the record too.
             self.store.add(
@@ -227,10 +244,10 @@ class RemoteIdIngest:
                     matched_drone_id=None if ours is None else ours.drone_id,
                 )
             )
-        if ours is not None:
-            if self.links.live(ours.drone_id, now_s=self.clock_s()):
-                self.withheld += 1
-                return
+        if judgement.verdict is Verdict.WITHHOLD:
+            self.withheld += 1
+            return
+        if judgement.verdict is Verdict.AS_OURS and ours is not None:
             observation = as_registered(observation, ours)
         rid = observation["remote_id"]
         identification = (
@@ -252,37 +269,6 @@ class RemoteIdIngest:
             return
         self.published += 1
         self.identified_as[identification.status.value] += 1
-
-    def _elsewhere(self, ours: Registered, observation: dict[str, Any]) -> bool:
-        """Whether our aircraft's live relay telemetry places it more than
-        `spoof_distance_m` from the broadcast (S-10)."""
-        now_s = self.clock_s()
-        if not self.links.live(ours.drone_id, now_s=now_s):
-            return False
-        relay = self.links.position(ours.drone_id)
-        lat, lon = observation.get("lat_deg"), observation.get("lon_deg")
-        if relay is None or lat is None or lon is None:
-            return False
-        apart_m = distance_m(relay, (float(lat), float(lon)))
-        if apart_m <= self.spoof_distance_m:
-            return False
-        self.serial_conflicts += 1
-        suppressed = self.refusals.admit(("serial_conflict", ours.drone_id))
-        if suppressed is not None:
-            _log.warning(
-                "remote id broadcast of our serial away from our aircraft; "
-                "published as a separate unverified track",
-                extra={
-                    "drone_id": str(ours.drone_id),
-                    "broadcast_drone_id": observation["drone_id"],
-                    "apart_m": round(apart_m),
-                    "spoof_distance_m": self.spoof_distance_m,
-                    "station_id": observation.get("station_id"),
-                    "suppressed": suppressed,
-                    "serial_conflicts": self.serial_conflicts,
-                },
-            )
-        return True
 
     def status(self) -> dict[str, int]:
         """The running totals, as the status line logs them."""

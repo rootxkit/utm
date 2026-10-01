@@ -43,6 +43,8 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -51,6 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from common import get_logger
 from gateway import odid
+from gateway.rate_limit import RateLimiter
 from gateway.registry_projection import RegistrySnapshot
 
 _log = get_logger(__name__)
@@ -86,6 +89,10 @@ class FleetSerials:
         if rid["id_type"] != odid.IdType.SERIAL_NUMBER:
             return None
         return self.by_serial.get(rid["ua_id"])
+
+    def match_serial(self, serial: str | None) -> Registered | None:
+        """A serial from any source (network Remote ID's `uas_id`)."""
+        return None if not serial else self.by_serial.get(serial)
 
     async def refresh(self, engine: AsyncEngine) -> None:
         async with engine.connect() as connection:
@@ -123,15 +130,30 @@ class LinkFreshness:
     _heard_s: dict[UUID, float] = field(default_factory=dict, init=False)
     _position: dict[UUID, tuple[float, float]] = field(default_factory=dict, init=False)
 
+    # Rows the link's liveness and position were not taken from: a relay
+    # backlog, or a row captured too long before the Gateway received it.
+    ignored_history: int = field(default=0, init=False)
+
     def on_telemetry(self, payload: bytes, *, now_s: float) -> None:
-        """A `telemetry.*` message from the bus. Only relay telemetry
+        """A `telemetry.*` message from the bus. Only live relay telemetry
         counts: it carries no `source`, where every broadcast source (direct
-        and network Remote ID) names itself."""
+        and network Remote ID) names itself.
+
+        A row the Gateway flagged `backlog`, or one whose `captured_at` is
+        more than `live_for_s` behind its `rx_ts`, is history: a relay
+        draining its queue after an outage delivers minutes-old positions,
+        and taking them as where the aircraft is now would make its own
+        current broadcast look like a spoof (S-10). Such rows neither make
+        the link live nor move the position.
+        """
         try:
             message = json.loads(payload)
             if message.get("source") not in (None, "relay"):
                 return
             drone_id = UUID(str(message["drone_id"]))
+            if _history(message, self.live_for_s):
+                self.ignored_history += 1
+                return
             self._heard_s[drone_id] = now_s
             lat, lon = message.get("lat_deg"), message.get("lon_deg")
             if isinstance(lat, int | float) and isinstance(lon, int | float):
@@ -146,6 +168,96 @@ class LinkFreshness:
     def position(self, drone_id: UUID) -> tuple[float, float] | None:
         """Where the relay last placed the drone; None if it never did."""
         return self._position.get(drone_id)
+
+
+def _history(message: dict[str, Any], live_for_s: float) -> bool:
+    """A relay row that says where the aircraft was, not where it is."""
+    if message.get("backlog") is True:
+        return True
+    captured, received = message.get("captured_at"), message.get("rx_ts")
+    if not isinstance(captured, str) or not isinstance(received, str):
+        return False
+    behind_s = (
+        datetime.fromisoformat(received) - datetime.fromisoformat(captured)
+    ).total_seconds()
+    return behind_s > live_for_s
+
+
+class Verdict(StrEnum):
+    """What a broadcast claiming a serial is, against our fleet (U-02)."""
+
+    # Not one of our serials.
+    STRANGER = "stranger"
+    # Ours, its relay telemetry live and agreeing: the relay track is better.
+    WITHHOLD = "withhold"
+    # Ours, its relay quiet: the broadcast speaks for it (P1-15).
+    AS_OURS = "as_ours"
+    # Ours by serial, but away from where its live relay telemetry places it
+    # (S-10): a separate, unverified track.
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class FleetJudgement:
+    verdict: Verdict
+    aircraft: Registered | None = None
+    # How far from the relay's position, when that was judged.
+    apart_m: float | None = None
+
+
+def judge(
+    ours: Registered | None,
+    position: tuple[float, float] | None,
+    links: LinkFreshness,
+    *,
+    now_s: float,
+    spoof_distance_m: float,
+) -> FleetJudgement:
+    """One rule for every broadcast source, direct and network Remote ID:
+    withhold, speak for our aircraft, or split off as a conflict."""
+    if ours is None:
+        return FleetJudgement(Verdict.STRANGER)
+    if not links.live(ours.drone_id, now_s=now_s):
+        return FleetJudgement(Verdict.AS_OURS, ours)
+    relay = links.position(ours.drone_id)
+    if relay is None or position is None:
+        return FleetJudgement(Verdict.WITHHOLD, ours)
+    apart_m = distance_m(relay, position)
+    if apart_m > spoof_distance_m:
+        return FleetJudgement(Verdict.CONFLICT, ours, apart_m)
+    return FleetJudgement(Verdict.WITHHOLD, ours, apart_m)
+
+
+def report_conflict(
+    limiter: RateLimiter,
+    judgement: FleetJudgement,
+    *,
+    broadcast_drone_id: str,
+    station_id: object,
+    source: str,
+    spoof_distance_m: float,
+    serial_conflicts: int,
+) -> None:
+    """Log an S-10 conflict, at most once per aircraft per interval."""
+    if judgement.aircraft is None:
+        return
+    suppressed = limiter.admit(("serial_conflict", judgement.aircraft.drone_id))
+    if suppressed is None:
+        return
+    _log.warning(
+        "broadcast of our serial away from our aircraft; published as a "
+        "separate unverified track",
+        extra={
+            "drone_id": str(judgement.aircraft.drone_id),
+            "broadcast_drone_id": broadcast_drone_id,
+            "source": source,
+            "apart_m": None if judgement.apart_m is None else round(judgement.apart_m),
+            "spoof_distance_m": spoof_distance_m,
+            "station_id": station_id,
+            "suppressed": suppressed,
+            "serial_conflicts": serial_conflicts,
+        },
+    )
 
 
 def as_registered(observation: dict[str, Any], aircraft: Registered) -> dict[str, Any]:

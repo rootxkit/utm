@@ -423,3 +423,80 @@ def test_fleet_serials_follow_the_snapshot() -> None:
     fleet = FleetSerials()
     fleet.take(snapshot())
     assert fleet.by_serial["SN-FLEET"] == Registered(drone_id=FLEET, label="hexa-01")
+
+
+# --- a relay draining its backlog is history, not where the aircraft is -----------
+
+
+def relay_row(
+    lat: float, lon: float, *, backlog: bool = False, behind_s: float = 0.0
+) -> bytes:
+    """A relay row as the Gateway publishes it: received at NOW, captured
+    `behind_s` earlier."""
+    from datetime import timedelta
+
+    return json.dumps(
+        {
+            "drone_id": str(FLEET),
+            "lat_deg": lat,
+            "lon_deg": lon,
+            "backlog": backlog,
+            "rx_ts": NOW.isoformat(),
+            "captured_at": (NOW - timedelta(seconds=behind_s)).isoformat(),
+        }
+    ).encode()
+
+
+async def test_a_backlog_drain_does_not_split_our_aircraft_off() -> None:
+    """After an outage the relay drains minutes-old positions 4 km away.
+    Those are history: the link is not live from them, so our aircraft's
+    current broadcast speaks for it, and is not a spoof."""
+    bus = FakeBus()
+    ingest = service(bus)
+    for _ in range(20):
+        ingest.links.on_telemetry(relay_row(LAT, LON + 0.05, backlog=True), now_s=0.0)
+
+    await ingest.on_datagram(datagram(pack(basic("SN-FLEET"), location())), "x")
+
+    [message] = bus.sent
+    assert message["drone_id"] == str(FLEET)
+    assert message["identification"]["status"] == "registered"
+    assert ingest.serial_conflicts == 0
+    assert ingest.links.ignored_history == 20
+
+
+async def test_old_rows_not_flagged_backlog_are_history_too() -> None:
+    """Captured 120 s before the Gateway received them: not where it is."""
+    bus = FakeBus()
+    ingest = service(bus)
+    ingest.links.on_telemetry(relay_row(LAT, LON + 0.05, behind_s=120.0), now_s=0.0)
+
+    await ingest.on_datagram(datagram(pack(basic("SN-FLEET"), location())), "x")
+
+    assert bus.sent[0]["drone_id"] == str(FLEET)
+    assert ingest.serial_conflicts == 0
+
+
+async def test_a_drain_after_live_rows_leaves_the_live_position() -> None:
+    """Live and nearby, then a drain of far-away history: still withheld."""
+    bus = FakeBus()
+    ingest = service(bus)
+    ingest.links.on_telemetry(relay_row(LAT, LON + 0.001), now_s=0.0)
+    ingest.links.on_telemetry(relay_row(LAT, LON + 0.05, backlog=True), now_s=0.0)
+
+    await ingest.on_datagram(datagram(pack(basic("SN-FLEET"), location())), "x")
+
+    assert bus.sent == []
+    assert ingest.withheld == 1
+
+
+async def test_a_live_row_far_away_still_splits_it_off() -> None:
+    """The presence half: current relay telemetry 4 km away."""
+    bus = FakeBus()
+    ingest = service(bus)
+    ingest.links.on_telemetry(relay_row(LAT, LON + 0.05, behind_s=0.5), now_s=0.0)
+
+    await ingest.on_datagram(datagram(pack(basic("SN-FLEET"), location())), "x")
+
+    assert bus.sent[0]["identification"]["reason"] == "serial_conflict"
+    assert ingest.serial_conflicts == 1
