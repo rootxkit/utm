@@ -82,7 +82,8 @@ export interface Alert {
   state: "raised" | "active" | "cleared";
   key: string;
   kind: "conflict" | "zone" | "height";
-  severity: "critical" | "warning";
+  // "info" only for a CONDITIONAL zone when policy says so (U-03).
+  severity: "critical" | "warning" | "info";
   drone_ids: string[];
   labels: (string | null)[];
   detail: {
@@ -90,14 +91,36 @@ export interface Alert {
     d_cpa_horizontal_m?: number;
     d_alt_at_cpa_m?: number;
     d_horizontal_now_m?: number;
-    zone_name?: string;
-    zone_type?: string;
+    // Zones (U-03): the ED-269 zone and the aircraft's height in each
+    // reference its limits use.
+    zone_id?: string;
+    identifier?: string;
+    zone_name?: string | null;
+    restriction?: "PROHIBITED" | "REQ_AUTHORISATION" | "CONDITIONAL" | "NO_RESTRICTION";
+    reason?: string[];
+    message?: string | null;
+    lower_limit_m?: number;
+    lower_reference?: string;
+    upper_limit_m?: number;
+    upper_reference?: string;
+    alt_hae_m?: number;
     alt_amsl_m?: number;
     height_agl_m?: number;
     max_height_agl_m?: number;
     ground_elevation_m?: number;
     dataset?: string;
   };
+}
+
+const SEVERITY_RANK: Record<Alert["severity"], number> = { info: 0, warning: 1, critical: 2 };
+
+// The more severe of two, for an aircraft in several alerts at once.
+export function worse(a: Alert["severity"] | undefined, b: Alert["severity"]): Alert["severity"] {
+  return a !== undefined && SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b;
+}
+
+export function bySeverity(a: Alert, b: Alert): number {
+  return SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity];
 }
 
 export interface Unclaimed {

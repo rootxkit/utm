@@ -1,18 +1,50 @@
-// The operator console (P6-01, P6-02, P6-03): map, aircraft, alerts, stations.
-// It reads the console feed and the API, never a database.
+// The operator console (P6-01, P6-02, P6-03): map, aircraft, alerts, stations,
+// and the zones with their editor (U-03). It reads the console feed and the
+// API, never a database.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { SignInRequired, apiGet, apiPost } from "./api/client";
+import { SignInRequired, apiGet, apiPost, apiSend } from "./api/client";
 import { AircraftList } from "./components/AircraftList";
 import { AlertsPanel } from "./components/AlertsPanel";
 import { DronePanel } from "./components/DronePanel";
 import { RegistryView } from "./components/RegistryView";
 import { StationsPanel, UnclaimedPanel } from "./components/StationsPanel";
 import { type Me, TopBar, type View } from "./components/TopBar";
+import { type EditorState, ZoneDetail, ZoneEditor } from "./components/ZoneEditor";
+import { ZonesPanel } from "./components/ZonesPanel";
 import { useFeed } from "./feed";
 import { I18n, type Lang, translator } from "./i18n";
 import { type Base, type Layers, MapView, type Zone } from "./map/MapView";
+import {
+  type LonLat,
+  type ZoneOut,
+  distanceM,
+  draftGeometry,
+  emptyForm,
+  featureFromForm,
+  formFromFeature,
+  refusalLines,
+} from "./zones";
 
-type Tab = "aircraft" | "alerts" | "stations" | "unclaimed";
+type Tab = "aircraft" | "alerts" | "zones" | "stations" | "unclaimed";
+
+// Who may change zones: the API's ZONE_WRITERS (api/zone_routes.py), which
+// decides; this only hides what would be refused. U-13 adds the regulator.
+const ZONE_WRITERS = new Set(["admin"]);
+const FEET_M = 0.3048;
+
+function newEditor(zone: ZoneOut | null, country: string): EditorState {
+  const opened = zone ? formFromFeature(zone.feature) : null;
+  return {
+    zoneId: zone?.id ?? null,
+    form: opened?.form ?? emptyForm(country),
+    shape: opened?.shape ?? null,
+    drawing: null,
+    circleCenter: null,
+    errors: [],
+    refused: [],
+    saving: false,
+  };
+}
 
 const LANG_KEY = "courier.lang";
 // How often zones and bases are re-read. A display choice, not flight data.
@@ -68,6 +100,8 @@ export function App() {
   const [bases, setBases] = useState<Base[]>([]);
   const [tab, setTab] = useState<Tab>("aircraft");
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedZone, setSelectedZone] = useState<string | null>(null);
+  const [editor, setEditor] = useState<EditorState | null>(null);
   const [acknowledged, setAcknowledged] = useState<Set<string>>(new Set());
   const [layers, setLayers] = useState<Layers>({ zones: true, bases: true, labels: true });
   const { state, status } = useFeed(me ? feedUrl : null);
@@ -102,15 +136,18 @@ export function App() {
 
   // Zones and bases change while the console is open (an admin adds a zone),
   // so they are re-read. A failed read keeps what was drawn and says so.
+  const loadZones = useCallback(() => {
+    apiGet("/airspace/zones")
+      .then((z) => {
+        setZones(z);
+        setZonesFailed(false);
+      })
+      .catch(() => setZonesFailed(true));
+  }, []);
   useEffect(() => {
     if (!me) return;
     const load = () => {
-      apiGet("/airspace/zones")
-        .then((z) => {
-          setZones(z);
-          setZonesFailed(false);
-        })
-        .catch(() => setZonesFailed(true));
+      loadZones();
       apiGet("/bases")
         .then(setBases)
         .catch(() => setZonesFailed(true));
@@ -118,7 +155,69 @@ export function App() {
     load();
     const timer = window.setInterval(load, REGISTRY_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [me]);
+  }, [me, loadZones]);
+
+  // A click on the map: a corner or a circle while drawing, else the zone
+  // under it is selected.
+  const mapClick = useCallback(
+    (point: LonLat, zoneId: string | null) => {
+      if (editor?.drawing === "polygon") {
+        const points = editor.shape?.kind === "polygon" ? editor.shape.points : [];
+        setEditor({ ...editor, shape: { kind: "polygon", points: [...points, point] } });
+      } else if (editor?.drawing === "circle") {
+        if (!editor.circleCenter) {
+          setEditor({ ...editor, circleCenter: point, shape: null });
+        } else {
+          const metres = distanceM(editor.circleCenter, point);
+          const radius = editor.form.uom === "FT" ? metres / FEET_M : metres;
+          setEditor({
+            ...editor,
+            drawing: null,
+            circleCenter: null,
+            shape: { kind: "circle", center: editor.circleCenter, radius: Math.round(radius) },
+          });
+        }
+      } else if (zoneId && !editor) {
+        setSelectedZone(zoneId);
+        setTab("zones");
+      }
+    },
+    [editor],
+  );
+
+  const saveZone = async () => {
+    if (!editor) return;
+    const built = featureFromForm(editor.form, editor.shape);
+    if (!built.feature) {
+      setEditor({ ...editor, errors: built.errors, refused: [] });
+      return;
+    }
+    setEditor({ ...editor, errors: [], refused: [], saving: true });
+    const response = await apiSend(
+      editor.zoneId ? "PUT" : "POST",
+      editor.zoneId ? `/airspace/zones/${editor.zoneId}` : "/airspace/zones",
+      JSON.stringify(built.feature),
+    );
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) {
+      setEditor({ ...editor, errors: [], refused: refusalLines(body), saving: false });
+      return;
+    }
+    setEditor(null);
+    setSelectedZone((body as ZoneOut).id);
+    loadZones();
+  };
+
+  const deleteZone = async (zone: ZoneOut) => {
+    if (!window.confirm(t("zone_delete_confirm", { id: zone.feature.identifier }))) return;
+    const response = await apiSend("DELETE", `/airspace/zones/${zone.id}`);
+    if (response.ok) {
+      setSelectedZone(null);
+      loadZones();
+    } else {
+      window.alert(refusalLines(await response.json().catch(() => null)).join("\n"));
+    }
+  };
 
   // Acknowledgements of alerts that have cleared are forgotten, so the same
   // pair converging again sounds again.
@@ -153,12 +252,16 @@ export function App() {
   if (!me) return <div className="loading">{t("product_name")}…</div>;
 
   const canAcknowledge = me.role === "operator" || me.role === "admin";
+  const canWriteZones = ZONE_WRITERS.has(me.role);
+  const zoneShown = zones.find((zone) => zone.id === selectedZone) ?? null;
+  const defaultCountry = zones.find((zone) => zone.type === "geozone")?.feature.country ?? "";
   const selectedAlerts = selected
     ? [...state.alerts.values()].filter((a) => a.drone_ids.includes(selected))
     : [];
   const tabs: [Tab, string, number][] = [
     ["aircraft", t("aircraft"), state.aircraft.size],
     ["alerts", t("alerts"), state.alerts.size],
+    ["zones", t("geozones"), zones.length],
     ["stations", t("stations"), state.stations.size],
     ["unclaimed", t("unclaimed"), state.unclaimed.size],
   ];
@@ -213,6 +316,22 @@ export function App() {
                     onSelect={select}
                   />
                 )}
+                {tab === "zones" && (
+                  <ZonesPanel
+                    zones={zones}
+                    selected={selectedZone}
+                    canWrite={canWriteZones}
+                    onSelect={(id) => {
+                      setEditor(null);
+                      setSelectedZone(id);
+                    }}
+                    onNew={() => {
+                      setSelectedZone(null);
+                      setEditor(newEditor(null, defaultCountry));
+                    }}
+                    onChanged={loadZones}
+                  />
+                )}
                 {tab === "stations" && <StationsPanel stations={state.stations} />}
                 {tab === "unclaimed" && <UnclaimedPanel unclaimed={state.unclaimed} />}
               </div>
@@ -240,9 +359,30 @@ export function App() {
                 layers={layers}
                 selected={selected}
                 onSelect={select}
+                selectedZone={selectedZone}
+                draft={
+                  editor ? draftGeometry(editor.shape, editor.form.uom, editor.circleCenter) : null
+                }
+                drawing={Boolean(editor?.drawing)}
+                onMapClick={mapClick}
               />
             </main>
-            {selected ? (
+            {editor ? (
+              <ZoneEditor
+                state={editor}
+                onChange={setEditor}
+                onSave={() => void saveZone()}
+                onCancel={() => setEditor(null)}
+              />
+            ) : zoneShown && tab === "zones" ? (
+              <ZoneDetail
+                zone={zoneShown}
+                canWrite={canWriteZones}
+                onEdit={() => setEditor(newEditor(zoneShown, defaultCountry))}
+                onDelete={() => void deleteZone(zoneShown)}
+                onClose={() => setSelectedZone(null)}
+              />
+            ) : selected ? (
               <DronePanel
                 droneId={selected}
                 aircraft={state.aircraft.get(selected)}

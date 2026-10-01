@@ -3,7 +3,7 @@
 // does when the condition is gone, and it is not yet recorded (P6-07).
 import { DASH, num, shortId } from "../format";
 import { useT } from "../i18n";
-import type { Aircraft, Alert } from "../types";
+import { type Aircraft, type Alert, bySeverity } from "../types";
 
 interface Props {
   alerts: Map<string, Alert>;
@@ -37,9 +37,7 @@ export function AlertsPanel({
       </span>
     ) : null;
   if (alerts.size === 0) return <p className="muted pad">{t("none")}</p>;
-  const ordered = [...alerts.values()].sort(
-    (a, b) => Number(b.severity === "critical") - Number(a.severity === "critical"),
-  );
+  const ordered = [...alerts.values()].sort(bySeverity);
   return (
     <ul className="list">
       {ordered.map((alert) => {
@@ -111,16 +109,17 @@ export function AlertsPanel({
                   >
                     {name(alert, 0)}
                   </button>
-                  {broadcastOnly(alert.drone_ids[0])} {t("in_zone", { zone: d.zone_name ?? DASH })}
+                  {broadcastOnly(alert.drone_ids[0])}{" "}
+                  {t("in_zone", { zone: d.zone_name ?? d.identifier ?? DASH })}
                 </div>
                 <div className="small muted">
-                  {d.zone_type === "no_fly" ||
-                  d.zone_type === "restricted" ||
-                  d.zone_type === "corridor"
-                    ? t(d.zone_type)
-                    : (d.zone_type ?? "")}
+                  {d.restriction ? t(`restriction_${d.restriction}`) : ""}
+                  {d.identifier && ` · ${d.identifier}`}
                   {d.alt_amsl_m !== undefined && ` · ${num(d.alt_amsl_m, 0, "m AMSL")}`}
+                  {d.height_agl_m !== undefined && ` · ${num(d.height_agl_m, 0, "m AGL")}`}
+                  {d.alt_hae_m !== undefined && ` · ${num(d.alt_hae_m, 0, "m WGS84")}`}
                 </div>
+                {d.message && <div className="small">{d.message}</div>}
               </>
             )}
             {!acked &&

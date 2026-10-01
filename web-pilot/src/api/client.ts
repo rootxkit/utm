@@ -41,11 +41,21 @@ export async function apiLookup<P extends keyof paths>(
 // State changes carry X-Courier-Request, which a form on another site cannot
 // send (api/auth.py). The API refuses a cookie-authenticated change without it.
 export async function apiPost(path: string, body?: unknown): Promise<Response> {
+  return apiSend("POST", path, body === undefined ? undefined : JSON.stringify(body));
+}
+
+// Any change: a JSON body already encoded (an uploaded file is sent as it
+// was read, not parsed and re-encoded), or none.
+export async function apiSend(
+  method: "POST" | "PUT" | "DELETE",
+  path: string,
+  body?: string,
+): Promise<Response> {
   const response = await fetch(path, {
-    method: "POST",
+    method,
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", "X-Courier-Request": "1" },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    body,
   });
   if (response.status === 401) toSignIn();
   return response;

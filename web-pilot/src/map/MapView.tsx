@@ -1,5 +1,6 @@
 // P6-01. The live map: basemap, zones, bases, aircraft and the conflicts
-// between them. The map is created once; everything drawn on it is updated
+// between them. U-03: zones styled by restriction, faint and dashed while
+// they do not apply, and the shape being drawn in the zone editor. The map is created once; everything drawn on it is updated
 // from props. A style change (basemap arriving, language, dark mode) drops
 // every source, so the overlays are re-added on each `style.load`.
 import maplibregl, { type GeoJSONSource, type Map as MapLibre } from "maplibre-gl";
@@ -8,7 +9,8 @@ import { useEffect, useRef, useState } from "react";
 import type { Feature, FeatureCollection, Geometry } from "geojson";
 import type { GetResponse } from "../api/client";
 import { useI18n } from "../i18n";
-import type { Aircraft, Alert } from "../types";
+import { type Aircraft, type Alert, worse } from "../types";
+import { type LonLat, zoneStyle } from "../zones";
 import { BASEMAP_URL, type BasemapInfo, basemapStyle } from "./basemap";
 
 export type Zone = GetResponse<"/airspace/zones">[number];
@@ -20,6 +22,13 @@ export interface Layers {
   labels: boolean;
 }
 
+// The shape being drawn in the zone editor, ready to draw.
+export interface Draft {
+  ring: LonLat[] | null;
+  line: LonLat[] | null;
+  points: LonLat[];
+}
+
 interface Props {
   aircraft: Map<string, Aircraft>;
   alerts: Map<string, Alert>;
@@ -28,15 +37,13 @@ interface Props {
   layers: Layers;
   selected: string | null;
   onSelect: (droneId: string) => void;
+  selectedZone: string | null;
+  draft: Draft | null;
+  // While drawing, a click places a point instead of selecting a zone.
+  drawing: boolean;
+  // A click on the map, with the zone under it (if any).
+  onMapClick: (lngLat: LonLat, zoneId: string | null) => void;
 }
-
-// Colours by zone type, as in the minimal map. Not flight data: a display choice.
-const ZONE_COLOURS: Record<string, string> = {
-  no_fly: "#c62828",
-  restricted: "#ef6c00",
-  corridor: "#2e7d32",
-  base: "#1565c0",
-};
 
 let protocolAdded = false;
 function addPmtilesProtocol(): void {
@@ -49,19 +56,48 @@ const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 type Collection = FeatureCollection;
 
-function zonesGeoJson(zones: Zone[]): Collection {
+function zonesGeoJson(zones: Zone[], selectedZone: string | null): Collection {
   return {
     type: "FeatureCollection",
-    features: zones.map((zone) => ({
-      type: "Feature",
-      geometry: zone.geometry as unknown as Geometry,
-      properties: {
-        name: zone.name,
-        type: zone.type,
-        colour: ZONE_COLOURS[zone.type] ?? "#616161",
-      },
-    })),
+    features: zones.map((zone) => {
+      const style = zoneStyle(zone);
+      return {
+        type: "Feature",
+        geometry: zone.geometry as unknown as Geometry,
+        properties: {
+          id: zone.id,
+          name: zone.feature.name ?? zone.feature.identifier,
+          colour: style.colour,
+          opacity: style.fillOpacity,
+          dashed: style.dashed,
+          selected: zone.id === selectedZone,
+        },
+      };
+    }),
   };
+}
+
+function draftGeoJson(draft: Draft | null): Collection {
+  if (!draft) return EMPTY;
+  const features: Feature[] = draft.points.map((point) => ({
+    type: "Feature",
+    geometry: { type: "Point", coordinates: point },
+    properties: {},
+  }));
+  if (draft.ring) {
+    features.push({
+      type: "Feature",
+      geometry: { type: "Polygon", coordinates: [draft.ring] },
+      properties: {},
+    });
+  } else if (draft.line) {
+    features.push({
+      type: "Feature",
+      geometry: { type: "LineString", coordinates: draft.line },
+      properties: {},
+    });
+  }
+  return { type: "FeatureCollection", features };
 }
 
 function basesGeoJson(bases: Base[]): Collection {
@@ -102,7 +138,7 @@ const EMPTY: Collection = { type: "FeatureCollection", features: [] };
 
 function addOverlays(map: MapLibre): void {
   if (map.getLayer("conflicts")) return;
-  for (const id of ["zones", "bases", "conflicts"]) {
+  for (const id of ["zones", "bases", "conflicts", "draft"]) {
     if (!map.getSource(id)) map.addSource(id, { type: "geojson", data: EMPTY });
   }
   const labels = Boolean(map.getStyle().glyphs);
@@ -110,13 +146,27 @@ function addOverlays(map: MapLibre): void {
     id: "zones-fill",
     type: "fill",
     source: "zones",
-    paint: { "fill-color": ["get", "colour"], "fill-opacity": 0.15 },
+    paint: { "fill-color": ["get", "colour"], "fill-opacity": ["get", "opacity"] },
   });
   map.addLayer({
     id: "zones-line",
     type: "line",
     source: "zones",
-    paint: { "line-color": ["get", "colour"], "line-width": 2 },
+    filter: ["!", ["get", "dashed"]],
+    paint: { "line-color": ["get", "colour"], "line-width": ["case", ["get", "selected"], 4, 2] },
+  });
+  // A zone that does not apply now: dashed, so "not in force" does not rest
+  // on colour alone.
+  map.addLayer({
+    id: "zones-line-inactive",
+    type: "line",
+    source: "zones",
+    filter: ["get", "dashed"],
+    paint: {
+      "line-color": ["get", "colour"],
+      "line-width": ["case", ["get", "selected"], 4, 2],
+      "line-dasharray": [3, 3],
+    },
   });
   map.addLayer({
     id: "bases",
@@ -156,6 +206,32 @@ function addOverlays(map: MapLibre): void {
       paint: { "text-color": "#1565c0", "text-halo-color": "#fff", "text-halo-width": 1 },
     });
   }
+  map.addLayer({
+    id: "draft-fill",
+    type: "fill",
+    source: "draft",
+    filter: ["==", ["geometry-type"], "Polygon"],
+    paint: { "fill-color": "#6a1b9a", "fill-opacity": 0.2 },
+  });
+  map.addLayer({
+    id: "draft-line",
+    type: "line",
+    source: "draft",
+    filter: ["!=", ["geometry-type"], "Point"],
+    paint: { "line-color": "#6a1b9a", "line-width": 2, "line-dasharray": [2, 1] },
+  });
+  map.addLayer({
+    id: "draft-points",
+    type: "circle",
+    source: "draft",
+    filter: ["==", ["geometry-type"], "Point"],
+    paint: {
+      "circle-radius": 5,
+      "circle-color": "#6a1b9a",
+      "circle-stroke-color": "#fff",
+      "circle-stroke-width": 2,
+    },
+  });
   map.addLayer({
     id: "conflicts",
     type: "line",
@@ -205,7 +281,19 @@ function makeMarker(droneId: string, onSelect: (id: string) => void): MarkerEntr
   };
 }
 
-export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSelect }: Props) {
+export function MapView({
+  aircraft,
+  alerts,
+  zones,
+  bases,
+  layers,
+  selected,
+  onSelect,
+  selectedZone,
+  draft,
+  drawing,
+  onMapClick,
+}: Props) {
   const { lang, t } = useI18n();
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibre | null>(null);
@@ -218,6 +306,10 @@ export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSe
   useEffect(() => {
     onSelectRef.current = onSelect;
   }, [onSelect]);
+  const onMapClickRef = useRef(onMapClick);
+  useEffect(() => {
+    onMapClickRef.current = onMapClick;
+  }, [onMapClick]);
 
   // Is a basemap installed? The PMTiles header answers, and carries its bounds.
   useEffect(() => {
@@ -272,6 +364,16 @@ export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSe
     map.addControl(new maplibregl.NavigationControl(), "top-right");
     map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-right");
     map.on("style.load", () => setStyleEpoch((epoch) => epoch + 1));
+    map.on("click", (event) => {
+      const zone = map.getLayer("zones-fill")
+        ? map.queryRenderedFeatures(event.point, { layers: ["zones-fill"] })[0]
+        : undefined;
+      const zoneId: unknown = zone?.properties?.id;
+      onMapClickRef.current(
+        [event.lngLat.lng, event.lngLat.lat],
+        typeof zoneId === "string" ? zoneId : null,
+      );
+    });
     mapRef.current = map;
     const current = markers.current;
     return () => {
@@ -306,13 +408,28 @@ export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSe
   useEffect(() => {
     const map = mapRef.current;
     if (!map || styleEpoch === 0) return;
-    setData(map, "zones", zonesGeoJson(zones));
+    setData(map, "zones", zonesGeoJson(zones, selectedZone));
     setData(map, "bases", basesGeoJson(bases));
-    setVisible(map, ["zones-fill", "zones-line"], layers.zones);
+    setVisible(map, ["zones-fill", "zones-line", "zones-line-inactive"], layers.zones);
     setVisible(map, ["bases", "bases-label"], layers.bases);
     setVisible(map, ["zones-label"], layers.zones && layers.labels);
     setVisible(map, ["bases-label"], layers.bases && layers.labels);
-  }, [styleEpoch, zones, bases, layers]);
+  }, [styleEpoch, zones, bases, layers, selectedZone]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || styleEpoch === 0) return;
+    setData(map, "draft", draftGeoJson(draft));
+  }, [styleEpoch, draft]);
+
+  // While drawing, a double click must not zoom, and the cursor says so.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (drawing) map.doubleClickZoom.disable();
+    else map.doubleClickZoom.enable();
+    map.getCanvas().style.cursor = drawing ? "crosshair" : "";
+  }, [drawing]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -328,7 +445,7 @@ export function MapView({ aircraft, alerts, zones, bases, layers, selected, onSe
     const inConflict = new Map<string, Alert["severity"]>();
     for (const alert of alerts.values()) {
       for (const id of alert.drone_ids) {
-        if (inConflict.get(id) !== "critical") inConflict.set(id, alert.severity);
+        inConflict.set(id, worse(inConflict.get(id), alert.severity));
       }
     }
     for (const [id, entry] of markers.current) {
