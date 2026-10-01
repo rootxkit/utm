@@ -1021,12 +1021,12 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       aircraft clears with reason `landed` rather than `stale`.
       *Done when:* both are visible on the bus and in `events` in SITL.
 
-- [ ] **S-26** `common/tests/test_startup.py` leaves the configured log level
+- [x] **S-26** `common/tests/test_startup.py` leaves the configured log level
       in place, so `gateway/tests/test_relay_server.py::test_repeated_bad_tokens_are_logged_once_per_interval`
       fails when run straight after it. Restore logging state in the test.
       *Done when:* `pytest airspace common gateway` passes in any order.
 
-- [ ] **S-27** Remote ID capture time from the ODID Location
+- [x] **S-27** Remote ID capture time from the ODID Location
       `seconds_after_hour` instead of the Gateway's receive time.
       *Done when:* a simulated broadcast with receiver latency is placed at
       its broadcast time.
@@ -1047,7 +1047,7 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       the old ones stop.
       *Done when:* a deploy of main shows no non-2xx/3xx on a 1 s probe.
 
-- [ ] **S-32** Remote ID identity is kept per transmitter address for 60 s,
+- [x] **S-32** Remote ID identity is kept per transmitter address for 60 s,
       so a Location frame from a reused address can attach to the previous
       serial when the new Basic ID was lost (found by U-16's drop-rate run).
       Expire the identity when a different Basic ID or a long silence is
@@ -1055,7 +1055,7 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       *Done when:* the U-16 bridge's drop-rate run after a serial change
       stores no Location under the old serial.
 
-- [ ] **S-33** The Remote ID ingest uses the broadcast's pressure altitude
+- [x] **S-33** The Remote ID ingest uses the broadcast's pressure altitude
       where the geodetic one is missing or flagged inaccurate.
 
 - [ ] **S-14** *(optional, last)* Rename the `courier_*` databases, users,
