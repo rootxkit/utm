@@ -5,7 +5,8 @@ geodetic altitude is missing or poor, and says so in `alt_source`. Pressure
 altitude is referenced to 1013.25 hPa, not the local QNH: about 8 m per hPa
 off, some 160 m on a 20 hPa day, against a 20 m vertical minimum. So such a
 track's vertical position is unknown: a conflict is judged on the horizontal
-alone, and the height limit and zone altitude limits are not evaluated.
+alone. Zone altitude bands are widened by the pressure uncertainty, and the
+height limit is judged with it taken off; either alert is then a warning.
 """
 
 from __future__ import annotations
@@ -18,7 +19,12 @@ from uuid import UUID
 import pytest
 
 from airspace.cpa import closest_approach
-from airspace.monitor import AirspaceMonitor, AlertKind, track_from_telemetry
+from airspace.monitor import (
+    AirspaceMonitor,
+    AlertKind,
+    Severity,
+    track_from_telemetry,
+)
 from airspace.tests.test_height_limit import LIMIT_M, Slope
 from airspace.tests.test_monitor import LAT0, LON0, POLICY, A, B, message
 from airspace.zones import zone_from_geojson
@@ -122,59 +128,106 @@ def zone(min_alt_amsl_m: float | None, max_alt_amsl_m: float | None) -> Any:
     )
 
 
-def test_a_zone_with_altitude_limits_is_not_evaluated_on_pressure() -> None:
-    banded = zone(400.0, 600.0)
-    on_pressure = AirspaceMonitor(policy=POLICY, zones=[banded])
-    on_geodetic = AirspaceMonitor(policy=POLICY, zones=[banded])
-
-    unknown = on_pressure.observe(at(A, 0, 500.0, PRESSURE), now_s=0.0).raised
-    known = on_geodetic.observe(at(A, 0, 500.0, GEODETIC), now_s=0.0).raised
-
-    assert unknown == []
-    assert on_pressure.vertical_unknown == 1
-    assert [alert.kind for alert in known] == [AlertKind.ZONE]
-
-
-def test_a_zone_without_altitude_limits_is_still_evaluated_on_pressure() -> None:
-    monitor = AirspaceMonitor(policy=POLICY, zones=[zone(None, None)])
+def test_a_pressure_track_in_a_band_is_a_warning_saying_so() -> None:
+    """Inside the band, on pressure: raised, but as a warning, approximate."""
+    monitor = AirspaceMonitor(policy=POLICY, zones=[zone(400.0, 600.0)])
 
     raised = monitor.observe(at(A, 0, 500.0, PRESSURE), now_s=0.0).raised
 
     assert [alert.kind for alert in raised] == [AlertKind.ZONE]
+    assert raised[0].severity is Severity.WARNING
+    assert raised[0].detail["vertical_known"] is False
+    assert raised[0].detail["pressure_uncertainty_m"] == 250.0
+    assert monitor.vertical_unknown == 1
 
 
-def test_a_pressure_message_does_not_clear_a_banded_zone_alert() -> None:
+@pytest.mark.parametrize(
+    ("alt_amsl_m", "source", "alerts"),
+    [
+        # 200 m over the band's top: inside it widened by 250 m.
+        (800.0, PRESSURE, 1),
+        (800.0, GEODETIC, 0),
+        # Beyond the margin, below and above.
+        (100.0, PRESSURE, 0),
+        (900.0, PRESSURE, 0),
+    ],
+)
+def test_a_band_is_widened_by_the_pressure_uncertainty(
+    alt_amsl_m: float, source: str, alerts: int
+) -> None:
     monitor = AirspaceMonitor(policy=POLICY, zones=[zone(400.0, 600.0)])
-    monitor.observe(at(A, 0, 500.0, GEODETIC), now_s=0.0)
+
+    raised = monitor.observe(at(A, 0, alt_amsl_m, source), now_s=0.0).raised
+
+    assert len(raised) == alerts
+
+
+def test_the_margin_is_configurable() -> None:
+    monitor = AirspaceMonitor(
+        policy=POLICY, zones=[zone(400.0, 600.0)], pressure_uncertainty_m=100.0
+    )
+
+    raised = monitor.observe(at(A, 0, 800.0, PRESSURE), now_s=0.0).raised
+
+    assert raised == []
+
+
+def test_a_geodetic_track_in_a_no_fly_band_stays_critical() -> None:
+    monitor = AirspaceMonitor(policy=POLICY, zones=[zone(400.0, 600.0)])
+
+    raised = monitor.observe(at(A, 0, 500.0, GEODETIC), now_s=0.0).raised
+
+    assert raised[0].severity is Severity.CRITICAL
+    assert "vertical_known" not in raised[0].detail
+
+
+def test_a_zone_without_altitude_limits_is_judged_as_for_anyone() -> None:
+    monitor = AirspaceMonitor(policy=POLICY, zones=[zone(None, None)])
+
+    raised = monitor.observe(at(A, 0, 500.0, PRESSURE), now_s=0.0).raised
+
+    assert raised[0].severity is Severity.CRITICAL
+    assert "vertical_known" not in raised[0].detail
+
+
+def test_leaving_the_widened_band_on_pressure_clears() -> None:
+    monitor = AirspaceMonitor(
+        policy=POLICY, zones=[zone(400.0, 600.0)], clear_after_s=3.0
+    )
+    monitor.observe(at(A, 0, 500.0, PRESSURE), now_s=0.0)
 
     cleared = []
-    for t_s in range(1, 10):
+    for t_s in range(1, 6):
         cleared += monitor.observe(
-            at(A, 0, 900.0, PRESSURE, at_s=float(t_s)), now_s=float(t_s)
+            at(A, 0, 1000.0, PRESSURE, at_s=float(t_s)), now_s=float(t_s)
         ).cleared
 
-    assert cleared == []
-    assert [alert.kind for alert in monitor.active] == [AlertKind.ZONE]
+    assert [c.alert.kind for c in cleared] == [AlertKind.ZONE]
 
 
-def test_the_height_limit_is_not_evaluated_on_pressure(
+def height_monitor() -> AirspaceMonitor:
+    return AirspaceMonitor(policy=POLICY, terrain=Slope(), max_height_agl_m=LIMIT_M)
+
+
+def test_on_pressure_the_height_limit_counts_only_beyond_the_margin(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    def monitor() -> AirspaceMonitor:
-        return AirspaceMonitor(policy=POLICY, terrain=Slope(), max_height_agl_m=LIMIT_M)
-
-    on_pressure, on_geodetic = monitor(), monitor()
+    """Ground 500 m, limit 120 m. 650 m is 150 m up: over it on geodetic,
+    but 150 - 250 is not over it on pressure. 900 m is 400 - 250 = 150."""
     caplog.set_level(logging.WARNING, logger="airspace.monitor")
+    geodetic, low, high = height_monitor(), height_monitor(), height_monitor()
 
-    # 150 m over 500 m ground, against a 120 m limit.
+    known = geodetic.observe(at(A, 0, 650.0, GEODETIC), now_s=0.0).raised
     for t_s in (0.0, 1.0):
-        unknown = on_pressure.observe(
-            at(A, 0, 650.0, PRESSURE, at_s=t_s), now_s=t_s
-        ).raised
-        assert unknown == []
-    known = on_geodetic.observe(at(A, 0, 650.0, GEODETIC), now_s=0.0).raised
+        assert low.observe(at(A, 0, 650.0, PRESSURE, at_s=t_s), now_s=t_s).raised == []
+    over = high.observe(at(A, 0, 900.0, PRESSURE), now_s=0.0).raised
 
     assert [alert.kind for alert in known] == [AlertKind.HEIGHT]
-    assert on_pressure.vertical_unknown == 2
+    assert "vertical_known" not in known[0].detail
+    assert [alert.kind for alert in over] == [AlertKind.HEIGHT]
+    assert over[0].severity is Severity.WARNING
+    assert over[0].detail["vertical_known"] is False
+    assert over[0].detail["pressure_uncertainty_m"] == 250.0
+    assert low.vertical_unknown == 2
     logged = [r for r in caplog.records if "pressure altitude" in r.getMessage()]
-    assert len(logged) == 1, "once per aircraft, not per message"
+    assert len(logged) == 2, "once per aircraft per monitor, not per message"

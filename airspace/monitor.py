@@ -65,10 +65,16 @@ minimum. Compared as AMSL it could hide a conflict or invent one. Such a
 track's vertical position is unknown: a pair with one is judged on the
 horizontal criteria alone, as though the vertical minimum were not met, and
 the alert says `vertical_separation_known: false` with `d_alt_at_cpa_m`
-null. The height limit, and zones with altitude limits, are not evaluated
-for it: neither raised nor cleared by its messages. Zones without altitude
-limits are. Each such message is counted (`vertical_unknown`, in the status
-line) and the first of a run per aircraft is logged.
+null. A zone's altitude band is widened by `pressure_uncertainty_m` (250 m)
+each way for it, and the height limit is exceeded only if it still is with
+that margin taken off; either alert is then a warning, whatever the zone,
+and says `vertical_known: false`. Zones without altitude limits are judged
+as for anyone. Each such message is counted (`vertical_unknown`, in the
+status line) and the first of a run per aircraft is logged.
+
+Two Remote ID tracks with the same transmitter address, one of them
+unidentified, are one radio under two ids (S-32) and are never paired. Two
+identified tracks on one address are judged like any pair.
 
 ## Raise once, clear with hysteresis
 
@@ -265,9 +271,13 @@ def track_from_telemetry(
         source=source_of(message),
         source_ts_s=captured_at_s(message),
         transmitter=transmitter_of(message),
+        identified=identified_of(message),
         vertical_known=vertical_known(message),
     )
 
+
+# S-33; matches `airspace.config.AirspaceSettings.pressure_uncertainty_m`.
+DEFAULT_PRESSURE_UNCERTAINTY_M = 250.0
 
 # The Gateway's `alt_source` for an AMSL altitude taken from a Remote ID
 # broadcast's pressure altitude (gateway/remote_id.py, S-33).
@@ -280,6 +290,36 @@ def vertical_known(message: dict[str, Any]) -> bool:
     A pressure altitude does not: see `Track.vertical_known`.
     """
     return message.get("alt_source") != ALT_SOURCE_PRESSURE
+
+
+def identified_of(message: dict[str, Any]) -> bool | None:
+    """A Remote ID broadcast's `remote_id.identified`; None otherwise.
+
+    Only an explicit False counts as unidentified: a broadcast without the
+    field is judged as identified, the side on which nothing is skipped.
+    """
+    if message.get("source") != "remote_id":
+        return None
+    remote_id = message.get("remote_id")
+    if not isinstance(remote_id, dict):
+        return None
+    return remote_id.get("identified") is not False
+
+
+def same_radio(a: Track, b: Track) -> bool:
+    """Two tracks that are one transmitter under two ids (S-32).
+
+    The Gateway publishes a transmitter without a fresh identity as an
+    unidentified track keyed by its address, and under its serial once it
+    has one: the same address, one side unidentified. Two identified tracks
+    on one address are two claims, a spoofer on another's address among
+    them, and are judged like any pair.
+    """
+    return (
+        a.transmitter is not None
+        and a.transmitter == b.transmitter
+        and (a.identified is False or b.identified is False)
+    )
 
 
 def transmitter_of(message: dict[str, Any]) -> str | None:
@@ -354,6 +394,9 @@ class AirspaceMonitor:
     # judged on the horizontal alone, and the height limit and zones with
     # altitude limits are not evaluated. Logged once per aircraft per run.
     vertical_unknown: int = field(default=0, init=False)
+    # S-33. How far a pressure altitude may be from AMSL: about 8 m per hPa
+    # between the local QNH and 1013.25 hPa. The default covers 30 hPa.
+    pressure_uncertainty_m: float = DEFAULT_PRESSURE_UNCERTAINTY_M
     _vertical_unknown_logged: set[UUID] = field(default_factory=set, init=False)
     _labels: dict[UUID, str | None] = field(default_factory=dict, init=False)
     _last_seen_s: dict[UUID, float] = field(default_factory=dict, init=False)
@@ -460,9 +503,7 @@ class AirspaceMonitor:
             (AlertKind.ZONE, self._check_zones),
             (AlertKind.HEIGHT, self._check_height),
         ):
-            if kind is AlertKind.HEIGHT and not (
-                height_available and track.vertical_known
-            ):
+            if kind is AlertKind.HEIGHT and not height_available:
                 not_evaluated.add(kind)
                 continue
             found = self._guarded(kind, check, track, at_s)
@@ -520,12 +561,13 @@ class AirspaceMonitor:
             self._vertical_unknown_logged.add(track.drone_id)
             _log.warning(
                 "altitude is a pressure altitude; conflicts judged on the "
-                "horizontal alone, height limit and zone altitude limits not "
-                "evaluated",
+                "horizontal alone, zone bands and the height limit with the "
+                "pressure uncertainty margin",
                 extra={
                     "drone_id": str(track.drone_id),
                     "station_id": track.source,
                     "vertical_unknown": self.vertical_unknown,
+                    "pressure_uncertainty_m": self.pressure_uncertainty_m,
                 },
             )
 
@@ -615,11 +657,8 @@ class AirspaceMonitor:
         raised: list[Alert] = []
         for other in self.index.neighbours(track.drone_id):
             key = conflict_key(track.drone_id, other.drone_id)
-            if track.transmitter is not None and track.transmitter == other.transmitter:
-                # One radio under two ids: the Gateway publishes a
-                # transmitter as unidentified while it has no fresh
-                # identity, and under its serial once it has one (S-32).
-                # Not a pair, so not judged either way.
+            if same_radio(track, other):
+                # One radio under two ids: not a pair, so not judged.
                 continue
             if (
                 abs(track.captured_at_s - other.captured_at_s)
@@ -683,30 +722,35 @@ class AirspaceMonitor:
         raised: list[Alert] = []
         for zone in self.zones:
             key = zone_key(track.drone_id, zone)
-            limited = zone.min_alt_amsl_m is not None or zone.max_alt_amsl_m is not None
-            if limited and not track.vertical_known:
-                # Inside or outside its altitude band is unknown (S-33): not
-                # judged, so neither raised nor cleared by this message.
-                self._unevaluated_keys.add(key)
+            # S-33: with the altitude a pressure altitude, the band is
+            # widened by its uncertainty, conservatively, and the alert is
+            # a warning that says the altitude is approximate.
+            approximate = not track.vertical_known and zone.has_altitude_limits
+            margin_m = self.pressure_uncertainty_m if approximate else 0.0
+            if not zone.contains(
+                track.lat_deg, track.lon_deg, track.alt_amsl_m, margin_m=margin_m
+            ):
                 continue
-            if not zone.contains(track.lat_deg, track.lon_deg, track.alt_amsl_m):
-                continue
+            detail: dict[str, Any] = {
+                "zone_id": str(zone.zone_id),
+                "zone_name": zone.name,
+                "zone_type": zone.type.value,
+                "alt_amsl_m": round(track.alt_amsl_m, 1),
+            }
+            if approximate:
+                detail["vertical_known"] = False
+                detail["pressure_uncertainty_m"] = margin_m
             alert = Alert(
                 key=key,
                 kind=AlertKind.ZONE,
                 severity=(
                     Severity.CRITICAL
-                    if zone.type is ZoneType.NO_FLY
+                    if zone.type is ZoneType.NO_FLY and not approximate
                     else Severity.WARNING
                 ),
                 drone_ids=(track.drone_id,),
                 labels=(self._labels.get(track.drone_id),),
-                detail={
-                    "zone_id": str(zone.zone_id),
-                    "zone_name": zone.name,
-                    "zone_type": zone.type.value,
-                    "alt_amsl_m": round(track.alt_amsl_m, 1),
-                },
+                detail=detail,
             )
             self._last_true_s[key] = now_s
             if key not in self._active:
@@ -721,22 +765,29 @@ class AirspaceMonitor:
         if ground is None:
             return []
         height_agl_m = track.alt_amsl_m - ground.elevation_m
-        if height_agl_m <= self.max_height_agl_m:
+        # S-33: a pressure altitude is over the limit only if it still is
+        # with its whole uncertainty taken off.
+        margin_m = 0.0 if track.vertical_known else self.pressure_uncertainty_m
+        if height_agl_m - margin_m <= self.max_height_agl_m:
             return []
         key = height_key(track.drone_id)
+        detail: dict[str, Any] = {
+            "height_agl_m": round(height_agl_m, 1),
+            "max_height_agl_m": self.max_height_agl_m,
+            "alt_amsl_m": round(track.alt_amsl_m, 1),
+            "ground_elevation_m": round(ground.elevation_m, 1),
+            "dataset": ground.dataset,
+        }
+        if not track.vertical_known:
+            detail["vertical_known"] = False
+            detail["pressure_uncertainty_m"] = margin_m
         alert = Alert(
             key=key,
             kind=AlertKind.HEIGHT,
             severity=Severity.WARNING,
             drone_ids=(track.drone_id,),
             labels=(self._labels.get(track.drone_id),),
-            detail={
-                "height_agl_m": round(height_agl_m, 1),
-                "max_height_agl_m": self.max_height_agl_m,
-                "alt_amsl_m": round(track.alt_amsl_m, 1),
-                "ground_elevation_m": round(ground.elevation_m, 1),
-                "dataset": ground.dataset,
-            },
+            detail=detail,
         )
         self._last_true_s[key] = now_s
         raised = [] if key in self._active else [alert]

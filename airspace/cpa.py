@@ -74,8 +74,10 @@ class Track:
     # None when the message carried none. Never compared across sources.
     source_ts_s: float | None = None
     # A Remote ID broadcast's transmitter address; None for anything else.
-    # Two tracks with one address are one radio (S-32).
     transmitter: str | None = None
+    # A Remote ID broadcast's `remote_id.identified`: False for a track the
+    # Gateway published without a fresh identity (S-32). None otherwise.
+    identified: bool | None = None
     # False when `alt_amsl_m` is a pressure altitude (S-33): referenced to
     # 1013.25 hPa, not the local QNH, it is off by about 8 m per hPa, some
     # 160 m on a 20 hPa day against a 20 m vertical minimum. Such a track's
@@ -123,6 +125,7 @@ def advance(track: Track, dt_s: float) -> Track:
         source=track.source,
         source_ts_s=track.source_ts_s,
         transmitter=track.transmitter,
+        identified=track.identified,
         vertical_known=track.vertical_known,
     )
 

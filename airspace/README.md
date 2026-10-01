@@ -47,15 +47,19 @@ than `NEIGHBOUR_MAX_AGE_S` is not judged by that message: neither refreshed
 nor cleared, because silence is not evidence.
 
 Two Remote ID tracks with the same transmitter address
-(`remote_id.transmitter`) are never paired: the Gateway publishes a
-transmitter as unidentified while it has no fresh identity and under its
-serial once it has one (S-32), so they are one radio under two ids.
+(`remote_id.transmitter`), one of them unidentified, are never paired: the
+Gateway publishes a transmitter as unidentified while it has no fresh
+identity and under its serial once it has one (S-32), so they are one radio
+under two ids. Two identified tracks on one address, a spoofer on another's
+address for instance, are judged like any pair.
 
 A track whose altitude is a Remote ID pressure altitude (`alt_source:
 "pressure"`, S-33) has no known vertical position. Conflicts with it are
 judged on the horizontal criteria alone, and say
-`vertical_separation_known: false`; the height limit and zones with altitude
-limits are not evaluated for it, counted in `vertical_unknown`.
+`vertical_separation_known: false`. Zone altitude bands are widened by
+`PRESSURE_UNCERTAINTY_M` (250 m) for it, and the height limit is exceeded
+only if it still is with that margin taken off; those alerts are warnings
+saying `vertical_known: false`. Messages are counted in `vertical_unknown`.
 
 Rejected messages, failed checks, unreadable tiles and audit-queue losses are
 counted and logged in the `airspace monitor status` line every minute.
@@ -63,7 +67,8 @@ counted and logged in the `airspace monitor status` line every minute.
 ## Settings
 
 `DATABASE_URL`, `NATS_URL`, `TERRAIN_DIR` as in `common/config.py`, plus,
-all in `airspace/config.py` with their defaults and reasons: `LIVE_MAX_AGE_S`,
+all in `airspace/config.py` with their defaults and reasons:
+`PRESSURE_UNCERTAINTY_M`, `LIVE_MAX_AGE_S`,
 `NEIGHBOUR_MAX_AGE_S`, `SOURCE_STATE_MAX`, `AUDIT_QUEUE_SIZE`,
 `AUDIT_CLOSE_TIMEOUT_S`, `TERRAIN_CACHE_TILES`. Separation minima and the
 height limit are policy in the database, never here.

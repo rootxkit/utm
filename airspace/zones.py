@@ -46,10 +46,29 @@ class Zone:
     min_alt_amsl_m: float | None
     max_alt_amsl_m: float | None
 
-    def contains(self, lat_deg: float, lon_deg: float, alt_amsl_m: float) -> bool:
-        if self.min_alt_amsl_m is not None and alt_amsl_m < self.min_alt_amsl_m:
+    @property
+    def has_altitude_limits(self) -> bool:
+        return self.min_alt_amsl_m is not None or self.max_alt_amsl_m is not None
+
+    def contains(
+        self,
+        lat_deg: float,
+        lon_deg: float,
+        alt_amsl_m: float,
+        *,
+        margin_m: float = 0.0,
+    ) -> bool:
+        """Inside the polygon and the altitude band, the band widened by
+        `margin_m` each way (S-33: an altitude known only approximately)."""
+        if (
+            self.min_alt_amsl_m is not None
+            and alt_amsl_m < self.min_alt_amsl_m - margin_m
+        ):
             return False
-        if self.max_alt_amsl_m is not None and alt_amsl_m > self.max_alt_amsl_m:
+        if (
+            self.max_alt_amsl_m is not None
+            and alt_amsl_m > self.max_alt_amsl_m + margin_m
+        ):
             return False
         if not _in_ring(self.exterior, lon_deg, lat_deg):
             return False
