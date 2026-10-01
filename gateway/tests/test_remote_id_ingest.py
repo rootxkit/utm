@@ -363,11 +363,16 @@ def test_the_tracker_takes_its_limits_from_the_environment(
     monkeypatch.setenv("REMOTE_ID_TIME_TOLERANCE_S", "0.5")
     monkeypatch.setenv("REMOTE_ID_MAX_LATENCY_S", "2.5")
     monkeypatch.setenv("REMOTE_ID_MIN_VERTICAL_ACCURACY", "4")
+    monkeypatch.setenv("REMOTE_ID_IDENTITY_TTL_S", "9")
+    monkeypatch.setenv("REMOTE_ID_MAX_GAP_S", "2")
+    monkeypatch.setenv("REMOTE_ID_IDENTIFY_WITHIN_S", "1.5")
 
     tracker = tracker_from_settings(RemoteIdSettings(_env_file=None), None)  # type: ignore[call-arg]
 
     assert (tracker.time_tolerance_s, tracker.max_latency_s) == (0.5, 2.5)
     assert tracker.min_vertical_accuracy == 4
+    assert (tracker.identity_ttl_s, tracker.max_gap_s) == (9.0, 2.0)
+    assert tracker.identify_within_s == 1.5
 
 
 # --- one of ours broadcasting (serial match) --------------------------------------

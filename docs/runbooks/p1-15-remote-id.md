@@ -26,6 +26,35 @@ One UDP datagram per message or message pack it hears, to
 address it came from; it is what joins a Basic ID to a Location when they
 arrive separately (Bluetooth 4).
 
+## Identity per transmitter address
+
+An address can be reused, so a Basic ID names its address's Locations only
+while it is fresh (S-32):
+
+| Setting | Default | The identity is dropped when |
+|---|---|---|
+| `REMOTE_ID_IDENTITY_TTL_S` | 15 | its Basic ID has not been heard for this long (five 3 s static periods; it was a minute). |
+| `REMOTE_ID_MAX_GAP_S` | 3 | the address is silent for longer than this (three 1 s Location periods): a reboot or another aircraft. |
+| | | another Basic ID of the same ID type arrives from the address. System and Operator ID go with it. |
+
+A Location without a fresh identity waits up to
+`REMOTE_ID_IDENTIFY_WITHIN_S` (4 s) for a Basic ID. After that it is
+published and stored as an **unidentified** track of the transmitter: id
+derived from the address, labelled with the address, `remote_id.identified`
+false, an empty UAS ID and ID type 0. It is never attached to an earlier
+serial. While a transmitter's identity comes and goes it can be on the map
+under both ids; the airspace monitor never pairs two Remote ID tracks of one
+address, so it does not conflict with itself. A Location that was waiting
+and is overtaken by the next one is not kept.
+
+The tracker counts `identity_changes`, `silences` and `unidentified`, and
+logs each identity change.
+
+**Limit.** A different aircraft that takes over an address within
+`REMOTE_ID_MAX_GAP_S`, while the old Basic ID is still fresh, and whose own
+Basic ID is lost, is indistinguishable from the old aircraft losing a Basic
+ID. Its Locations are joined to the old serial until its Basic ID arrives.
+
 ## Run it
 
 ```
@@ -254,11 +283,11 @@ signed datagrams. Every position was compared with the same vehicle's
 - **Faults:** one message per datagram with 30% dropped, and a new serial
   on SYSID 1's transmitter address. 24 datagrams were sent and 17 dropped,
   and 16 observations were stored. The first 2 were stored under the serial
-  of the run just before. The ingest joins messages by transmitter address
-  and keeps an identity for 60 s, so those Locations arrived before the new
+  of the run just before. The ingest joined messages by transmitter address
+  and kept an identity for 60 s, so those Locations arrived before the new
   Basic ID. A real module does not change its serial, but a spoofer on a
   reused address would do the same. `--spoof-serial` therefore uses its own
-  address.
+  address. S-32 fixed this ("Identity per transmitter address" above).
 - **What this does not check:** the real geoid model. It is not installed on
   the laptop, so both processes used a flat 15.9 m grid. The HAE to AMSL
   round trip is checked; EGM2008 itself is not.
@@ -285,6 +314,27 @@ registered, unretired aircraft's. It re-reads the serials every minute.
 Either way it stays one track: it never becomes a second aircraft, and it
 never conflicts with itself. If our link drops, the track stays on the map
 from the broadcast.
+
+## Verified 2026-10-01: S-27 and S-32, in-process
+
+`tools/tests/test_sitl_remote_id_ingest.py` runs the U-16 bridge into the
+ingest on simulated clocks: pymavlink-parsed MAVLink in, signed datagrams
+through the bridge's own `FaultyLink`, then the ingest's authenticator,
+tracker and store. There are two 30 s legs, one message per datagram, with
+30% dropped. The second leg is a restart 4 s later with a new serial on the
+same address. Its seed loses the restart's first Basic ID while two
+Locations get through.
+
+- With the rules before S-32 (60 s identity, 60 s memory), the run stores
+  2 Locations of the restarted bridge under the old serial, as U-16 saw.
+- With S-32's rules, 22 rows are stored after the restart, all under the
+  new serial. Twenty more drop patterns store none under the old one
+  either.
+- With `--delay-s 2` and no drops, every observation is placed at its
+  broadcast time, 1.9 to 2.0 s before its receive time (the field holds
+  tenths).
+
+No SITL vehicle was flown for this.
 
 ## Not yet
 - No real receiver has been connected yet: the decoder is checked against

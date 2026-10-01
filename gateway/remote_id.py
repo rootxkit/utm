@@ -3,22 +3,46 @@
 A receiver (an ESP32, a phone, a commercial unit) hears Open Drone ID
 messages and forwards each one, with the address it came from, as a
 `Frame`. `RemoteIdTracker` keeps the latest of each message kind per
-transmitter and, whenever a Location arrives from a transmitter whose
-identity it knows, returns an observation shaped like the Gateway's
-telemetry message (`gateway/publisher.py`), so the console and the airspace
-monitor take it without knowing where it came from.
+transmitter and, whenever a Location arrives, returns an observation shaped
+like the Gateway's telemetry message (`gateway/publisher.py`), so the console
+and the airspace monitor take it without knowing where it came from.
 
 ## Identity
 
 Messages are joined by the transmitter's address, as receivers see them: a
 Bluetooth 4 broadcast sends Basic ID and Location separately, and only the
-address ties them together. A Location from a transmitter that has not yet
-sent a Basic ID is held until one arrives; an aircraft is not shown without
-an identity.
+address ties them together.
 
 The aircraft's id on the bus is a UUID derived from its broadcast identity
 (ID type and UAS ID), not from the transmitter address, which some
 transmitters randomise. The same serial number always maps to the same id.
+
+### An identity is used only while it is fresh (S-32)
+
+An address can be reused: by a randomising transmitter, by a module that
+reboots with another identity, by a spoofer. A Location joined to the
+identity of the aircraft that used the address before is a confident wrong
+answer, so an identity is used only while all of these hold:
+
+- its Basic ID was heard within `identity_ttl_s` (15 s: five of the
+  standard's 3 s static periods);
+- no other Basic ID of the same ID type has been heard from the address
+  since. If one has, everything known about the address is dropped,
+  System and Operator ID with it, and counted (`identity_changes`);
+- the address has not been silent for longer than `max_gap_s` (3 s: three
+  of the standard's 1 s Location periods). After such a silence, a reboot
+  or another aircraft, everything known about it is dropped (`silences`).
+
+A Location without a fresh identity is held for up to `identify_within_s`
+after the address lost or never had one, since a Basic ID normally follows
+within a static period; one arriving publishes it. After that, Locations
+are published as an **unidentified** track of the transmitter: its id is
+derived from the address, its label is the address, and `remote_id` says
+`identified: false`, with an empty UAS ID and ID type 0 (none). It is never
+attached to an earlier serial. One transmitter can therefore appear under
+two ids, unidentified and identified, while its identity comes and goes;
+the airspace monitor does not pair two Remote ID tracks of one transmitter
+address with each other (`airspace/monitor.py`).
 
 ## Time (S-27)
 
@@ -90,7 +114,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 
+from common import get_logger
 from gateway import odid
+
+_log = get_logger(__name__)
 
 SOURCE = "remote_id"
 
@@ -110,6 +137,11 @@ _SECONDS_PER_HOUR = 3600.0
 # Timestamp accuracy is in steps of 0.1 s, and 0 is unknown
 # (MAV_ODID_TIME_ACC; pinned against pymavlink in the tests).
 _TS_ACCURACY_STEP_S = 0.1
+
+# S-32: see "An identity is used only while it is fresh" above.
+DEFAULT_IDENTITY_TTL_S = 15.0
+DEFAULT_MAX_GAP_S = 3.0
+DEFAULT_IDENTIFY_WITHIN_S = 4.0
 
 TIME_SOURCE_BROADCAST = "broadcast"
 TIME_SOURCE_RECEIVER = "receiver"
@@ -145,6 +177,15 @@ class Frame:
 
 def aircraft_id(basic: odid.BasicId) -> UUID:
     return uuid.uuid5(REMOTE_ID_NAMESPACE, f"{basic.id_type}:{basic.ua_id}")
+
+
+def unidentified_aircraft_id(transmitter: str) -> UUID:
+    """The id of a transmitter heard without a fresh identity (S-32).
+
+    Not per receiver: two receivers hearing one transmitter are one track,
+    as they are for a serial.
+    """
+    return uuid.uuid5(REMOTE_ID_NAMESPACE, f"transmitter:{transmitter}")
 
 
 def broadcast_time(
@@ -238,36 +279,49 @@ def place(
 
 
 @dataclass
+class _Identity:
+    basic: odid.BasicId
+    heard_s: float
+
+
+@dataclass
 class _Transmitter:
-    basic: odid.BasicId | None = None
+    # When this state began: first heard, heard again after a silence, or
+    # taken by another identity.
+    started_s: float
+    last_heard_s: float
+    # The Basic IDs heard, one per ID type: a transmitter may send two.
+    identities: dict[int, _Identity] = field(default_factory=dict)
     location: odid.Location | None = None
+    # The frame that carried `location`: its receive time places it.
+    location_frame: Frame | None = None
+    location_published: bool = False
     system: odid.System | None = None
     operator: odid.OperatorId | None = None
-    last_frame: Frame | None = None
-    last_heard_s: float = 0.0
 
 
-def _preferred(current: odid.BasicId | None, new: odid.BasicId) -> odid.BasicId:
-    """A serial number over a registration id, and either over nothing.
+def _preferred(identities: list[_Identity]) -> odid.BasicId | None:
+    """A serial number over any other identity, else the latest heard.
 
-    A transmitter may send two Basic IDs. The serial is fixed to the airframe;
-    a registration can move between airframes, so it is the weaker identity.
+    A transmitter may send two Basic IDs. The serial is fixed to the
+    airframe; a registration can move between airframes, so it is the
+    weaker identity.
     """
-    if new.id_type == odid.IdType.NONE or not new.ua_id:
-        return current if current is not None else new
-    if current is None or current.id_type == odid.IdType.NONE or not current.ua_id:
-        return new
-    if new.id_type == odid.IdType.SERIAL_NUMBER:
-        return new
-    return current if current.id_type == odid.IdType.SERIAL_NUMBER else new
+    for identity in identities:
+        if identity.basic.id_type == odid.IdType.SERIAL_NUMBER:
+            return identity.basic
+    if not identities:
+        return None
+    return max(identities, key=lambda i: i.heard_s).basic
 
 
 @dataclass
 class RemoteIdTracker:
     geoid: Geoid | None = None
-    # Transmitters not heard for this long are forgotten, so their partial
-    # state cannot attach to a new aircraft reusing a random address.
-    forget_after_s: float = 60.0
+    # S-32: see "An identity is used only while it is fresh" above.
+    identity_ttl_s: float = DEFAULT_IDENTITY_TTL_S
+    max_gap_s: float = DEFAULT_MAX_GAP_S
+    identify_within_s: float = DEFAULT_IDENTIFY_WITHIN_S
     # S-27: see "Time" above.
     time_tolerance_s: float = DEFAULT_TIME_TOLERANCE_S
     max_latency_s: float = DEFAULT_MAX_LATENCY_S
@@ -276,6 +330,12 @@ class RemoteIdTracker:
     # Observations whose `captured_at` fell back to the receive time, by
     # reason: unknown, invalid, future, too_old.
     time_fallbacks: Counter[str] = field(default_factory=Counter, init=False)
+    # A different Basic ID from an address with an identity (S-32).
+    identity_changes: int = field(default=0, init=False)
+    # Addresses forgotten after a silence longer than `max_gap_s`.
+    silences: int = field(default=0, init=False)
+    # Observations published without a fresh identity.
+    unidentified: int = field(default=0, init=False)
 
     _by_transmitter: dict[tuple[str, str], _Transmitter] = field(
         default_factory=dict, init=False
@@ -287,39 +347,92 @@ class RemoteIdTracker:
         Raises `odid.DecodeError` for bytes that are not a valid message.
         """
         messages = odid.decode(frame.payload)
+        # Before this frame counts as hearing the address: a silence ends here.
         self._forget(now_s)
         key = (frame.receiver_id, frame.transmitter)
-        state = self._by_transmitter.setdefault(key, _Transmitter())
-        state.last_frame = frame
+        state = self._by_transmitter.get(key)
+        if state is None:
+            state = _Transmitter(started_s=now_s, last_heard_s=now_s)
+            self._by_transmitter[key] = state
         state.last_heard_s = now_s
-        new_location = False
+        # Identity first: a Basic ID that changes it drops what the address
+        # said before, and must not drop a Location in the same pack.
         for message in messages:
-            if isinstance(message, odid.BasicId):
-                state.basic = _preferred(state.basic, message)
-            elif isinstance(message, odid.Location):
+            if isinstance(message, odid.BasicId) and _identified(message):
+                self._learn(state, message, frame, now_s)
+        for message in messages:
+            if isinstance(message, odid.Location):
                 state.location = message
-                new_location = True
+                state.location_frame = frame
+                state.location_published = False
             elif isinstance(message, odid.System):
                 state.system = message
             elif isinstance(message, odid.OperatorId):
                 state.operator = message
-        basic, location = state.basic, state.location
-        if location is None or basic is None or not _identified(basic):
+        location, location_frame = state.location, state.location_frame
+        # Each Location is published once: when it arrives, or when the
+        # Basic ID it was held for does.
+        if location is None or location_frame is None or state.location_published:
             return None
-        # A Basic ID completing a held Location publishes it once; after that,
-        # only a new Location does.
-        if not new_location and not any(isinstance(m, odid.BasicId) for m in messages):
-            return None
-        return self._observation(basic, location, state, frame)
+        basic = _preferred(
+            [
+                identity
+                for identity in state.identities.values()
+                if now_s - identity.heard_s <= self.identity_ttl_s
+            ]
+        )
+        if basic is None:
+            if now_s - self._unidentified_since(state) < self.identify_within_s:
+                return None
+            self.unidentified += 1
+        state.location_published = True
+        return self._observation(basic, location, state, location_frame)
+
+    def _learn(
+        self, state: _Transmitter, basic: odid.BasicId, frame: Frame, now_s: float
+    ) -> None:
+        known = state.identities.get(basic.id_type)
+        if known is not None and known.basic.ua_id != basic.ua_id:
+            # Another aircraft on this address: nothing it said before is
+            # this one's, a held Location included.
+            self.identity_changes += 1
+            _log.warning(
+                "remote id identity changed on one transmitter address",
+                extra={
+                    "station_id": frame.receiver_id,
+                    "transmitter": frame.transmitter,
+                    "id_type": basic.id_type,
+                    "previous_ua_id": known.basic.ua_id,
+                    "ua_id": basic.ua_id,
+                    "identity_changes": self.identity_changes,
+                },
+            )
+            state.identities.clear()
+            state.location = None
+            state.location_frame = None
+            state.system = None
+            state.operator = None
+            state.started_s = now_s
+        state.identities[basic.id_type] = _Identity(basic=basic, heard_s=now_s)
+
+    def _unidentified_since(self, state: _Transmitter) -> float:
+        """Since when the address has had no fresh identity."""
+        if not state.identities:
+            return state.started_s
+        latest_s = max(identity.heard_s for identity in state.identities.values())
+        return max(state.started_s, latest_s + self.identity_ttl_s)
 
     def _forget(self, now_s: float) -> None:
+        """Drop addresses silent for longer than `max_gap_s`: whatever is
+        heard from one next is not known to be the same aircraft."""
         for key, state in list(self._by_transmitter.items()):
-            if now_s - state.last_heard_s > self.forget_after_s:
+            if now_s - state.last_heard_s > self.max_gap_s:
                 del self._by_transmitter[key]
+                self.silences += 1
 
     def _observation(
         self,
-        basic: odid.BasicId,
+        basic: odid.BasicId | None,
         location: odid.Location,
         state: _Transmitter,
         frame: Frame,
@@ -338,9 +451,15 @@ class RemoteIdTracker:
         )
         if placed.fallback is not None:
             self.time_fallbacks[placed.fallback] += 1
+        drone_id = (
+            unidentified_aircraft_id(frame.transmitter)
+            if basic is None
+            else aircraft_id(basic)
+        )
         return {
-            "drone_id": str(aircraft_id(basic)),
-            "label": basic.ua_id,
+            "drone_id": str(drone_id),
+            # An unidentified transmitter has no name but its address.
+            "label": frame.transmitter if basic is None else basic.ua_id,
             "source": SOURCE,
             "authenticated": False,
             "link": None,
@@ -382,9 +501,12 @@ class RemoteIdTracker:
             "groundspeed_ms": location.speed_horizontal_ms,
             "climb_ms": location.speed_vertical_ms,
             "remote_id": {
-                "ua_id": basic.ua_id,
-                "id_type": basic.id_type,
-                "ua_type": basic.ua_type,
+                # S-32: no identity is an empty UAS ID of ID type 0 (none),
+                # as the standard encodes it, never an earlier serial.
+                "identified": basic is not None,
+                "ua_id": "" if basic is None else basic.ua_id,
+                "id_type": odid.IdType.NONE if basic is None else basic.id_type,
+                "ua_type": None if basic is None else basic.ua_type,
                 "status": location.status,
                 "operator_id": state.operator.operator_id if state.operator else None,
                 "operator_lat_deg": system.operator_lat_deg if system else None,

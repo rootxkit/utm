@@ -236,6 +236,9 @@ def tracker_from_settings(
         time_tolerance_s=settings.remote_id_time_tolerance_s,
         max_latency_s=settings.remote_id_max_latency_s,
         min_vertical_accuracy=settings.remote_id_min_vertical_accuracy,
+        identity_ttl_s=settings.remote_id_identity_ttl_s,
+        max_gap_s=settings.remote_id_max_gap_s,
+        identify_within_s=settings.remote_id_identify_within_s,
     )
 
 

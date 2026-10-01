@@ -15,6 +15,9 @@ from common import (
     TelemetryDatabaseSettings,
 )
 from gateway.remote_id import (
+    DEFAULT_IDENTIFY_WITHIN_S,
+    DEFAULT_IDENTITY_TTL_S,
+    DEFAULT_MAX_GAP_S,
     DEFAULT_MAX_LATENCY_S,
     DEFAULT_MIN_VERTICAL_ACCURACY,
     DEFAULT_TIME_TOLERANCE_S,
@@ -138,6 +141,24 @@ class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings)
         ge=1,
         le=6,
         validation_alias="REMOTE_ID_MIN_VERTICAL_ACCURACY",
+    )
+    # S-32 (gateway/remote_id.py, "An identity is used only while it is
+    # fresh"). How long a Basic ID names its transmitter's Locations; how
+    # long a silence ends everything known about a transmitter address; how
+    # long a Location waits for a Basic ID before it is published as an
+    # unidentified track.
+    remote_id_identity_ttl_s: float = Field(
+        default=DEFAULT_IDENTITY_TTL_S,
+        gt=0,
+        validation_alias="REMOTE_ID_IDENTITY_TTL_S",
+    )
+    remote_id_max_gap_s: float = Field(
+        default=DEFAULT_MAX_GAP_S, gt=0, validation_alias="REMOTE_ID_MAX_GAP_S"
+    )
+    remote_id_identify_within_s: float = Field(
+        default=DEFAULT_IDENTIFY_WITHIN_S,
+        ge=0,
+        validation_alias="REMOTE_ID_IDENTIFY_WITHIN_S",
     )
 
     @model_validator(mode="after")
