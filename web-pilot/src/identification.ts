@@ -32,7 +32,10 @@ export function statusLabelKey(status: IdentificationStatus | null): Key {
   return status === null ? "id_none" : `id_${status}`;
 }
 
-export function statusHintKey(status: IdentificationStatus): Key {
+// What a status means. A registration by our fleet's serial alone ("fleet")
+// says so: the operator ID was not compared, and a broadcast is a claim.
+export function statusHintKey(status: IdentificationStatus, reason?: string | null): Key {
+  if (status === "registered" && reason === "fleet") return "id_registered_fleet_hint";
   return `id_${status}_hint`;
 }
 

@@ -58,7 +58,14 @@ export function DronePanel({ droneId, aircraft, alerts, now, onClose, sourceDisa
               <span className="pill id-mismatch">{t("id_mismatch")}</span>
             )}
             {identificationStatus(d) && (
-              <p className="small">{t(statusHintKey(identificationStatus(d) ?? "unidentified"))}</p>
+              <p className="small">
+                {t(
+                  statusHintKey(
+                    identificationStatus(d) ?? "unidentified",
+                    d.identification?.reason,
+                  ),
+                )}
+              </p>
             )}
             {d.identification && (
               <dl className="fields">

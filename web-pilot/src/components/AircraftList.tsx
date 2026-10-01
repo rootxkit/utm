@@ -51,7 +51,7 @@ export function AircraftList({ aircraft, alerts, selected, now, onSelect, source
                   <strong>{d.label ?? <span className="muted">{t("unnamed")}</span>}</strong>
                   <span
                     className={badgeClass(status)}
-                    title={status ? t(statusHintKey(status)) : undefined}
+                    title={status ? t(statusHintKey(status, d.identification?.reason)) : undefined}
                   >
                     {t(statusLabelKey(status))}
                   </span>

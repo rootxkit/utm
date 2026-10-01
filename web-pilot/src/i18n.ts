@@ -255,7 +255,10 @@ const en = {
   id_unknown_operator: "unknown operator",
   id_unidentified: "unidentified",
   id_none: "not identified yet",
-  id_registered_hint: "The serial and the operator match an active registration.",
+  id_registered_hint:
+    "The serial and the operator, as broadcast and unverified, match an active registration.",
+  id_registered_fleet_hint:
+    "One of our own aircraft by its serial alone, as broadcast and unverified; the operator ID it gives is not compared.",
   id_suspended_hint: "Registered, but the aircraft or its operator is suspended or revoked.",
   id_unknown_operator_hint:
     "The serial is not registered, or the operator it gives is missing, unknown or not the owner.",
@@ -535,7 +538,10 @@ const ka: Partial<Record<Key, string>> = {
   id_unknown_operator: "უცნობი ოპერატორი",
   id_unidentified: "უიდენტიფიკაციო",
   id_none: "ჯერ არ არის იდენტიფიცირებული",
-  id_registered_hint: "სერიული ნომერი და ოპერატორი ემთხვევა მოქმედ რეგისტრაციას.",
+  id_registered_hint:
+    "სერიული ნომერი და ოპერატორი, როგორც გადაცემულია და დაუდასტურებლად, ემთხვევა მოქმედ რეგისტრაციას.",
+  id_registered_fleet_hint:
+    "ჩვენი საკუთარი აპარატი მხოლოდ სერიული ნომრით, როგორც გადაცემულია და დაუდასტურებლად; მითითებული ოპერატორი არ მოწმდება.",
   id_suspended_hint:
     "რეგისტრირებულია, მაგრამ საფრენი აპარატი ან მისი ოპერატორი შეჩერებული ან გაუქმებულია.",
   id_unknown_operator_hint:

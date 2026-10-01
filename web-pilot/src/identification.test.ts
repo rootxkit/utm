@@ -111,6 +111,19 @@ describe("badges and their legend", () => {
   });
 });
 
+describe("statusHintKey", () => {
+  it("says a fleet registration is by serial alone, as broadcast and unverified", () => {
+    const t = translator("en");
+    expect(statusHintKey("registered", "fleet")).toBe("id_registered_fleet_hint");
+    expect(t(statusHintKey("registered", "fleet"))).toContain("as broadcast and unverified");
+    expect(t(statusHintKey("registered", "matched"))).toContain("as broadcast and unverified");
+    expect(statusHintKey("suspended", "fleet")).toBe("id_suspended_hint");
+    expect(translator("ka")(statusHintKey("registered", "fleet"))).not.toBe(
+      t(statusHintKey("registered", "fleet")),
+    );
+  });
+});
+
 describe("isClaimed", () => {
   it("is true for both Remote ID sources and false for the relay", () => {
     expect(isClaimed({ source: "remote_id" })).toBe(true);
