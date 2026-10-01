@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from airspace.ed269 import MAX_RING_VERTICES
 from api.assets import STATIC, mount_map_assets
 from api.auth import Operator, Role
 from api.auth_http import AccountStore, Authenticator, auth_router, require
@@ -178,6 +179,7 @@ def create_api_app(
     terrain: Terrain | None = None,
     login_limiter: LoginRateLimiter | None = None,
     uas: UasRegistry | None = None,
+    zone_max_ring_vertices: int = MAX_RING_VERTICES,
 ) -> FastAPI:
     """The API. `auth` is required: there is no way to build it open.
 
@@ -186,6 +188,21 @@ def create_api_app(
     request they make for data is authenticated.
     """
     app = FastAPI(title="courier API", version="0.1.0")
+
+    @app.exception_handler(RecursionError)
+    async def too_deep(_: Request, error: RecursionError) -> JSONResponse:
+        """A JSON body nested deeply enough to exhaust the parser's stack
+        (U-03 review): a refusal with a reason, not a 500."""
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "code": "nested_too_deeply",
+                    "message": "the request body is nested too deeply",
+                }
+            },
+        )
+
     viewer = require(auth, Role.VIEWER)
     admin = require(auth, Role.ADMIN)
     app.include_router(
@@ -316,7 +333,10 @@ def create_api_app(
     # answer 503.
     app.include_router(
         zone_router(
-            ZoneStore(engine=registry.engine) if registry is not None else None, auth
+            ZoneStore(engine=registry.engine, max_ring_vertices=zone_max_ring_vertices)
+            if registry is not None
+            else None,
+            auth,
         )
     )
 

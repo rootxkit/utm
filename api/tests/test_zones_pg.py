@@ -30,6 +30,7 @@ from api.tests.auth_fakes import (
     VIEWER_HEADERS,
     api_kwargs,
 )
+from api.zone_routes import MAX_IMPORT_BYTES
 
 pytestmark = pytest.mark.postgres
 
@@ -454,7 +455,8 @@ async def test_a_viewer_and_an_operator_read_zones_and_change_none(
             ),
         ):
             assert response.status_code == 403
-            assert "admin" in response.json()["detail"]
+            assert response.json()["detail"]["code"] == "forbidden"
+            assert "admin" in response.json()["detail"]["message"]
     assert await zone_count(relational_engine) == before
     assert len(await events(relational_engine, str(created["id"]))) == 1
 
@@ -466,3 +468,96 @@ async def test_the_unwritten_file_is_still_a_valid_import(client: AsyncClient) -
     response = await client.post("/airspace/zones/import", json=data)
     assert response.status_code == 200
     assert response.json()["created"] == ["TST001"]
+
+
+# --- review findings: geometry, numbers, nesting, size ----------------------------
+
+BOW_TIE = [[44.8, 41.7], [44.81, 41.71], [44.81, 41.7], [44.8, 41.71], [44.8, 41.7]]
+COLLINEAR = [[44.8, 41.7], [44.805, 41.7], [44.81, 41.7], [44.8, 41.7]]
+
+
+def with_ring(zone: dict[str, Any], ring: list[list[float]]) -> dict[str, Any]:
+    zone["geometry"][0]["horizontalProjection"]["coordinates"] = [ring]
+    return zone
+
+
+@pytest.mark.parametrize("ring", [BOW_TIE, COLLINEAR], ids=["bow tie", "collinear"])
+async def test_an_invalid_polygon_is_refused_on_create_and_import(
+    client: AsyncClient, relational_engine: AsyncEngine, ring: list[list[float]]
+) -> None:
+    before = await zone_count(relational_engine)
+    created = await client.post("/airspace/zones", json=with_ring(editor_zone(), ring))
+    assert created.status_code == 422, created.text
+    (problem,) = created.json()["detail"]["problems"]
+    assert problem["field"] == "zone.geometry[0].horizontalProjection"
+    assert problem["reason"].startswith("not a valid polygon")
+
+    document = {"features": [with_ring(editor_zone("API010"), ring)]}
+    imported = await client.post("/airspace/zones/import", json=document)
+    assert imported.status_code == 422
+    assert imported.json()["detail"]["problems"][0]["field"] == (
+        "features[0].geometry[0].horizontalProjection"
+    )
+    assert await zone_count(relational_engine) == before
+
+
+async def test_an_invalid_polygon_is_refused_on_replace(client: AsyncClient) -> None:
+    created = (await client.post("/airspace/zones", json=editor_zone())).json()
+    replaced = await client.put(
+        f"/airspace/zones/{created['id']}", json=with_ring(editor_zone(), BOW_TIE)
+    )
+    assert replaced.status_code == 422
+    kept = (await client.get(f"/airspace/zones/{created['id']}")).json()
+    assert kept["feature"]["geometry"] == editor_zone()["geometry"]
+
+
+async def test_a_string_where_a_number_belongs_is_refused_not_converted(
+    client: AsyncClient,
+) -> None:
+    zone = editor_zone()
+    zone["geometry"][0]["upperLimit"] = "120"
+    response = await client.post("/airspace/zones", json=zone)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "upperLimit"
+    # The same zone with the number is accepted.
+    zone["geometry"][0]["upperLimit"] = 120
+    assert (await client.post("/airspace/zones", json=zone)).status_code == 201
+
+
+async def test_deeply_nested_json_is_refused_with_a_reason(client: AsyncClient) -> None:
+    deep = b'{"features": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+    imported = await client.post("/airspace/zones/import", content=deep)
+    assert imported.status_code == 422
+    assert imported.json()["detail"]["problems"][0]["reason"] == (
+        "nested too deeply to be ED-269"
+    )
+    created = await client.post(
+        "/airspace/zones",
+        content=b'{"identifier": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
+        headers={"Content-Type": "application/json"},
+    )
+    assert created.status_code == 400, created.text
+
+
+async def test_an_oversized_import_is_refused_by_its_declared_length(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        "/airspace/zones/import",
+        content=b"{}",
+        headers={"Content-Length": str(MAX_IMPORT_BYTES + 1)},
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "too_large"
+
+
+async def test_an_oversized_import_without_a_length_is_refused_as_it_streams(
+    client: AsyncClient,
+) -> None:
+    async def chunks() -> AsyncIterator[bytes]:
+        for _ in range(MAX_IMPORT_BYTES // 65536 + 2):
+            yield b" " * 65536
+
+    response = await client.post("/airspace/zones/import", content=chunks())
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "too_large"

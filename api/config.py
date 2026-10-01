@@ -171,6 +171,12 @@ class ApiSettings(
     replay_max_flight_window_s: float = Field(
         default=90 * 86400.0, gt=0, validation_alias="REPLAY_MAX_FLIGHT_WINDOW_S"
     )
+    # U-03. Positions allowed in one ring of a zone, written in the
+    # console or imported. The monitor tests every zone on every message;
+    # 5000 is far above any published zone (Luxembourg's largest: 1,400).
+    zone_max_ring_vertices: int = Field(
+        default=5000, ge=4, validation_alias="ZONE_MAX_RING_VERTICES"
+    )
     # U-01. What a UAS operator registration number must look like. The EU
     # number is a three-letter country code and alphanumerics (16 characters
     # in all, per EASA); Georgia's format is not confirmed, so the default is

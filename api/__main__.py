@@ -71,6 +71,7 @@ def build_app(settings: ApiSettings) -> FastAPI:
         console_feed_url=settings.console_feed_url,
         console_app_dir=settings.console_app_dir,
         terrain=Terrain(settings.terrain_dir) if settings.terrain_dir else None,
+        zone_max_ring_vertices=settings.zone_max_ring_vertices,
         login_limiter=LoginRateLimiter(
             max_per_address=settings.login_rate_max_per_address,
             max_per_username=settings.login_rate_max_per_username,

@@ -25,7 +25,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt
 from pydantic.alias_generators import to_camel
 
 from airspace.ed269 import (
@@ -44,10 +44,14 @@ from api.auth import Operator, Role
 from api.auth_http import Authenticator, authenticated, require
 from api.http_errors import registry_http
 from api.registry import RegistryError
-from api.zones import ZoneImportRefusedError, ZoneStore
+from api.zones import InvalidGeometryError, ZoneImportRefusedError, ZoneStore
 
 # Who may change zones. U-13 adds Role.REGULATOR here.
 ZONE_WRITERS = frozenset({Role.ADMIN})
+# Numbers are strict: a string where ED-269 wants a number ("120") is
+# refused here, not converted, as the strict reader refuses it in a file.
+Number = StrictFloat
+
 # An ED-269 file is a few hundred kilobytes for a whole state (Luxembourg's
 # 46 zones are 120 kB); this is far above any real one and bounds memory.
 MAX_IMPORT_BYTES = 10 * 1024 * 1024
@@ -91,23 +95,23 @@ class Applicability(Ed269Model):
 class PolygonProjection(Ed269Model):
     type: Literal["Polygon"]
     # Rings of [longitude, latitude], each closed; the first is the outside.
-    coordinates: list[list[list[float]]]
+    coordinates: list[list[list[Number]]]
 
 
 class CircleProjection(Ed269Model):
     type: Literal["Circle"]
     # [longitude, latitude].
-    center: list[float]
+    center: list[Number]
     # In the volume's uomDimensions.
-    radius: float
+    radius: Number
 
 
 class AirspaceVolume(Ed269Model):
     uom_dimensions: Uom
     # Absent: from the surface (lower) or unlimited (upper).
-    lower_limit: float | None = None
+    lower_limit: Number | None = None
     lower_vertical_reference: VerticalReference
-    upper_limit: float | None = None
+    upper_limit: Number | None = None
     upper_vertical_reference: VerticalReference
     horizontal_projection: PolygonProjection | CircleProjection = Field(
         discriminator="type"
@@ -131,7 +135,7 @@ class Ed269Zone(Ed269Model):
     geometry: list[AirspaceVolume]
     # Published fields carried as they are, not interpreted here.
     restriction_conditions: str | list[str] | None = None
-    region: int | None = None
+    region: StrictInt | None = None
     other_reason_info: str | None = None
     regulation_exemption: YesNo | None = None
     u_space_class: str | None = None
@@ -195,20 +199,49 @@ def _refusal(problems: list[Problem], *, more: int = 0, code: str) -> HTTPExcept
 Handler = Callable[[], Coroutine[Any, Any, Any]]
 
 
+def _error(status_code: int, code: str, message: str) -> HTTPException:
+    """A refusal in the `{code, message}` shape the other routes use."""
+    return HTTPException(
+        status_code=status_code, detail={"code": code, "message": message}
+    )
+
+
+async def _bounded_body(request: Request, limit: int) -> bytes:
+    """The request body, refused with 413 once it passes `limit` bytes:
+    by its declared length before anything is read, else as it streams in,
+    so an oversized upload is never buffered whole."""
+    too_large = _error(413, "too_large", f"the body is over {limit} bytes")
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        raise too_large
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise too_large
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _call(action: Handler) -> Any:
     try:
         return await action()
     except ZoneImportRefusedError as error:
         raise _refusal(error.problems, code=error.code) from error
+    except InvalidGeometryError as error:
+        raise _refusal(error.problems, code="invalid_ed269") from error
     except RegistryError as error:
         raise registry_http(error) from error
 
 
-def _checked(body: Ed269Zone) -> Any:
+def _checked(body: Ed269Zone, max_ring_vertices: int) -> Any:
     """The body through the strict ED-269 reader, or 422 naming the fields."""
     try:
         return parse_zone(
-            body.model_dump(by_alias=True, exclude_none=True, mode="json"), "zone"
+            body.model_dump(by_alias=True, exclude_none=True, mode="json"),
+            "zone",
+            max_ring_vertices=max_ring_vertices,
         )
     except Ed269Error as error:
         raise _refusal(
@@ -224,9 +257,10 @@ def zone_writer(
     async def dependency(request: Request) -> Operator:
         operator = await check(request)
         if operator.role not in ZONE_WRITERS:
-            raise HTTPException(
-                status_code=403,
-                detail="changing zones needs the "
+            raise _error(
+                403,
+                "forbidden",
+                "changing zones needs the "
                 + " or ".join(sorted(role.value for role in ZONE_WRITERS))
                 + " role",
             )
@@ -290,13 +324,9 @@ def zone_router(zones: ZoneStore | None, auth: Authenticator) -> APIRouter:
     ) -> dict[str, Any]:
         """Add and replace zones from an ED-269 document, by identifier, all
         or nothing. `dry_run` validates and reports, writing nothing."""
-        data = await request.body()
-        if len(data) > MAX_IMPORT_BYTES:
-            raise HTTPException(
-                status_code=413, detail=f"at most {MAX_IMPORT_BYTES} bytes"
-            )
+        data = await _bounded_body(request, MAX_IMPORT_BYTES)
         try:
-            parsed = parse(data)
+            parsed = parse(data, max_ring_vertices=store().max_ring_vertices)
         except Ed269Error as error:
             raise _refusal(
                 list(error.problems), more=error.more, code="invalid_ed269"
@@ -323,7 +353,7 @@ def zone_router(zones: ZoneStore | None, auth: Authenticator) -> APIRouter:
         body: Ed269Zone, operator: Annotated[Operator, Depends(writer)]
     ) -> dict[str, Any]:
         """Create a zone, as the editor draws it."""
-        geozone = _checked(body)
+        geozone = _checked(body, store().max_ring_vertices)
         result: dict[str, Any] = await _call(
             lambda: store().create(geozone, actor=operator.actor)
         )
@@ -334,7 +364,7 @@ def zone_router(zones: ZoneStore | None, auth: Authenticator) -> APIRouter:
         zone_id: UUID, body: Ed269Zone, operator: Annotated[Operator, Depends(writer)]
     ) -> dict[str, Any]:
         """Replace a zone with the one sent; the identifier may change."""
-        geozone = _checked(body)
+        geozone = _checked(body, store().max_ring_vertices)
         result: dict[str, Any] = await _call(
             lambda: store().update(zone_id, geozone, actor=operator.actor)
         )

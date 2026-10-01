@@ -54,6 +54,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from airspace.ed269 import (
+    MAX_RING_VERTICES,
     Circle,
     Ed269Document,
     GeoZone,
@@ -64,7 +65,7 @@ from airspace.ed269 import (
 )
 from airspace.zones import ZONE_COLUMNS, RowType, geozone_from_row
 from api.actors import Actor
-from api.registry import ConflictError, NotFoundError, audit, refused
+from api.registry import ConflictError, InvalidError, NotFoundError, audit, refused
 
 ENTITY = "airspace_zone"
 IMPORT_ENTITY = "airspace_zone_import"
@@ -83,6 +84,50 @@ class ZoneImportRefusedError(ConflictError):
             code="zone_import_refused",
         )
         self.problems = problems
+
+
+class InvalidGeometryError(InvalidError):
+    """A polygon PostGIS finds invalid: a ring that crosses itself (a bow
+    tie), one with no area (collinear corners), a hole outside its shell.
+    The monitor's ray casting would answer for it, plausibly and wrongly."""
+
+    def __init__(self, problems: list[Problem]) -> None:
+        super().__init__(
+            "; ".join(f"{p.field}: {p.reason}" for p in problems),
+            code="invalid_ed269",
+        )
+        self.problems = problems
+
+
+_VALIDITY = sa.text(
+    """
+    SELECT ST_IsValid(g) AS valid, ST_IsValidReason(g) AS reason
+    FROM (SELECT ST_SetSRID(ST_GeomFromGeoJSON(:geojson), 4326) AS g) AS shape
+    """
+)
+
+
+async def _check_geometry(
+    connection: AsyncConnection, zones: list[tuple[str, GeoZone]]
+) -> None:
+    """Refuse, naming each, the polygons PostGIS finds invalid. A circle is
+    valid by construction (a buffer)."""
+    problems: list[Problem] = []
+    for path, zone in zones:
+        if isinstance(zone.volume.projection, Circle):
+            continue
+        row = (
+            await connection.execute(_VALIDITY, {"geojson": _params(zone)["geojson"]})
+        ).one()
+        if not row.valid:
+            problems.append(
+                Problem(
+                    f"{path}.geometry[0].horizontalProjection",
+                    f"not a valid polygon: {row.reason}",
+                )
+            )
+    if problems:
+        raise InvalidGeometryError(problems)
 
 
 @dataclass
@@ -205,6 +250,8 @@ def _params(geozone: GeoZone) -> dict[str, Any]:
 @dataclass
 class ZoneStore:
     engine: AsyncEngine
+    # The parser's cap on positions per ring (`ZONE_MAX_RING_VERTICES`).
+    max_ring_vertices: int = MAX_RING_VERTICES
     # When "active now" is judged; a test sets it.
     wall: Callable[[], datetime] = _now
 
@@ -285,6 +332,7 @@ class ZoneStore:
     async def create(self, geozone: GeoZone, *, actor: Actor) -> dict[str, Any]:
         try:
             async with self.engine.begin() as connection:
+                await _check_geometry(connection, [("zone", geozone)])
                 zone_id = await self._insert(connection, geozone)
                 await audit(
                     connection,
@@ -307,6 +355,7 @@ class ZoneStore:
                 row = await self._row(connection, zone_id, lock=True)
                 self._refuse_non_geozone(row)
                 before = geozone_from_row(row)
+                await _check_geometry(connection, [("zone", geozone)])
                 if before != geozone:
                     await connection.execute(
                         _update_sql(geozone), {**_params(geozone), "id": str(zone_id)}
@@ -403,6 +452,13 @@ class ZoneStore:
                 ]
                 if problems:
                     raise ZoneImportRefusedError(problems)
+                await _check_geometry(
+                    connection,
+                    [
+                        (f"features[{index}]", zone)
+                        for index, zone in enumerate(parsed.zones)
+                    ],
+                )
                 changes: list[tuple[str, UUID | None, GeoZone, GeoZone | None]] = []
                 for zone in parsed.zones:
                     row = existing.get(zone.identifier)
