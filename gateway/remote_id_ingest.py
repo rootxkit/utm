@@ -23,6 +23,15 @@ With `REMOTE_ID_RECEIVER_KEYS` set, every datagram must be signed by a known
 receiver, recently, and only once (`gateway/remote_id_auth.py`). Without it
 the ingest accepts unsigned datagrams, and `gateway/config.py` then refuses to
 bind anywhere but loopback.
+
+## Switched off (U-15)
+
+Remote ID as a whole, or one receiver, can be switched off without a
+restart (`common/sources.py`). A datagram from a disabled receiver is
+dropped once its receiver is established, before the tracker, the store or
+the bus sees it, and counted (`dropped_source_disabled` in the status line,
+and per receiver on `source.remote_id`). Switching it on again needs
+nothing at the receiver: the next datagram is taken.
 """
 
 from __future__ import annotations
@@ -44,6 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from common import configure_logging, get_logger, load_settings
 from common.geoid import GeoidGrid
+from common.sources import REMOTE_ID, SourceControlFollower, bucket_reader, follow
 from gateway import odid
 from gateway.config import RemoteIdSettings
 from gateway.publisher import Bus
@@ -57,6 +67,7 @@ from gateway.remote_id_auth import (
 )
 from gateway.remote_id_match import FleetSerials, LinkFreshness, as_registered
 from gateway.remote_id_store import PendingRows, RemoteIdWriter, row_from_observation
+from gateway.source_activity import SourceActivity, publish_periodically
 
 _log = get_logger(__name__)
 
@@ -137,6 +148,11 @@ class RemoteIdIngest:
     # Broadcasts by our own aircraft while their telemetry was live: stored,
     # not published.
     withheld: int = field(default=0, init=False)
+    # U-15. Which receivers are switched on, and what each is doing. None:
+    # every receiver is (a test, or an ingest with no control channel).
+    sources: SourceActivity | None = None
+    # Datagrams from a receiver, or a type, that is switched off.
+    dropped_source_disabled: int = field(default=0, init=False)
 
     async def on_datagram(self, data: bytes, source: str) -> None:
         received_at = self.wall()
@@ -146,6 +162,11 @@ class RemoteIdIngest:
             else:
                 report, _ = split(data)
             frame = parse_datagram(report, received_at=received_at)
+            if self.sources is not None and not self.sources.admit(frame.receiver_id):
+                # Before the tracker: a disabled receiver's broadcasts are
+                # not half taken, and nothing of them is stored or published.
+                self.dropped_source_disabled += 1
+                return
             observation = self.tracker.take(frame, now_s=self.clock_s())
         except (AuthenticationError, DatagramError, odid.DecodeError) as error:
             self.refused += 1
@@ -200,6 +221,7 @@ class RemoteIdIngest:
         totals = {
             "published": self.published,
             "refused": self.refused,
+            "dropped_source_disabled": self.dropped_source_disabled,
             "withheld": self.withheld,
             "transmitters": tracker.transmitters,
             "unidentified": tracker.unidentified,
@@ -317,6 +339,17 @@ async def run(settings: RemoteIdSettings) -> None:
         )
     fleet = FleetSerials()
     await fleet.refresh(engine)
+    # U-15. The switches, from the bucket the API writes; never from the
+    # relational database.
+    follower = SourceControlFollower(
+        read=bucket_reader(bus, settings.source_control_bucket),
+        poll_s=settings.source_control_poll_s,
+    )
+    sources = SourceActivity(
+        source_type=REMOTE_ID,
+        switch=follower,
+        known=authenticator.keys if authenticator is not None else (),
+    )
     ingest = RemoteIdIngest(
         tracker=tracker_from_settings(settings, geoid),
         bus=bus,
@@ -324,7 +357,9 @@ async def run(settings: RemoteIdSettings) -> None:
         geoid_model=geoid_model(geoid, settings.geoid_path),
         authenticator=authenticator,
         fleet=fleet,
+        sources=sources,
     )
+    control = await follow(bus, follower, subject=settings.source_control_subject)
 
     async def on_telemetry(message: Msg) -> None:
         ingest.links.on_telemetry(message.data, now_s=ingest.clock_s())
@@ -343,6 +378,8 @@ async def run(settings: RemoteIdSettings) -> None:
             "receivers": (
                 sorted(authenticator.keys) if authenticator else "unauthenticated"
             ),
+            "source_control_version": follower.state.version,
+            "disabled": [f"{t}/{i or '*'}" for t, i in follower.state.disabled()],
         },
     )
     stop = asyncio.Event()
@@ -353,6 +390,7 @@ async def run(settings: RemoteIdSettings) -> None:
     flusher = asyncio.create_task(flush_periodically(store, stop))
     refresher = asyncio.create_task(refresh_serials_periodically(fleet, engine, stop))
     reporter = asyncio.create_task(log_status_periodically(ingest, stop))
+    announcer = asyncio.create_task(publish_periodically(sources, bus, stop))
     try:
         await stop.wait()
     finally:
@@ -362,6 +400,9 @@ async def run(settings: RemoteIdSettings) -> None:
         await flusher
         await refresher
         await reporter
+        await announcer
+        await follower.stop()
+        await control.unsubscribe()
         if store.pending:
             _log.error(
                 "remote id observations not stored at shutdown",
