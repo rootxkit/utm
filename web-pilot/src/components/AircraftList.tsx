@@ -8,6 +8,8 @@ interface Props {
   selected: string | null;
   now: number;
   onSelect: (droneId: string) => void;
+  // U-15: aircraft whose source is switched off.
+  sourceDisabled: Set<string>;
 }
 
 // The registry label leads and the id follows: a pilot knows "SITL-01", and
@@ -18,7 +20,7 @@ export function sortedAircraft(aircraft: Map<string, Aircraft>): [string, Aircra
   );
 }
 
-export function AircraftList({ aircraft, alerts, selected, now, onSelect }: Props) {
+export function AircraftList({ aircraft, alerts, selected, now, onSelect, sourceDisabled }: Props) {
   const t = useT();
   if (aircraft.size === 0) return <p className="muted pad">{t("none")}</p>;
   const severity = new Map<string, Alert["severity"]>();
@@ -66,6 +68,9 @@ export function AircraftList({ aircraft, alerts, selected, now, onSelect }: Prop
                   {t("seconds_ago", { n: ageSeconds(item.receivedAt, now) })}
                 </span>
                 {!placed && <span className="pill unplaced">{t("no_position")}</span>}
+                {sourceDisabled.has(id) && (
+                  <span className="pill source-disabled">{t("source_disabled_track")}</span>
+                )}
               </div>
             </button>
           </li>
