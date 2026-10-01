@@ -6,7 +6,15 @@ import ipaddress
 from pathlib import Path
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from common import (
     NatsSettings,
@@ -16,6 +24,14 @@ from common import (
     SourceControlSettings,
     TelemetryDatabaseSettings,
 )
+from common.sources import INSTANCE_ID_PATTERN
+from gateway.network_rid import (
+    DEFAULT_DETAILS_TTL_S,
+    DEFAULT_MAX_AGE_S,
+    DEFAULT_MAX_DIAGONAL_KM,
+    Area,
+)
+from gateway.network_rid import DEFAULT_SCOPE as DEFAULT_NETWORK_RID_SCOPE
 from gateway.registry_projection import DEFAULT_REFRESH_S
 from gateway.remote_id import (
     DEFAULT_IDENTIFY_WITHIN_S,
@@ -216,6 +232,116 @@ class RemoteIdSettings(
                 "they must be signed, or bind to 127.0.0.1"
             )
         return self
+
+
+class NetworkRidProvider(BaseModel):
+    """One ASTM F3411 Service Provider polled as a Display Provider (U-02).
+
+    `id` is the instance U-15 switches and the `station_id` its tracks
+    carry. `areas` are `[lat_min, lon_min, lat_max, lon_max]` boxes.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(pattern=INSTANCE_ID_PATTERN.pattern)
+    base_url: AnyHttpUrl
+    token_url: AnyHttpUrl
+    client_id: str = Field(min_length=1)
+    client_secret: SecretStr
+    scope: str = DEFAULT_NETWORK_RID_SCOPE
+    audience: str | None = None
+    areas: list[tuple[float, float, float, float]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _https_off_this_host(self) -> Self:
+        """A client secret and a bearer token are sent to these URLs: in
+        clear only to this host (the fake SP for SITL)."""
+        for name, url in (("base_url", self.base_url), ("token_url", self.token_url)):
+            if url.scheme != "https" and not _is_loopback(url.host or ""):
+                raise ValueError(
+                    f"provider {self.id}: {name} {url} is plain HTTP off this host; "
+                    "use https"
+                )
+        return self
+
+    @field_validator("areas")
+    @classmethod
+    def _areas_are_boxes(
+        cls, value: list[tuple[float, float, float, float]]
+    ) -> list[tuple[float, float, float, float]]:
+        for box in value:
+            Area(*box)  # raises ValueError for a box out of order or range
+        return value
+
+
+class NetworkRidSettings(
+    ServiceSettings,
+    NatsSettings,
+    TelemetryDatabaseSettings,
+    SourceControlSettings,
+    RegistryProjectionSettings,
+):
+    """Network Remote ID ingest (U-02): USSP flights in, telemetry out.
+
+    Needs the bus and the telemetry database (the registry projection).
+    Never the relational one.
+    """
+
+    service_name: str = "network-rid-ingest"
+    # JSON, one object per provider (gateway/network_rid_ingest.py). Empty:
+    # nothing is polled, and the service says so.
+    network_rid_providers: list[NetworkRidProvider] = Field(
+        default_factory=list, validation_alias="NETWORK_RID_PROVIDERS"
+    )
+    # How often each provider is polled. F3411 asks a Display Provider to
+    # refresh at least once a second for a display that is current.
+    network_rid_poll_s: float = Field(
+        default=1.0, gt=0, validation_alias="NETWORK_RID_POLL_S"
+    )
+    # F3411-22a NetMaxDisplayAreaDiagonalKm (7 km; v19's was 3.6 km): the
+    # largest view an SP answers, so an area is polled in tiles no larger.
+    network_rid_max_diagonal_km: float = Field(
+        default=DEFAULT_MAX_DIAGONAL_KM,
+        gt=0,
+        validation_alias="NETWORK_RID_MAX_DIAGONAL_KM",
+    )
+    # F3411 NetMaxNearRealTimeDataPeriod: a state older than this is not
+    # shown as current.
+    network_rid_max_age_s: float = Field(
+        default=DEFAULT_MAX_AGE_S, gt=0, validation_alias="NETWORK_RID_MAX_AGE_S"
+    )
+    # How long a flight's details (serial, operator) are reused.
+    network_rid_details_ttl_s: float = Field(
+        default=DEFAULT_DETAILS_TTL_S,
+        gt=0,
+        validation_alias="NETWORK_RID_DETAILS_TTL_S",
+    )
+    network_rid_http_timeout_s: float = Field(
+        default=5.0, gt=0, validation_alias="NETWORK_RID_HTTP_TIMEOUT_S"
+    )
+    # Only when a response carries no timestamp of its own: how far the
+    # state's time may be ahead of ours, or behind, and still place it.
+    network_rid_time_tolerance_s: float = Field(
+        default=DEFAULT_TIME_TOLERANCE_S,
+        ge=0,
+        validation_alias="NETWORK_RID_TIME_TOLERANCE_S",
+    )
+    network_rid_max_latency_s: float = Field(
+        default=DEFAULT_MAX_LATENCY_S,
+        gt=0,
+        validation_alias="NETWORK_RID_MAX_LATENCY_S",
+    )
+    # The same grid as the Remote ID ingest: F3411 altitudes are above the
+    # WGS-84 ellipsoid.
+    geoid_path: Path | None = Field(default=None, validation_alias="GEOID_PATH")
+
+    @field_validator("network_rid_providers")
+    @classmethod
+    def _unique_ids(cls, value: list[NetworkRidProvider]) -> list[NetworkRidProvider]:
+        ids = [provider.id for provider in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"provider ids must be unique: {ids}")
+        return value
 
 
 def _is_loopback(host: str) -> bool:
