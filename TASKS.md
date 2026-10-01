@@ -933,6 +933,11 @@ S-A and S-B rather than running beside them. S-14 is optional and last.
       published on a registered aircraft's `telemetry.{id}` subject.
       *Done when:* a broadcast carrying a registered serial, without that
       aircraft's verification, is shown as a separate unverified track.
+      *U-02:* done while the aircraft's relay telemetry is live: a
+      broadcast more than `REMOTE_ID_SPOOF_DISTANCE_M` from it is a
+      separate `unknown_operator` track with a mismatch alert. With the
+      link quiet the broadcast still takes over as that aircraft (P1-15's
+      design), marked as a broadcast; nothing then can contradict it.
 
 ### S-C: `airspace/` and `common/terrain.py`
 
@@ -1188,7 +1193,7 @@ optional there and can be made mandatory by the authority.
       suspended and looked up by registration number or serial, with every
       change in `events`.
 
-- [ ] **U-02** Network identification service: every track, whatever its
+- [x] **U-02** Network identification service: every track, whatever its
       source, is resolved to *registered*, *registered but suspended*,
       *unknown operator* or *unidentified*. Direct Remote ID's operator
       registration number and serial are matched against U-01; a mismatch
@@ -1198,6 +1203,14 @@ optional there and can be made mandatory by the authority.
       *Done when:* four simulated broadcasts, one per status, show their
       status in the console, and an `unidentified` or `unknown operator`
       track in a zone opens an incident (U-12).
+      *Done* 2026-10-01 (`docs/runbooks/u02-identification.md`): four SITL
+      broadcasts, one per status, on the bus and in the console; an
+      unidentified one flown through a PROHIBITED zone raised and cleared
+      an `identification` alert. U-12 does not exist yet, so the incident
+      half is met by its seam: every `identification` alert goes to the
+      airspace service's `Incidents` sink, which U-12 will implement.
+      Network Remote ID ingests F3411 SPs (a fake SP in SITL). U-17's
+      inbound side is not built.
 
 - [x] **U-03** Geo-awareness: the zone model follows EUROCAE ED-269
       (identifier, restriction type, reason, vertical limits with their
