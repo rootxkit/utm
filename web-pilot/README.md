@@ -7,7 +7,9 @@ redirects there once it is built.
 - **Map:** the self-hosted basemap (P1-12), zones, bases, every aircraft with
   its heading, and a line between the two aircraft of each conflict.
   Layer toggles for zones, bases and labels.
-- **Aircraft, alerts, stations, unclaimed sources** in the sidebar.
+- **Aircraft, alerts, stations, sources, unclaimed sources** in the
+  sidebar. Sources (U-15) lists each source type and instance with its
+  state; an admin switches one off or on with a reason.
 - **Detail panel** for the selected aircraft: everything the feed carries,
   battery and altitude trends, link quality, firmware, and a link to replay.
 - **Alerts:** a tone repeats while a critical alert is unacknowledged.

@@ -12,6 +12,8 @@ interface Props {
   alerts: Alert[];
   now: number;
   onClose: () => void;
+  // U-15: its source is switched off; the data shown is its last.
+  sourceDisabled: boolean;
 }
 
 function Field({ label, value }: { label: string; value: string }) {
@@ -23,7 +25,7 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function DronePanel({ droneId, aircraft, alerts, now, onClose }: Props) {
+export function DronePanel({ droneId, aircraft, alerts, now, onClose, sourceDisabled }: Props) {
   const t = useT();
   const d = aircraft?.data;
   const ground = useTerrain(d?.lat_deg ?? null, d?.lon_deg ?? null);
@@ -41,6 +43,7 @@ export function DronePanel({ droneId, aircraft, alerts, now, onClose }: Props) {
           ×
         </button>
       </header>
+      {sourceDisabled && <p className="source-disabled-note small">{t("source_disabled_note")}</p>}
       {!d || !aircraft ? (
         <p className="muted pad">{t("no_position")}</p>
       ) : (

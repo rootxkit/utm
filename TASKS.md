@@ -1142,7 +1142,7 @@ The four services 2021/664 makes mandatory inside a U-space airspace are
 U-02, U-03, U-05 and U-07. U-06 (conformance) and U-08 (weather) are
 optional there and can be made mandatory by the authority.
 
-- [ ] **U-15** Source isolation and control (`ARCHITECTURE.md` §2.1):
+- [x] **U-15** Source isolation and control (`ARCHITECTURE.md` §2.1):
       every source is its own adapter process publishing the common track
       format, and each can be switched off without a deploy, by type and by
       instance (station, receiver, provider, feed). A disabled source is

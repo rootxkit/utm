@@ -12,6 +12,7 @@ from common.config import (
     RedisSettings,
     ServiceSettings,
     Settings,
+    SourceControlSettings,
     TelemetryDatabaseSettings,
     load_settings,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "RedisSettings",
     "ServiceSettings",
     "Settings",
+    "SourceControlSettings",
     "TelemetryDatabaseSettings",
     "bind",
     "configure_logging",

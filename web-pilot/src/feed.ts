@@ -4,7 +4,7 @@
 // and reconnects. A 401 from the API means the session itself is gone.
 import { useEffect, useReducer, useState } from "react";
 import { apiPost } from "./api/client";
-import type { Aircraft, Alert, FeedMessage, Station, Unclaimed } from "./types";
+import type { Aircraft, Alert, FeedMessage, SourceReport, Station, Unclaimed } from "./types";
 
 const SIGN_IN_REQUIRED = 4401;
 const HISTORY_POINTS = 600;
@@ -17,10 +17,18 @@ export interface FeedState {
   stations: Map<string, Station>;
   alerts: Map<string, Alert>;
   unclaimed: Map<string, Unclaimed>;
+  // U-15: each adapter's latest report on its sources, by source type.
+  sources: Map<string, SourceReport>;
 }
 
 function empty(): FeedState {
-  return { aircraft: new Map(), stations: new Map(), alerts: new Map(), unclaimed: new Map() };
+  return {
+    aircraft: new Map(),
+    stations: new Map(),
+    alerts: new Map(),
+    unclaimed: new Map(),
+    sources: new Map(),
+  };
 }
 
 export function apply(state: FeedState, message: FeedMessage): FeedState {
@@ -50,6 +58,11 @@ export function apply(state: FeedState, message: FeedMessage): FeedState {
       if (message.data.state === "cleared") alerts.delete(message.data.key);
       else alerts.set(message.data.key, message.data);
       return { ...state, alerts };
+    }
+    case "source": {
+      const sources = new Map(state.sources);
+      sources.set(message.data.source_type, { data: message.data, receivedAt: now });
+      return { ...state, sources };
     }
     case "events": {
       if (message.name !== "unclaimed_source" && message.name !== "rejected_source") return state;

@@ -2,7 +2,7 @@
 in ED-269. P6-01, U-03.
 
 A zone is an ED-269 `UASZoneVersion` (`airspace/ed269.py`) stored in
-`airspace_zones` (migration 0006_geo_awareness). Every zone written here,
+`airspace_zones` (migration 0007_geo_awareness). Every zone written here,
 by the console's editor or by an import, goes through the same strict
 reader, `airspace.ed269.parse_zone`, so what is stored is always something
 the export can write back unchanged and the monitor can evaluate.

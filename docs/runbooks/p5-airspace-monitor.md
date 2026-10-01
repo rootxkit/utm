@@ -44,7 +44,7 @@ UPDATE airspace_policy SET max_height_agl_m = 150;   -- NULL: no limit
 ## Geographical zones (U-03)
 
 Zones follow EUROCAE ED-269 (`airspace/ed269.py`; migration
-`0006_geo_awareness`). Each has an identifier, a restriction, reasons, a
+`0007_geo_awareness`). Each has an identifier, a restriction, reasons, a
 message, the authority, when it applies (permanent, or dates and a weekly
 schedule) and one volume: a polygon or a circle between a lower and an upper
 limit, each limit with its own reference.

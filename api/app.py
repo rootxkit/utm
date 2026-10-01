@@ -39,6 +39,8 @@ from api.registry import (
     RegistryError,
 )
 from api.replay import DroneNotFoundError, ReplayError, ReplayStore, WindowTooLargeError
+from api.source_routes import sources_router
+from api.sources import SourceControlService
 from api.uas_registry import UasRegistry
 from api.uas_routes import uas_router
 from api.zone_routes import zone_router
@@ -180,6 +182,7 @@ def create_api_app(
     login_limiter: LoginRateLimiter | None = None,
     uas: UasRegistry | None = None,
     zone_max_ring_vertices: int = MAX_RING_VERTICES,
+    sources: SourceControlService | None = None,
 ) -> FastAPI:
     """The API. `auth` is required: there is no way to build it open.
 
@@ -326,6 +329,11 @@ def create_api_app(
 
     # Always routed, so the schema carries them; without `uas` they answer 503.
     app.include_router(uas_router(uas, auth))
+
+    # --- source switches (U-15) ------------------------------------------------
+
+    # Always routed, so the schema carries them; without `sources`, 503.
+    app.include_router(sources_router(sources, auth))
 
     # --- airspace zones (P6-01, U-03) ---------------------------------------------
 

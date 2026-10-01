@@ -6,7 +6,7 @@ what a supervisor watching the air needs whether or not anyone planned the
 flight.
 
 Zones are ED-269 zones (`airspace/ed269.py`) stored in `airspace_zones`
-(migration 0006_geo_awareness). Each has one volume: a polygon or a circle,
+(migration 0007_geo_awareness). Each has one volume: a polygon or a circle,
 between a lower and an upper limit, each limit with its own reference.
 
 ## Horizontally

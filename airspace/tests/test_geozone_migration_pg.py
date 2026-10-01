@@ -1,4 +1,4 @@
-"""Migration 0006_geo_awareness on a populated table: up, down, up. U-03.
+"""Migration 0007_geo_awareness on a populated table: up, down, up. U-03.
 
 Zones made before U-03 must keep alerting exactly as they did, and the
 downgrade must lose only what its docstring says it loses.
@@ -19,7 +19,7 @@ from api.tests.conftest import migrate_relational
 
 pytestmark = pytest.mark.postgres
 
-BEFORE = "0005_uas_registry"
+BEFORE = "0006_source_controls"
 SQUARE = "POLYGON((44.80 41.70, 44.82 41.70, 44.82 41.72, 44.80 41.72, 44.80 41.70))"
 OLD_ZONES = (
     ("mig-no-fly", "no_fly", 400.0, 700.0),

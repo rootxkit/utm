@@ -2,9 +2,10 @@
 
 Reads the separation policy, the height limit and the zones from the
 relational database, the terrain tiles from `TERRAIN_DIR` and the geoid
-from `GEOID_PATH`, then follows the Gateway's telemetry on the bus. Zones
-are re-read every `ZONE_REFRESH_S` (60 s), and so are the separation policy,
-the height limit and the CONDITIONAL zone severity, so a zone drawn in the
+from `GEOID_PATH`, then follows the Gateway's telemetry on the bus, leaving
+out sources that are switched off (U-15, `common/sources.py`). Zones are
+re-read every `ZONE_REFRESH_S` (60 s), and so are the separation policy, the
+height limit and the CONDITIONAL zone severity, so a zone drawn in the
 console, imported, edited or deleted takes effect within a minute without a
 restart; a change is logged.
 """
@@ -30,7 +31,13 @@ from airspace.policy import (
 from airspace.service import AirspaceService, EventsAuditLog, run_ticker
 from airspace.zones import Zone, load_zones, unjudgeable
 from common import configure_logging, get_logger, load_settings
+from common.bus import RECONNECT_FOREVER
 from common.geoid import GeoidGrid
+from common.sources import (
+    SourceControlState,
+    follow,
+    follower_from_settings,
+)
 from common.terrain import Terrain
 
 _log = get_logger(__name__)
@@ -88,7 +95,14 @@ async def run(settings: AirspaceSettings) -> None:
         )
     geoid = None if settings.geoid_path is None else GeoidGrid.load(settings.geoid_path)
     zones = await load_zones(engine)
+    bus = await nats.connect(
+        str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
+    )
+    # U-15. The switches, from the same bucket and subject the adapters
+    # follow, so the monitor stops judging a source when they stop taking it.
+    follower = follower_from_settings(bus, settings)
     monitor = AirspaceMonitor(
+        source_enabled=follower.enabled,
         policy=policy,
         zones=zones,
         terrain=terrain,
@@ -100,7 +114,6 @@ async def run(settings: AirspaceSettings) -> None:
         source_state_max=settings.source_state_max,
         pressure_uncertainty_m=settings.pressure_uncertainty_m,
     )
-    bus = await nats.connect(str(settings.nats_url))
     service = AirspaceService(
         monitor=monitor,
         bus=bus,
@@ -109,6 +122,7 @@ async def run(settings: AirspaceSettings) -> None:
         close_timeout_s=settings.audit_close_timeout_s,
         tiles=terrain,
         tile_log_every_s=settings.terrain_retry_missing_s,
+        source_control=follower,
     )
     _log.info(
         "airspace monitor running",
@@ -130,6 +144,13 @@ async def run(settings: AirspaceSettings) -> None:
     async def on_message(message: Msg) -> None:
         await service.on_telemetry(message.data)
 
+    async def on_switch(_: SourceControlState, __: SourceControlState) -> None:
+        await service.on_sources_changed()
+
+    follower.on_change = on_switch
+    # Before telemetry is taken, so a source switched off before this start
+    # is never judged.
+    control = await follow(bus, follower, subject=settings.source_control_subject)
     await bus.subscribe("telemetry.*", cb=on_message)
 
     stop = asyncio.Event()
@@ -187,6 +208,8 @@ async def run(settings: AirspaceSettings) -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        await follower.stop()
+        await control.unsubscribe()
         await bus.drain()
         # Queued audit rows are written before the engine goes.
         await service.close()

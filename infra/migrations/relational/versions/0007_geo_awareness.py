@@ -1,7 +1,7 @@
 """airspace_zones follows EUROCAE ED-269: restriction, limits with their reference
 
-Revision ID: 0006_geo_awareness
-Revises: 0005_uas_registry
+Revision ID: 0007_geo_awareness
+Revises: 0006_source_controls
 Create Date: 2026-10-01
 
 U-03. A zone becomes an ED-269 `UASZoneVersion` with one airspace volume
@@ -92,8 +92,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0006_geo_awareness"
-down_revision: str | None = "0005_uas_registry"
+revision: str = "0007_geo_awareness"
+down_revision: str | None = "0006_source_controls"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

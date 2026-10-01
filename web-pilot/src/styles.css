@@ -504,6 +504,42 @@ button.link {
 .registry-table tr.clickable:hover {
   background: var(--selected);
 }
+/* U-15: sources switched off, and aircraft from them. */
+.pill.source-healthy {
+  background: var(--ok);
+  color: #fff;
+}
+.pill.source-stale {
+  background: var(--warning);
+  color: #fff;
+}
+.pill.source-disabled {
+  background: #616161;
+  color: #fff;
+}
+.source-type {
+  margin: 12px 12px 4px;
+  font-size: 13px;
+}
+.source-switch {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.source-switch input {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.source-disabled-note {
+  margin: 0;
+  padding: 6px 12px;
+  background: var(--line);
+}
+.drone-marker[data-source-disabled="true"] {
+  opacity: 0.35;
+  filter: grayscale(1);
+}
 .pill.reg-active {
   background: var(--ok);
   color: #fff;

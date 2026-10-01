@@ -2,6 +2,10 @@
 
 Loopback by default (`API_HOST`). Every route needs a signed-in operator
 (P6-08); create the first admin with `python tools/operators.py create-admin`.
+
+U-15: the API is the writer of the source switches, so it holds a NATS
+connection for publishing them (`api/sources.py`). Without the bus it still
+serves, and a switch answers 503 without changing anything.
 """
 
 from __future__ import annotations
@@ -22,10 +26,23 @@ from api.live import RedisLiveState
 from api.ratelimit import LoginRateLimiter
 from api.registry import FleetRegistry
 from api.replay import ReplayStore
+from api.sources import (
+    NatsControlChannel,
+    SourceControlService,
+    SourceControlStore,
+    nats_channel_factory,
+    republish_periodically,
+)
 from api.uas_registry import UasRegistry
-from common import configure_logging, load_settings
+from common import configure_logging, get_logger, load_settings
 from common.terrain import Terrain
 from gateway.binding import BindingResolver
+
+_log = get_logger(__name__)
+
+# How long startup may wait for the bus before serving without it; see
+# api/telemetry_ws.py CONNECT_TIMEOUT_S for why this is bounded.
+NATS_CONNECT_TIMEOUT_S = 5.0
 
 
 def build_app(settings: ApiSettings) -> FastAPI:
@@ -59,8 +76,20 @@ def build_app(settings: ApiSettings) -> FastAPI:
         projection=registry.projection,
         registration_pattern=settings.registration_pattern,
     )
+    sources = SourceControlService(
+        store=SourceControlStore(engine=engine),
+        channel=None,
+        default_deny=settings.sources_default_deny,
+        connect=nats_channel_factory(
+            str(settings.nats_url),
+            bucket=settings.source_control_bucket,
+            subject=settings.source_control_subject,
+            connect_timeout_s=NATS_CONNECT_TIMEOUT_S,
+        ),
+    )
     app = create_api_app(
         registry,
+        sources=sources,
         uas=uas,
         auth=operators,
         feed_secret=settings.feed_ticket_secret.get_secret_value().encode("utf-8"),
@@ -81,9 +110,22 @@ def build_app(settings: ApiSettings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # The first connection is made by the republish loop's first pass,
+        # and remade by any later pass that finds it missing or closed.
+        stop = asyncio.Event()
+        republisher = asyncio.create_task(
+            republish_periodically(
+                sources, stop, every_s=settings.source_control_republish_s
+            )
+        )
         try:
             yield
         finally:
+            stop.set()
+            await republisher
+            channel = sources.channel
+            if isinstance(channel, NatsControlChannel) and not channel.closed:
+                await channel.client.drain()
             await redis_client.aclose()
             await asyncio.gather(engine.dispose(), telemetry_engine.dispose())
 

@@ -1498,6 +1498,101 @@
         "title": "RoleIn",
         "type": "object"
       },
+      "SourceControlOut": {
+        "properties": {
+          "changed_at": {
+            "format": "date-time",
+            "title": "Changed At",
+            "type": "string"
+          },
+          "changed_by": {
+            "title": "Changed By",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "instance_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instance Id"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "source_type": {
+            "title": "Source Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_type",
+          "instance_id",
+          "enabled",
+          "reason",
+          "changed_by",
+          "changed_at"
+        ],
+        "title": "SourceControlOut",
+        "type": "object"
+      },
+      "SourceSwitchIn": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "reason": {
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "reason"
+        ],
+        "title": "SourceSwitchIn",
+        "type": "object"
+      },
+      "SourcesOut": {
+        "properties": {
+          "controls": {
+            "items": {
+              "$ref": "#/components/schemas/SourceControlOut"
+            },
+            "title": "Controls",
+            "type": "array"
+          },
+          "default_deny": {
+            "title": "Default Deny",
+            "type": "boolean"
+          },
+          "source_types": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Types",
+            "type": "array"
+          }
+        },
+        "required": [
+          "default_deny",
+          "source_types",
+          "controls"
+        ],
+        "title": "SourcesOut",
+        "type": "object"
+      },
       "StatusChangeIn": {
         "description": "Why, for the audit log.",
         "properties": {
@@ -3564,6 +3659,146 @@
           }
         },
         "summary": "Flights"
+      }
+    },
+    "/sources": {
+      "get": {
+        "description": "Every switch that has been made. Live state (last seen, refused\ncounts) is on the console feed, from the adapters.",
+        "operationId": "list_sources_sources_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourcesOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Sources",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/sources/{source_type}": {
+      "put": {
+        "description": "Switch a whole type: every station, receiver, provider or feed.",
+        "operationId": "switch_type_sources__source_type__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_type",
+            "required": true,
+            "schema": {
+              "maxLength": 32,
+              "title": "Source Type",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceSwitchIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceControlOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Switch Type",
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/sources/{source_type}/instances/{instance_id}": {
+      "put": {
+        "description": "Switch one station, receiver, provider or feed.",
+        "operationId": "switch_instance_sources__source_type__instances__instance_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_type",
+            "required": true,
+            "schema": {
+              "maxLength": 32,
+              "title": "Source Type",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "instance_id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "title": "Instance Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceSwitchIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceControlOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Switch Instance",
+        "tags": [
+          "sources"
+        ]
       }
     },
     "/terrain": {
