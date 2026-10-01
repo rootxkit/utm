@@ -115,10 +115,11 @@ def _row(row: Any) -> dict[str, Any]:
 
 
 def state_of(
-    rows: list[dict[str, Any]], *, version: int, default_deny: bool
+    rows: list[dict[str, Any]], *, version: int, default_deny: bool, epoch: str = ""
 ) -> SourceControlState:
     return SourceControlState(
         version=version,
+        epoch=epoch,
         default_deny=default_deny,
         controls=tuple(
             Control(
@@ -141,6 +142,22 @@ _SELECT = (
 # The version of a published state: a database sequence, so it only ever
 # goes up, whatever any clock does (migration 0006_source_controls).
 _NEXT_VERSION = sa.text("SELECT nextval('source_control_version_seq')")
+_LAST_VERSION = sa.text(
+    "SELECT CASE WHEN is_called THEN last_value ELSE 0 END "
+    "FROM source_control_version_seq"
+)
+_EPOCH = sa.text("SELECT epoch FROM source_control_epoch WHERE id = 1")
+_NEW_EPOCH = sa.text(
+    "UPDATE source_control_epoch SET epoch = gen_random_uuid()::text "
+    "WHERE id = 1 RETURNING epoch"
+)
+# Every writer of the switches and of the bucket takes this transaction-
+# scoped lock first, so two API processes serialise: one's switch, written
+# to the bucket before its commit, is never overwritten by the other's
+# republish of what its database view still said. The value is arbitrary
+# and only has to be the same in every process ("U15" in ASCII).
+ADVISORY_LOCK_KEY = 0x553135
+_LOCK = sa.text("SELECT pg_advisory_xact_lock(:key)")
 
 
 async def _list(connection: AsyncConnection) -> list[dict[str, Any]]:
@@ -167,11 +184,22 @@ class SourceControlStore:
         async with self.engine.connect() as fresh:
             return await _list(fresh)
 
-    async def next_version(self, connection: AsyncConnection | None = None) -> int:
-        if connection is not None:
-            return int((await connection.execute(_NEXT_VERSION)).scalar_one())
-        async with self.engine.begin() as fresh:
-            return int((await fresh.execute(_NEXT_VERSION)).scalar_one())
+    async def next_version(self, connection: AsyncConnection) -> int:
+        return int((await connection.execute(_NEXT_VERSION)).scalar_one())
+
+    async def last_version(self, connection: AsyncConnection) -> int:
+        return int((await connection.execute(_LAST_VERSION)).scalar_one())
+
+    async def epoch(self, connection: AsyncConnection) -> str:
+        return str((await connection.execute(_EPOCH)).scalar_one())
+
+    async def new_epoch(self, connection: AsyncConnection) -> str:
+        return str((await connection.execute(_NEW_EPOCH)).scalar_one())
+
+    async def lock(self, connection: AsyncConnection) -> None:
+        """Serialise with every other writer, in any process, until this
+        transaction ends."""
+        await connection.execute(_LOCK, {"key": ADVISORY_LOCK_KEY})
 
     async def set(
         self,
@@ -195,6 +223,7 @@ class SourceControlStore:
         reason = check_reason(reason)
         key = WHOLE_TYPE if instance_id is None else instance_id
         async with self.engine.begin() as connection:
+            await self.lock(connection)
             current = (
                 await connection.execute(
                     sa.text(
@@ -318,8 +347,20 @@ class NatsControlChannel:
             )
 
     async def load(self) -> SourceControlState | None:
+        """None for nothing, and for a value that does not parse: a corrupt
+        bucket is logged and then overwritten, never left to block repair."""
         payload = await bucket_reader(self.client, self.bucket)()
-        return None if payload is None else SourceControlState.from_json(payload)
+        if payload is None:
+            return None
+        try:
+            return SourceControlState.from_json(payload)
+        except ValueError as error:
+            _log.error(
+                "the source control bucket holds a value that does not parse; "
+                "overwriting it from the database",
+                extra={"bucket": self.bucket, "error": str(error)},
+            )
+            return None
 
     async def store(self, state: SourceControlState) -> None:
         """Raises when JetStream cannot take it (not enabled, store full,
@@ -419,6 +460,7 @@ class SourceControlService:
                 state = state_of(
                     await self.store.list(connection),
                     version=await self.store.next_version(connection),
+                    epoch=await self.store.epoch(connection),
                     default_deny=self.default_deny,
                 )
                 try:
@@ -500,20 +542,9 @@ class SourceControlService:
             )
             return False
         try:
-            rows = await self.store.list()
-            held = await channel.load()
-            probe = state_of(rows, version=0, default_deny=self.default_deny)
-            if held is not None and same_content(held, probe):
-                # Already there: announce the same version, which followers
-                # that have it ignore.
-                state = held
-            else:
-                state = state_of(
-                    rows,
-                    version=await self.store.next_version(),
-                    default_deny=self.default_deny,
-                )
-                await channel.store(state)
+            async with self.store.engine.begin() as connection:
+                await self.store.lock(connection)
+                state = await self._reconcile(channel, connection)
             await channel.announce(state)
         except Exception as error:
             self.publish_failures += 1
@@ -533,6 +564,47 @@ class SourceControlService:
             )
         self.published_version = state.version
         return True
+
+    async def _reconcile(
+        self, channel: ControlChannel, connection: AsyncConnection
+    ) -> SourceControlState:
+        """Make the bucket hold the database's state; return what it holds.
+        Runs under the advisory lock, inside `connection`'s transaction."""
+        rows = await self.store.list(connection)
+        epoch = await self.store.epoch(connection)
+        held = await channel.load()
+        probe = state_of(rows, version=0, default_deny=self.default_deny)
+        if held is not None and held.epoch == epoch and same_content(held, probe):
+            # Already there: announce the same version, which followers
+            # that have it ignore.
+            return held
+        if (
+            held is not None
+            and held.epoch == epoch
+            and held.version > await self.store.last_version(connection)
+        ):
+            # The bucket is ahead of the sequence in the same epoch: the
+            # database was restored from a backup. A new epoch makes the
+            # followers take the next state whatever its number.
+            old = epoch
+            epoch = await self.store.new_epoch(connection)
+            _log.warning(
+                "source control sequence is behind the bucket; starting a new "
+                "epoch (database restored?)",
+                extra={
+                    "bucket_version": held.version,
+                    "old_epoch": old,
+                    "epoch": epoch,
+                },
+            )
+        state = state_of(
+            rows,
+            version=await self.store.next_version(connection),
+            epoch=epoch,
+            default_deny=self.default_deny,
+        )
+        await channel.store(state)
+        return state
 
 
 def nats_channel_factory(

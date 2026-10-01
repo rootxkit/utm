@@ -316,3 +316,43 @@ async def test_with_jetstream_a_switch_is_recorded_and_reaches_a_follower(
     finally:
         await follower.stop()
         await subscription.unsubscribe()
+
+
+@pytest.mark.postgres
+async def test_a_corrupt_bucket_is_overwritten_and_followers_survive_it(
+    client: Any,
+    names: tuple[str, str],
+    relational_engine: AsyncEngine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bucket, subject = names
+    channel = NatsControlChannel(client=client, bucket=bucket, subject=subject)
+    await channel.ensure_bucket()
+    await channel.store(switched_off(RELAY, "station-1", version=1))
+    follower = SourceControlFollower(read=bucket_reader(client, bucket), poll_s=3600)
+    await follower.start()
+    try:
+        assert not follower.enabled(RELAY, "station-1")
+        kv = await client.jetstream().key_value(bucket)
+        await kv.put("state", b"{not json")
+
+        # The follower keeps what it held and counts the corrupt value.
+        assert not await follower.refresh()
+        assert not follower.enabled(RELAY, "station-1")
+        assert follower.ignored_malformed == 1
+
+        # The API reads it as nothing, says so, and overwrites it.
+        with caplog.at_level(logging.ERROR, logger="api.sources"):
+            assert await channel.load() is None
+        assert any("does not parse" in r.getMessage() for r in caplog.records)
+        service = SourceControlService(
+            store=SourceControlStore(engine=relational_engine), channel=channel
+        )
+        assert await service.publish_current()
+        payload = await bucket_reader(client, bucket)()
+        assert payload is not None
+        SourceControlState.from_json(payload)
+        assert await follower.refresh()
+        assert follower.status()["source_control_read_ok"] == 1
+    finally:
+        await follower.stop()

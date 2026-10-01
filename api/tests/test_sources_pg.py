@@ -18,7 +18,7 @@ import pytest
 import sqlalchemy as sa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from api.app import create_api_app
 from api.sources import SourceControlService, SourceControlStore
@@ -465,3 +465,143 @@ async def test_the_migration_goes_down_and_up(
         )
     assert "source_controls" not in tables
     await asyncio.to_thread(migrate_relational, prepared_relational_database, "head")
+
+
+async def test_a_bucket_ahead_of_the_sequence_starts_a_new_epoch(
+    service: SourceControlService, channel: RecordingChannel
+) -> None:
+    """A database restored from a backup: the bucket holds a version the
+    sequence has not reached, under the database's own epoch. The next
+    publish starts a new epoch, so followers take it."""
+    assert await service.publish_current()
+    current = channel.published[-1]
+    channel.published.append(
+        SourceControlState(
+            version=current.version + 1_000_000,
+            epoch=current.epoch,
+            controls=current.controls,
+            default_deny=not current.default_deny,
+        )
+    )
+
+    assert await service.publish_current()
+
+    repaired = channel.published[-1]
+    assert repaired.epoch != current.epoch
+    assert repaired.version < current.version + 1_000_000
+    assert repaired.default_deny == current.default_deny
+
+
+class FailingCommitStore(SourceControlStore):
+    """The bucket write succeeds and then the transaction fails, as a commit
+    that the database refuses would."""
+
+    async def set(self, *args: Any, **kwargs: Any) -> tuple[dict[str, Any], bool]:
+        hook = kwargs.pop("before_commit")
+
+        async def then_fail(connection: Any) -> None:
+            await hook(connection)
+            raise RuntimeError("commit refused")
+
+        return await super().set(*args, before_commit=then_fail, **kwargs)
+
+
+async def test_a_commit_that_fails_after_the_bucket_write_is_repaired_at_once(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    service = SourceControlService(
+        store=FailingCommitStore(engine=relational_engine), channel=channel
+    )
+    name = station()
+    with pytest.raises(RuntimeError, match="commit refused"):
+        await service.switch(
+            RELAY, name, enabled=False, reason="x", actor=ADMIN.actor, actor_name="a"
+        )
+
+    # The switch reached the bucket before the failure, and was taken back
+    # out of it before the call returned.
+    assert any(not s.enabled(RELAY, name) for s in channel.published)
+    assert channel.published[-1].enabled(RELAY, name)
+    assert await rows_for(relational_engine, name) == []
+
+
+async def test_two_api_processes_serialise_their_switches(
+    prepared_relational_database: str, channel: RecordingChannel
+) -> None:
+    """Two stores on two engines, as two API replicas: each holds the
+    advisory lock from its first statement to its commit, so their bucket
+    writes never interleave."""
+    engines = [create_async_engine(prepared_relational_database) for _ in range(2)]
+    spans: list[tuple[str, float, float]] = []
+
+    class SlowChannel(RecordingChannel):
+        async def store(self, state: SourceControlState) -> None:
+            started = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.3)
+            await super().store(state)
+            spans.append((str(len(spans)), started, asyncio.get_running_loop().time()))
+
+    try:
+        channels = [SlowChannel(), SlowChannel()]
+        services = [
+            SourceControlService(
+                store=SourceControlStore(engine=engine), channel=channel
+            )
+            for engine, channel in zip(engines, channels, strict=True)
+        ]
+        names = [station(), station()]
+        await asyncio.gather(
+            *(
+                svc.switch(
+                    RELAY,
+                    name,
+                    enabled=False,
+                    reason="r",
+                    actor=ADMIN.actor,
+                    actor_name="a",
+                )
+                for svc, name in zip(services, names, strict=True)
+            )
+        )
+    finally:
+        for engine in engines:
+            await engine.dispose()
+
+    (_, _first_start, first_end), (_, second_start, _) = sorted(
+        spans, key=lambda s: s[1]
+    )
+    assert second_start >= first_end
+    # The later one saw the earlier one's switch: its state has both.
+    last = max(
+        (state for channel in channels for state in channel.published),
+        key=lambda state: state.version,
+    )
+    assert not last.enabled(RELAY, names[0])
+    assert not last.enabled(RELAY, names[1])
+
+
+async def test_without_the_lock_the_writes_would_interleave(
+    prepared_relational_database: str,
+) -> None:
+    """The paired presence: the same timing with the lock taken on a key
+    nobody else uses shows the writes overlapping, so the test above
+    measures the lock and not the event loop."""
+    engines = [create_async_engine(prepared_relational_database) for _ in range(2)]
+    spans: list[tuple[float, float]] = []
+
+    async def write(engine: AsyncEngine, key: int) -> None:
+        async with engine.begin() as connection:
+            await connection.execute(
+                sa.text("SELECT pg_advisory_xact_lock(:k)"), {"k": key}
+            )
+            started = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.3)
+            spans.append((started, asyncio.get_running_loop().time()))
+
+    try:
+        await asyncio.gather(write(engines[0], 1), write(engines[1], 2))
+    finally:
+        for engine in engines:
+            await engine.dispose()
+    (_first_start, first_end), (second_start, _) = sorted(spans)
+    assert second_start < first_end
