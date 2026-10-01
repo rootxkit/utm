@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 
@@ -84,6 +85,15 @@ class AirspaceSettings(
     # say the altitude is approximate to within it.
     pressure_uncertainty_m: float = Field(
         default=250.0, ge=0, validation_alias="PRESSURE_UNCERTAINTY_M"
+    )
+    # U-02. What an `identification` alert raises (an unidentified or
+    # unknown-operator aircraft in a PROHIBITED or REQ_AUTHORISATION zone,
+    # the incident seam), and an `identification_mismatch` alert.
+    identification_alert_severity: Literal["critical", "warning", "info"] = Field(
+        default="critical", validation_alias="IDENTIFICATION_ALERT_SEVERITY"
+    )
+    identification_mismatch_severity: Literal["critical", "warning", "info"] = Field(
+        default="warning", validation_alias="IDENTIFICATION_MISMATCH_SEVERITY"
     )
     # S-13. Audit rows waiting for the background writer. Transitions are
     # rare (the 2026-09-29 SITL run wrote 16 rows in four minutes), so 1000
