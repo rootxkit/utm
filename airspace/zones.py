@@ -17,9 +17,10 @@ difference from a geodesic edge is metres at most, well under GPS error at
 the boundary; a zone the size of a country would need the database's own
 `ST_Contains` on `geography`. Interior rings (holes) are honoured.
 
-A circle is tested exactly, by great-circle distance from its centre, not
-against the inscribed polygon `geom` holds for drawing. Every shape is first
-tested against its bounding box.
+A circle is tested exactly, by the geodesic distance from its centre on the
+WGS-84 ellipsoid (`airspace/geodesy.py`), which is what PostGIS's buffer on
+`geography` draws, not against the inscribed polygon `geom` holds. Every
+shape is first tested against its bounding box.
 
 ## Vertically, each limit in its own reference
 
@@ -69,6 +70,7 @@ from airspace.ed269 import (
     Volume,
     applies,
 )
+from airspace.geodesy import distance_m
 
 Ring = tuple[tuple[float, float], ...]
 
@@ -155,10 +157,9 @@ class Zone:
         if not (min_lon <= lon_deg <= max_lon and min_lat <= lat_deg <= max_lat):
             return False
         if self.circle is not None:
+            # On the ellipsoid, as PostGIS's geography buffer draws it.
             return (
-                great_circle_m(
-                    lat_deg, lon_deg, self.circle.lat_deg, self.circle.lon_deg
-                )
+                distance_m(lat_deg, lon_deg, self.circle.lat_deg, self.circle.lon_deg)
                 <= self.circle.radius_m
             )
         if not _in_ring(self.exterior, lon_deg, lat_deg):
