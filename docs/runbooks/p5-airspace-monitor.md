@@ -55,12 +55,26 @@ limit, each limit with its own reference.
 | AGL | AMSL less the ground under it (DEM) | `TERRAIN_DIR` |
 | WGS84 | AMSL plus the geoid undulation (height above the ellipsoid) | `GEOID_PATH` |
 
-Where a zone the aircraft is horizontally inside has a limit whose data is
-missing, it is **not evaluated** for that aircraft: no alert, an active one
-is neither refreshed nor cleared, and `zone_checks_not_evaluated` in the
-status line counts it. At start-up and on every reload the service logs
-which zones cannot be judged and what they need. Applicability is judged in
-UTC at the track's placed time (`captured_at`).
+A lower AGL limit at or below the ground is met by any airborne aircraft and
+needs no DEM. Where a zone the aircraft is horizontally inside has a limit
+whose data is missing:
+
+- a PROHIBITED or REQ_AUTHORISATION zone whose only unjudged limit is above
+  the ground raises a **warning** with `vertical_known: false` and
+  `limit_not_judged: true` (`zone_limits_not_judged`): a false warning beats
+  a missed critical. While any PROHIBITED zone needs terrain and
+  `TERRAIN_DIR` is unset, the start-up log and every status line are at
+  error level;
+- otherwise (CONDITIONAL, or a WGS84 limit without the geoid) it is **not
+  evaluated**: no alert, an active one is neither refreshed nor cleared, and
+  `zone_checks_not_evaluated` counts it.
+
+On a pressure altitude (S-33) each judged limit is widened by
+`pressure_uncertainty_m`: inside as indicated keeps the zone's severity,
+inside the widened limits only is a warning (`within_band: false`).
+Applicability is judged in UTC at the track's placed time (`captured_at`).
+Circles are judged on the WGS-84 ellipsoid, every zone's bounding box first,
+and a ring may have at most `ZONE_MAX_RING_VERTICES` (5000) positions.
 
 Zones are written three ways, every change audited in `events`:
 
@@ -94,9 +108,16 @@ and one was drawn and edited in the console itself. From the bus, in UTC:
 | 3 | permanent again | 01:27:12-01:27:31 | critical raised 01:27:11.9, cleared 01:27:33.9 |
 | 4 | plus U03UI, drawn in the console, CONDITIONAL, edited there to 600-800 m AMSL | 01:33:31-01:33:50 | U03UI warning raised 01:33:21.9, cleared 01:33:34.9; U03AMSL critical raised 01:33:30.9, cleared 01:33:53.9 |
 
-A third zone, 0-120 m AGL over the same square, raised nothing in every
-run and was counted as not evaluated (20 checks a pass), with the log
-naming `TERRAIN_DIR`. Zones were created at 01:20:55 and loaded at
+A third zone, REQ_AUTHORISATION 0-120 m AGL over the same square, raised
+nothing in every run and was counted as not evaluated (20 checks a pass),
+with the log naming `TERRAIN_DIR`. That was the rule then; the review
+changed it (above), and it was re-run after merging S-33:
+
+- U03AGLP, PROHIBITED, 0-120 m AGL, no DEM, the same pass (20 samples
+  inside, 02:05:55-02:06:13): **warning** raised 02:05:56.4 with
+  `vertical_known: false`, `limit_not_judged: true`, `not_judged: ["AGL"]`;
+  cleared (resolved) 02:06:19.4. Both are `events` rows. From its load
+  onwards, the start-up line and every status line were errors naming it. Zones were created at 01:20:55 and loaded at
 01:21:43, inside the 60 s refresh. Each transition is an `events` row.
 
 ## Result, 2026-09-29
