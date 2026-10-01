@@ -1101,7 +1101,7 @@ class AirspaceMonitor:
             labels=(self._labels.get(track.drone_id),),
             detail={
                 "status": identification.get("status"),
-                "reason": identification.get("reason"),
+                "identification_reason": identification.get("reason"),
                 "serial": identification.get("serial"),
                 "operator_reg": identification.get("operator_reg"),
                 "mismatch": identification.get("mismatch") is True,
@@ -1130,7 +1130,7 @@ class AirspaceMonitor:
             labels=(self._labels.get(track.drone_id),),
             detail={
                 "status": identification.get("status"),
-                "reason": identification.get("reason"),
+                "identification_reason": identification.get("reason"),
                 "serial": identification.get("serial"),
                 "operator_reg": identification.get("operator_reg"),
                 "registered_operator_reg": identification.get(
