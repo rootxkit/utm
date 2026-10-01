@@ -202,16 +202,28 @@ def monitored_zone(zone_id: UUID, geozone: GeoZone) -> Zone:
     )
 
 
+def needs_terrain(zone: Zone) -> bool:
+    """Whether judging the zone vertically needs the DEM: an AGL ceiling, or
+    an AGL floor above the ground. A floor at or below it is met by any
+    airborne aircraft."""
+    return any(
+        limit is not None
+        and limit.reference is VerticalReference.AGL
+        and (not is_lower or limit.value_m > 0)
+        for limit, is_lower in ((zone.lower, True), (zone.upper, False))
+    )
+
+
 def unjudgeable(
     zones: list[Zone], *, terrain: bool, geoid: bool
 ) -> dict[str, list[str]]:
     """Identifiers of zones with a limit that cannot be judged anywhere, by
-    what is missing: AGL limits without terrain, WGS84 limits without the
-    geoid. Such a zone is never evaluated vertically, so the service says
+    what is missing: AGL limits that need the ground (`needs_terrain`)
+    without terrain, WGS84 limits without the geoid. Such a zone is never evaluated vertically, so the service says
     so when it loads them rather than only when an aircraft is inside."""
     missing: dict[str, list[str]] = {}
     for zone in zones:
-        if not terrain and VerticalReference.AGL in zone.references:
+        if not terrain and needs_terrain(zone):
             missing.setdefault("TERRAIN_DIR", []).append(zone.identifier)
         if not geoid and VerticalReference.WGS84 in zone.references:
             missing.setdefault("GEOID_PATH", []).append(zone.identifier)

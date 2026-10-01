@@ -20,11 +20,10 @@ arrived. What `ts` is depends on the path:
 - **Relay (MAVLink):** the ground PC's `recv_utc_ns`, the moment the relay
   received the frame. relay-v1 §9 says that clock may be wrong, drifting or
   stepped, and nothing corrects it upstream.
-- **Remote ID:** the Gateway's own receive time (`gateway/remote_id.py`).
-  The broadcast's `seconds_after_hour` is decoded (`gateway/odid.py`) but not
-  yet carried, so a Remote ID position is stamped when it reached the
-  Gateway, not when the aircraft measured it. Carrying the broadcast time is
-  a Gateway follow-up.
+- **Remote ID:** the broadcast's own capture time (`gateway/remote_id.py`,
+  S-27). The Gateway also sets `captured_at` to it when it is plausible, so
+  a Remote ID position is placed when the aircraft measured it, not when it
+  reached the Gateway.
 
 Neither clock is trusted for placing an aircraft in time. Every message also
 carries `rx_ts`, when the Gateway received the batch on its own clock;
@@ -47,13 +46,31 @@ is bounded by `SOURCE_STATE_MAX`. A pair whose neighbour sample is older
 than `NEIGHBOUR_MAX_AGE_S` is not judged by that message: neither refreshed
 nor cleared, because silence is not evidence.
 
+Two Remote ID tracks with the same transmitter address
+(`remote_id.transmitter`), one of them unidentified, are never paired: the
+Gateway publishes a transmitter as unidentified while it has no fresh
+identity and under its serial once it has one (S-32), so they are one radio
+under two ids. Two identified tracks on one address, a spoofer on another's
+address for instance, are judged like any pair.
+
+A track whose altitude is a Remote ID pressure altitude (`alt_source:
+"pressure"`, S-33) has no known vertical position. Conflicts with it are
+judged on the horizontal criteria alone, and say
+`vertical_separation_known: false`. Inside a zone's altitude band as
+indicated, it raises as anyone would, a no-fly zone at critical; inside the
+band widened by `PRESSURE_UNCERTAINTY_M` (250 m) only, a warning. The
+height limit is judged on the indicated height. Those alerts say
+`vertical_known: false`. Messages are counted in `vertical_unknown`. An
+alert whose severity changes is raised again, not changed in place.
+
 Rejected messages, failed checks, unreadable tiles and audit-queue losses are
 counted and logged in the `airspace monitor status` line every minute.
 
 ## Settings
 
 `DATABASE_URL`, `NATS_URL`, `TERRAIN_DIR` as in `common/config.py`, plus,
-all in `airspace/config.py` with their defaults and reasons: `LIVE_MAX_AGE_S`,
+all in `airspace/config.py` with their defaults and reasons:
+`PRESSURE_UNCERTAINTY_M`, `LIVE_MAX_AGE_S`,
 `NEIGHBOUR_MAX_AGE_S`, `SOURCE_STATE_MAX`, `AUDIT_QUEUE_SIZE`,
 `AUDIT_CLOSE_TIMEOUT_S`, `TERRAIN_CACHE_TILES`. Separation minima and the
 height limit are policy in the database, never here.

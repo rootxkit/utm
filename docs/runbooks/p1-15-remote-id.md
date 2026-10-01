@@ -26,6 +26,66 @@ One UDP datagram per message or message pack it hears, to
 address it came from; it is what joins a Basic ID to a Location when they
 arrive separately (Bluetooth 4).
 
+## Identity per transmitter address
+
+An address can be reused, so a Basic ID names its address's Locations only
+while it is fresh (S-32):
+
+| Setting | Default | The identity is dropped when |
+|---|---|---|
+| `REMOTE_ID_IDENTITY_TTL_S` | 15 | its Basic ID has not been heard for this long (five 3 s static periods; it was a minute). |
+| `REMOTE_ID_MAX_GAP_S` | 3 | the address is silent for longer than this (three 1 s Location periods): a reboot or another aircraft. |
+| | | another Basic ID of the same ID type arrives from the address. System and Operator ID go with it. |
+
+Freshness is per transmitter, across receivers. If receiver A hears the
+Basic ID and receiver B only the Locations, B's Locations take A's fresh
+identity (a receiver's own comes first): one identified track, not an
+identified one beside an unidentified one.
+
+A Location without a fresh identity on any receiver waits up to
+`REMOTE_ID_IDENTIFY_WITHIN_S` (4 s) for a Basic ID. After that it is
+published and stored as an **unidentified** track of the transmitter: id
+derived from the address, labelled with the address, `remote_id.identified`
+false, an empty UAS ID and ID type 0. It is never attached to an earlier
+serial. A Location that was waiting and is overtaken by the next one is not
+kept.
+
+**When the serial arrives, the unidentified track is not merged into it.**
+It is left to go stale, and drops out of the airspace monitor after its
+15 s staleness horizon. Until then the transmitter is on the map under both
+ids. The monitor never pairs an unidentified track with another track of the
+same address, so the two do not conflict with each other. Every other check
+runs on both, though. A zone, height or conflict condition met by the
+aircraft can therefore be raised twice, once per id. The unidentified
+track's alerts then clear as `stale`.
+
+**One transmitter, two identities.** A Basic ID naming a second fresh
+identity of the same ID type for an address, from any receiver, is an
+anomaly: two radios on one address, or a spoofer using another aircraft's.
+It is counted (`address_conflicts`) and logged at warning ("remote id
+anomaly: one transmitter, two identities"), at most once a minute per
+address with the count suppressed in between. Identity changes are logged
+the same way. Two identified tracks on one address are judged by the
+monitor like any pair, so the spoofer is checked against its victim.
+
+The ingest logs its totals every minute and on stopping ("remote id ingest
+status"):
+
+- `published`, `refused`, `withheld`, `transmitters`;
+- `unidentified`, `identity_changes`, `address_conflicts`, `silences`;
+- `time_fallback_unknown`, `_invalid`, `_too_old` and `_clock_ahead`;
+- `store_pending`, `store_written`, `store_dropped`.
+
+**Our own aircraft.** If one of ours broadcasts without a fresh identity,
+its unidentified track is not matched to our fleet (only a serial is), so
+while its MAVLink telemetry is live the monitor can raise a conflict between
+the two. This is accepted for now: the MAVLink path is leaving utm.
+
+**Limit.** A different aircraft that takes over an address within
+`REMOTE_ID_MAX_GAP_S`, while the old Basic ID is still fresh, and whose own
+Basic ID is lost, is indistinguishable from the old aircraft losing a Basic
+ID. Its Locations are joined to the old serial until its Basic ID arrives.
+
 ## Run it
 
 ```
@@ -90,8 +150,9 @@ python -m tools.sitl_remote_id --count 3 --serial 'SITLRID{sysid:04d}' \
 - **Time:** the Location timestamp is the vehicle's own clock (its
   `time_boot_ms`, put on UTC by `SYSTEM_TIME`), in tenths of a second after
   the hour. Until the vehicle has sent `SYSTEM_TIME` the timestamp is sent
-  as unknown and no System message goes out. The ingest does not use the
-  timestamp yet (`ts` is arrival time).
+  as unknown and no System message goes out. The ingest places the
+  aircraft at that time (S-27, "Time" below); an unknown one is placed at
+  its arrival.
 - **Rates:** Location every `--location-period-s` (1 s). Basic ID, System
   and Operator ID every `--static-period-s` (3 s), sent as one message pack
   (`--transport pack`) or one message per datagram, as Bluetooth 4 does
@@ -101,6 +162,68 @@ python -m tools.sitl_remote_id --count 3 --serial 'SITLRID{sysid:04d}' \
   for a repeatable run). `--delay-s 2` delivers each datagram two seconds
   late, signed when it is sent. `--spoof-serial <serial>` broadcasts
   someone else's serial number (U-02).
+
+## Pressure altitude
+
+The AMSL altitude comes from the broadcast's geodetic (ellipsoid) altitude
+through the geoid. When that altitude is missing, or the broadcast flags it
+as poor, the pressure altitude is used instead (S-33).
+
+- **Flagged poor:** its declared vertical accuracy is known and below
+  `REMOTE_ID_MIN_VERTICAL_ACCURACY`. The codes are the standard's, from 1
+  (under 150 m) to 6 (under 1 m). The default is 2, under 45 m, so only
+  "under 150 m" is flagged. An unknown accuracy is not a flag.
+- **Marked:** every observation carries `alt_source` (`geodetic`,
+  `pressure`, or null with no AMSL altitude) and the raw `alt_pressure_m`.
+- **Held:** once on pressure, a transmitter stays on it for
+  `REMOTE_ID_PRESSURE_HOLD_S` (10 s) after its last poor geodetic altitude.
+  An accuracy hovering at the threshold therefore does not flip the source,
+  and the monitor's alerts with it, every message.
+- **Pressure altitude is not AMSL.** It is referenced to 1013.25 hPa, not
+  to the local QNH, and is off by about 8 m per hPa of difference: some
+  160 m on a 20 hPa day, against a 20 m vertical minimum. The airspace
+  monitor therefore treats such an aircraft's vertical position as
+  unknown. A conflict with it is judged on the horizontal criteria alone,
+  and its alert says `vertical_separation_known: false`, with no vertical
+  distance. Inside a zone's altitude band as indicated, it raises as
+  usual, a no-fly zone at critical. Inside the band widened by the
+  monitor's `PRESSURE_UNCERTAINTY_M` (250 m) each way, but not the band
+  itself, it raises a warning. The height limit is judged on the indicated
+  height, as a warning. These alerts say `vertical_known: false`. Zones
+  without altitude limits are judged as for anyone. When an active alert's
+  severity changes, it is raised again under its key, so the console and
+  the audit log see the change. The monitor counts these messages as
+  `vertical_unknown` in its status line.
+- **Stored:** the row's `geoid_model` says `pressure altitude, ISA
+  1013.25 hPa`. That is not a geoid: read it as "no geodetic height".
+- **Without a geoid**, there is still no AMSL altitude: pressure replaces a
+  poor geodetic altitude, not a missing geoid.
+
+## Time
+
+The aircraft is placed at the time its Location says it was measured, not
+when the ingest heard it (S-27). The broadcast carries tenths of a second
+after the UTC hour; the ingest takes the hour that puts it closest to, and
+not after, its own receive time plus a tolerance, so a broadcast at
+12:59:59.9 heard at 13:00:00.2 is 12:59:59.9.
+
+| Setting | Default | |
+|---|---|---|
+| `REMOTE_ID_TIME_TOLERANCE_S` | 1.0 | How far ahead of the ingest's clock a broadcast time may be. |
+| `REMOTE_ID_MAX_LATENCY_S` | 5.0 | How old a broadcast may be on arrival and still be placed at its own time. |
+
+Both are widened by the timestamp accuracy the broadcast declares. Outside
+them, or with the time unknown, the aircraft is placed at its arrival:
+`captured_at` is `rx_ts`, `remote_id.time_source` is `receiver`, and the
+tracker counts the reason:
+
+- `unknown` or `invalid`: no usable time;
+- `too_old`: more than the latency bound behind the ingest's clock;
+- `clock_ahead`: ahead of it by more than the tolerance. The hour choice
+  then lands nearly an hour back, so anything over half an hour old is read
+  this way, and `ts` is the time the broadcast claims. A steady count here
+  usually means the ingest's own clock is behind. Stored rows
+(`remote_id_observations.ts`) take the same placement.
 
 ## Signed receivers
 
@@ -145,7 +268,8 @@ half second. A row holds:
 - the broadcast identity;
 - the claimed position;
 - both heights: the ellipsoid height as broadcast, and the AMSL height with
-  the geoid model that produced it;
+  the geoid model that produced it, or `pressure altitude, ISA 1013.25 hPa`
+  when it came from the pressure altitude (below);
 - the receiver and transmitter;
 - the raw frame, so the decode can be checked later.
 
@@ -214,11 +338,11 @@ signed datagrams. Every position was compared with the same vehicle's
 - **Faults:** one message per datagram with 30% dropped, and a new serial
   on SYSID 1's transmitter address. 24 datagrams were sent and 17 dropped,
   and 16 observations were stored. The first 2 were stored under the serial
-  of the run just before. The ingest joins messages by transmitter address
-  and keeps an identity for 60 s, so those Locations arrived before the new
+  of the run just before. The ingest joined messages by transmitter address
+  and kept an identity for 60 s, so those Locations arrived before the new
   Basic ID. A real module does not change its serial, but a spoofer on a
   reused address would do the same. `--spoof-serial` therefore uses its own
-  address.
+  address. S-32 fixed this ("Identity per transmitter address" above).
 - **What this does not check:** the real geoid model. It is not installed on
   the laptop, so both processes used a flat 15.9 m grid. The HAE to AMSL
   round trip is checked; EGM2008 itself is not.
@@ -245,6 +369,27 @@ registered, unretired aircraft's. It re-reads the serials every minute.
 Either way it stays one track: it never becomes a second aircraft, and it
 never conflicts with itself. If our link drops, the track stays on the map
 from the broadcast.
+
+## Verified 2026-10-01: S-27 and S-32, in-process
+
+`tools/tests/test_sitl_remote_id_ingest.py` runs the U-16 bridge into the
+ingest on simulated clocks: pymavlink-parsed MAVLink in, signed datagrams
+through the bridge's own `FaultyLink`, then the ingest's authenticator,
+tracker and store. There are two 30 s legs, one message per datagram, with
+30% dropped. The second leg is a restart 4 s later with a new serial on the
+same address. Its seed loses the restart's first Basic ID while two
+Locations get through.
+
+- With the rules before S-32 (60 s identity, 60 s memory), the run stores
+  2 Locations of the restarted bridge under the old serial, as U-16 saw.
+- With S-32's rules, 22 rows are stored after the restart, all under the
+  new serial. Twenty more drop patterns store none under the old one
+  either.
+- With `--delay-s 2` and no drops, every observation is placed at its
+  broadcast time, 1.9 to 2.0 s before its receive time (the field holds
+  tenths).
+
+No SITL vehicle was flown for this.
 
 ## Not yet
 - No real receiver has been connected yet: the decoder is checked against

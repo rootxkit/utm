@@ -409,6 +409,35 @@ async def test_the_tick_logs_the_running_totals_on_its_cadence(
     assert svc.status()["rejected_backlog"] == 1
 
 
+async def test_a_prohibited_zone_that_needs_terrain_makes_the_status_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """U-03. Without a DEM a PROHIBITED zone with an AGL ceiling only warns;
+    the status line says so at error level, every time it is logged, and is
+    a plain info line once the zone no longer needs terrain."""
+    from airspace.tests.zone_helpers import square, zone
+
+    caplog.set_level(logging.INFO, logger="airspace.service")
+    svc, clock = service(RecordingBus())
+    svc.status_every_s = 10.0
+    svc.monitor.zones = [
+        zone(identifier="NOAGL", coordinates=square(41.7, 44.8), upper=(120, "AGL"))
+    ]
+    await svc.on_tick()
+    errors: list[Any] = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert errors[0].zones == ["NOAGL"]
+    assert svc.status()["prohibited_zones_without_terrain"] == 1
+
+    svc.monitor.zones = [
+        zone(identifier="AMSL", coordinates=square(41.7, 44.8), upper=(700, "AMSL"))
+    ]
+    clock.now_s = 20.0
+    await svc.on_tick()
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+    assert caplog.records[-1].getMessage() == "airspace monitor status"
+
+
 async def test_close_writes_what_is_queued() -> None:
     bus, audit = RecordingBus(), RecordingAudit()
     svc, _ = service(bus, audit)

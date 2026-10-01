@@ -30,11 +30,16 @@ def location(
     lat: float = LAT,
     lon: float = LON,
     alt_hae_m: float | None = 520.0,
+    alt_baro_m: float | None = None,
+    vert_accuracy: int = 4,
     track_deg: float | None = 90.0,
     speed_ms: float | None = 10.0,
     climb_ms: float | None = 1.0,
     status: int = odid.Status.AIRBORNE,
     height_reference: int = odid.HeightReference.OVER_TAKEOFF,
+    # NOW is on the hour, so 0.0 is a broadcast made the moment it arrives.
+    seconds_after_hour: float | None = 0.0,
+    ts_accuracy: int = 0,
 ) -> bytes:
     return odid.encode_location(
         odid.Location(
@@ -44,25 +49,31 @@ def location(
             speed_vertical_ms=climb_ms,
             lat_deg=lat,
             lon_deg=lon,
-            alt_baro_m=None,
+            alt_baro_m=alt_baro_m,
             alt_hae_m=alt_hae_m,
             height_reference=height_reference,
             height_m=30.0,
             horiz_accuracy=10,
-            vert_accuracy=4,
+            vert_accuracy=vert_accuracy,
             baro_accuracy=0,
             speed_accuracy=3,
-            ts_accuracy=0,
-            seconds_after_hour=12.3,
+            ts_accuracy=ts_accuracy,
+            seconds_after_hour=seconds_after_hour,
         )
     )
 
 
-def frame(payload: bytes, transmitter: str = "AA:BB:CC:00:00:01") -> Frame:
+def frame(
+    payload: bytes,
+    transmitter: str = "AA:BB:CC:00:00:01",
+    *,
+    received_at: datetime = NOW,
+    receiver_id: str = "rx-1",
+) -> Frame:
     return Frame(
-        receiver_id="rx-1",
+        receiver_id=receiver_id,
         transmitter=transmitter,
-        received_at=NOW,
+        received_at=received_at,
         payload=payload,
         rssi_dbm=-71.0,
     )

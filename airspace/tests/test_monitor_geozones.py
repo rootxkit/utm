@@ -181,31 +181,86 @@ def test_limits_in_feet_are_converted() -> None:
     assert raised(monitor(feet), 615.0) == []
 
 
-# --- not evaluated, counted, and never cleared by silence ------------------------------
+# --- limits without their data -------------------------------------------------------
+#
+# A CONDITIONAL zone, or a limit above the ellipsoid without the geoid, is not
+# evaluated: silent, counted, never cleared by silence. A PROHIBITED or
+# REQ_AUTHORISATION zone whose only unjudged limit is above the ground warns
+# instead (`limit_not_judged`): a false warning beats a missed critical.
 
 
 @pytest.mark.parametrize(
-    ("limit", "kwargs"),
+    ("restriction", "limit", "kwargs"),
     [
-        ((120, "AGL"), {}),
-        ((120, "AGL"), {"terrain": Flat(known=False)}),
-        ((120, "AGL"), {"terrain": Unreadable()}),
-        ((600, "WGS84"), {}),
+        ("CONDITIONAL", (120, "AGL"), {}),
+        ("CONDITIONAL", (120, "AGL"), {"terrain": Flat(known=False)}),
+        ("CONDITIONAL", (120, "AGL"), {"terrain": Unreadable()}),
+        ("PROHIBITED", (600, "WGS84"), {}),
     ],
     ids=["no terrain", "ground unknown", "tile unreadable", "no geoid"],
 )
 def test_a_limit_without_its_data_is_not_evaluated_and_counted(
-    limit: tuple[float, str], kwargs: dict[str, Any]
+    restriction: str, limit: tuple[float, str], kwargs: dict[str, Any]
 ) -> None:
-    m = monitor(here(upper=limit), **kwargs)
+    m = monitor(here(restriction=restriction, upper=limit), **kwargs)
     assert raised(m, 550.0) == []
     assert m.zone_checks_not_evaluated == 1
     raised(m, 550.0, at_s=1.0)
     assert m.zone_checks_not_evaluated == 2
 
 
+@pytest.mark.parametrize("restriction", ["PROHIBITED", "REQ_AUTHORISATION"])
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"terrain": Flat(known=False)}, {"terrain": Unreadable()}],
+    ids=["no terrain", "ground unknown", "tile unreadable"],
+)
+def test_an_agl_ceiling_without_the_ground_warns_that_it_was_not_judged(
+    restriction: str, kwargs: dict[str, Any]
+) -> None:
+    m = monitor(
+        here(restriction=restriction, lower=(0, "AGL"), upper=(120, "AGL")), **kwargs
+    )
+    (alert,) = raised(m, 550.0)
+    assert alert.severity is Severity.WARNING
+    assert alert.detail["vertical_known"] is False
+    assert alert.detail["limit_not_judged"] is True
+    assert alert.detail["not_judged"] == ["AGL"]
+    assert m.zone_limits_not_judged == 1
+    assert m.zone_checks_not_evaluated == 0
+
+
+def test_the_same_agl_zone_with_the_ground_is_judged_at_its_own_severity() -> None:
+    """The presence pair: with the DEM, 50 m AGL is critical and nothing is
+    flagged; 130 m AGL raises nothing."""
+    zone_ = here(lower=(0, "AGL"), upper=(120, "AGL"))
+    (alert,) = raised(monitor(zone_, terrain=Flat()), GROUND_M + 50)
+    assert alert.severity is Severity.CRITICAL
+    assert "limit_not_judged" not in alert.detail
+    assert raised(monitor(zone_, terrain=Flat()), GROUND_M + 130) == []
+
+
+def test_an_agl_floor_above_the_ground_also_needs_it() -> None:
+    m = monitor(here(lower=(50, "AGL")))
+    (alert,) = raised(m, 550.0)
+    assert alert.detail["limit_not_judged"] is True
+    assert alert.severity is Severity.WARNING
+    assert raised(monitor(here(lower=(50, "AGL")), terrain=Flat()), GROUND_M + 20) == []
+
+
+def test_an_agl_floor_at_the_ground_is_met_without_terrain() -> None:
+    """A lower AGL limit at or below 0 is met by any airborne aircraft."""
+    m = monitor(here(lower=(0, "AGL"), upper=(700, "AMSL")))  # no terrain
+    (alert,) = raised(m, 650.0)
+    assert alert.severity is Severity.CRITICAL
+    assert "limit_not_judged" not in alert.detail
+    assert m.zone_checks_not_evaluated == 0
+    # The AMSL ceiling still decides.
+    assert raised(monitor(here(lower=(0, "AGL"), upper=(700, "AMSL"))), 750.0) == []
+
+
 def test_the_height_the_caller_could_not_load_is_not_evaluated() -> None:
-    m = monitor(here(upper=(120, "AGL")), terrain=Flat())
+    m = monitor(here(restriction="CONDITIONAL", upper=(120, "AGL")), terrain=Flat())
     assert raised(m, 550.0, height_available=False) == []
     assert m.zone_checks_not_evaluated == 1
     # The same message with the tile loaded alerts.
@@ -214,7 +269,11 @@ def test_the_height_the_caller_could_not_load_is_not_evaluated() -> None:
 
 def test_an_unjudged_alert_is_neither_refreshed_nor_cleared() -> None:
     terrain = Flat()
-    m = monitor(here(upper=(120, "AGL")), terrain=terrain, clear_after_s=3.0)
+    m = monitor(
+        here(restriction="CONDITIONAL", upper=(120, "AGL")),
+        terrain=terrain,
+        clear_after_s=3.0,
+    )
     assert len(raised(m, 550.0)) == 1
     key = zone_key(A, m.zones[0])
 
@@ -231,20 +290,82 @@ def test_an_unjudged_alert_is_neither_refreshed_nor_cleared() -> None:
     assert [c.alert.key for c in cleared] == [key]
 
 
-def test_a_limit_that_can_be_judged_decides_when_another_cannot() -> None:
-    """Above an AMSL ceiling is outside, whatever an AGL floor says."""
-    mixed = here(lower=(0, "AGL"), upper=(700, "AMSL"))
-    m = monitor(mixed)  # no terrain
-    assert raised(m, 750.0) == []
-    assert m.zone_checks_not_evaluated == 0
-    assert raised(m, 650.0, at_s=1.0) == []
-    assert m.zone_checks_not_evaluated == 1
+def test_a_critical_alert_that_loses_the_ground_drops_to_a_flagged_warning() -> None:
+    """A severity change is raised again under its key (S-33's `_refresh`)."""
+    terrain = Flat()
+    m = monitor(here(upper=(120, "AGL")), terrain=terrain)
+    (first,) = raised(m, 550.0)
+    terrain.known = False
+    (second,) = raised(m, 550.0, at_s=1.0)
+    assert (first.severity, second.severity) == (Severity.CRITICAL, Severity.WARNING)
+    assert first.key == second.key
+    assert raised(m, 550.0, at_s=2.0) == []
+
+
+def test_prohibited_zones_without_terrain_are_named() -> None:
+    zones = [
+        here(identifier="P1", upper=(120, "AGL")),
+        here(identifier="P2", lower=(0, "AGL"), upper=(700, "AMSL")),
+        here(identifier="C1", restriction="CONDITIONAL", upper=(120, "AGL")),
+    ]
+    assert monitor(*zones).prohibited_without_terrain() == ["P1"]
+    assert monitor(*zones, terrain=Flat()).prohibited_without_terrain() == []
 
 
 def test_outside_horizontally_is_judged_without_the_ground() -> None:
     m = monitor(here(upper=(120, "AGL")))
     m.observe(message(A, 5_000, alt_amsl_m=550.0), now_s=0.0)
     assert m.zone_checks_not_evaluated == 0
+    assert m.zone_limits_not_judged == 0
+
+
+# --- a pressure altitude against ED-269 limits (S-33) -----------------------------------
+
+
+def pressure(alt_amsl_m: float, at_s: float = 0.0) -> dict[str, Any]:
+    return {**message(A, 0, alt_amsl_m=alt_amsl_m, at_s=at_s), "alt_source": "pressure"}
+
+
+@pytest.mark.parametrize(
+    ("height_agl_m", "alerts", "within_band"),
+    [(100.0, 1, True), (300.0, 1, False), (400.0, 0, None)],
+)
+def test_a_pressure_track_against_an_agl_zone_is_widened_by_the_margin(
+    height_agl_m: float, alerts: int, within_band: bool | None
+) -> None:
+    """0-120 m AGL over ground at 500 m, margin 250 m: 100 m AGL is inside
+    (critical), 300 m only inside the widened band (warning), 400 m out."""
+    m = monitor(here(lower=(0, "AGL"), upper=(120, "AGL")), terrain=Flat())
+    found = m.observe(pressure(GROUND_M + height_agl_m), now_s=0.0).raised
+    assert len(found) == alerts
+    if found:
+        assert found[0].detail["vertical_known"] is False
+        assert found[0].detail["within_band"] is within_band
+        assert found[0].severity is (
+            Severity.CRITICAL if within_band else Severity.WARNING
+        )
+
+
+def test_a_geodetic_track_300_m_above_the_agl_zone_raises_nothing() -> None:
+    m = monitor(here(lower=(0, "AGL"), upper=(120, "AGL")), terrain=Flat())
+    assert raised(m, GROUND_M + 300) == []
+
+
+def test_a_pressure_track_in_a_wgs84_zone_goes_through_the_geoid_and_the_margin() -> (
+    None
+):
+    m = monitor(here(upper=(600, "WGS84")), geoid=Geoid())
+    (alert,) = m.observe(pressure(700.0), now_s=0.0).raised
+    assert alert.severity is Severity.WARNING
+    assert alert.detail["within_band"] is False
+
+
+def test_a_pressure_track_and_an_unjudged_agl_ceiling_carry_both_flags() -> None:
+    m = monitor(here(lower=(0, "AGL"), upper=(120, "AGL")))
+    (alert,) = m.observe(pressure(550.0), now_s=0.0).raised
+    assert alert.severity is Severity.WARNING
+    assert alert.detail["limit_not_judged"] is True
+    assert alert.detail["vertical_known"] is False
 
 
 # --- applicability, at the placed time in UTC ----------------------------------------

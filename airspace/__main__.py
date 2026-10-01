@@ -20,6 +20,7 @@ from nats.aio.msg import Msg
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from airspace.config import AirspaceSettings
+from airspace.ed269 import Restriction
 from airspace.monitor import AirspaceMonitor, Severity
 from airspace.policy import (
     load_conditional_zone_severity,
@@ -51,9 +52,17 @@ def warn_unjudgeable_zones(
     judge; such a zone is never evaluated vertically (U-03)."""
     missing = unjudgeable(zones, terrain=terrain is not None, geoid=geoid is not None)
     if missing != before and missing:
-        _log.warning(
+        prohibited = {
+            zone.identifier
+            for zone in zones
+            if zone.restriction is Restriction.PROHIBITED
+        }
+        unjudged_prohibited = sorted(set(missing.get("TERRAIN_DIR", [])) & prohibited)
+        # A PROHIBITED zone whose AGL limit cannot be judged raises a warning
+        # where it should raise critical: an error, not a warning.
+        (_log.error if unjudged_prohibited else _log.warning)(
             "zones with limits that cannot be evaluated: configure what they need",
-            extra={"missing": missing},
+            extra={"missing": missing, "prohibited": unjudged_prohibited},
         )
     return missing
 
@@ -89,6 +98,7 @@ async def run(settings: AirspaceSettings) -> None:
         live_max_age_s=settings.live_max_age_s,
         neighbour_max_age_s=settings.neighbour_max_age_s,
         source_state_max=settings.source_state_max,
+        pressure_uncertainty_m=settings.pressure_uncertainty_m,
     )
     bus = await nats.connect(str(settings.nats_url))
     service = AirspaceService(

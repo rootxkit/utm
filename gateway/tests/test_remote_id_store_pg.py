@@ -16,7 +16,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from gateway.remote_id import RemoteIdTracker
+from gateway.remote_id import PRESSURE_ALTITUDE_MODEL, RemoteIdTracker
 from gateway.remote_id_store import RemoteIdRow, RemoteIdWriter, row_from_observation
 from gateway.tests.rid_frames import NOW, FlatGeoid, basic, frame, location, pack
 
@@ -70,6 +70,25 @@ async def test_a_row_is_stored_with_its_point_the_right_way_round(
     )
     assert bytes(back.payload) == row.payload
     assert back.op_lat is None
+
+
+async def test_a_pressure_altitude_row_satisfies_the_height_model_rule(
+    engine: AsyncEngine,
+) -> None:
+    """S-33: an AMSL height from pressure names that, not a geoid."""
+    tracker = RemoteIdTracker(geoid=FlatGeoid())
+    payload = pack(basic(), location(alt_hae_m=None, alt_baro_m=507.5))
+    found = tracker.take(frame(payload), now_s=0.0)
+    assert found is not None
+    row = replace(
+        row_from_observation(found, ts=NOW, payload=payload, geoid_model="EGM2008"),
+        aircraft_id=uuid4(),
+    )
+    await RemoteIdWriter(engine).write([row])
+
+    [back] = await stored(engine, row)
+    assert (back.alt_hae_m, back.alt_amsl_m) == (None, 507.5)
+    assert back.geoid_model == PRESSURE_ALTITUDE_MODEL
 
 
 async def test_no_position_is_null_not_zero(engine: AsyncEngine) -> None:

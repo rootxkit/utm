@@ -282,6 +282,11 @@ class AirspaceService:
             "without_capture_time": self.monitor.without_capture_time,
             "check_failures": self.monitor.check_failures,
             "zone_checks_not_evaluated": self.monitor.zone_checks_not_evaluated,
+            "zone_limits_not_judged": self.monitor.zone_limits_not_judged,
+            "prohibited_zones_without_terrain": len(
+                self.monitor.prohibited_without_terrain()
+            ),
+            "vertical_unknown": self.monitor.vertical_unknown,
             "tile_failures": self.tile_failures,
             "audit_pending": self.audit_pending,
             "audit_overflow": self.audit_overflow,
@@ -296,6 +301,17 @@ class AirspaceService:
         ):
             return
         self._status_logged_at_s = now_s
+        unjudged = self.monitor.prohibited_without_terrain()
+        if unjudged:
+            # U-03: a PROHIBITED zone whose AGL limits cannot be judged only
+            # warns, never raises critical; that is an error to fix, not a
+            # state to scroll past.
+            _log.error(
+                "airspace monitor status: PROHIBITED zones cannot be judged "
+                "without terrain (TERRAIN_DIR)",
+                extra={**self.status(), "zones": unjudged},
+            )
+            return
         _log.info("airspace monitor status", extra=self.status())
 
     async def on_tick(self) -> None:
