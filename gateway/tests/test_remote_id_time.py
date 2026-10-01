@@ -166,9 +166,31 @@ def test_a_clock_ahead_beyond_the_tolerance_is_not_believed() -> None:
 
     assert within.captured_at == RECEIVED + timedelta(seconds=0.8)
     assert within.time_source == TIME_SOURCE_BROADCAST
-    # An hour back is far older than any receiver holds a broadcast.
-    assert beyond.fallback == "too_old"
+    # Ahead, not an hour old: counted as such, and `ts` is what it claims.
+    assert beyond.fallback == "clock_ahead"
+    assert beyond.ts == RECEIVED + timedelta(seconds=3.0)
     assert beyond.captured_at == RECEIVED
+    assert beyond.time_source == TIME_SOURCE_RECEIVER
+
+
+@pytest.mark.parametrize(
+    ("ahead_s", "fallback"),
+    [
+        # Ahead of the Gateway: the module's clock fast, or ours slow.
+        (2.0, "clock_ahead"),
+        (29 * 60.0, "clock_ahead"),
+        # Behind it beyond the latency bound: old, not ahead.
+        (-10.0, "too_old"),
+        (-29 * 60.0, "too_old"),
+    ],
+)
+def test_ahead_and_too_old_are_told_apart(ahead_s: float, fallback: str) -> None:
+    seconds = (RECEIVED_IN_HOUR_S + ahead_s) % 3600.0
+
+    placed = place(decoded(seconds_after_hour=seconds), RECEIVED, tolerance_s=1.0)
+
+    assert placed.fallback == fallback
+    assert placed.captured_at == RECEIVED
 
 
 def test_an_unknown_timestamp_is_placed_on_arrival() -> None:

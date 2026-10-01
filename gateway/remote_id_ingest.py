@@ -65,6 +65,10 @@ FLUSH_INTERVAL_S = 0.5
 # How often the registered serials are re-read, so an aircraft registered
 # while the ingest runs is matched without a restart.
 SERIALS_REFRESH_S = 60.0
+# How often the running totals are logged, as the airspace monitor's are.
+STATUS_INTERVAL_S = 60.0
+# Why `captured_at` fell back to the receive time (gateway/remote_id.py).
+TIME_FALLBACK_REASONS = ("unknown", "invalid", "too_old", "clock_ahead")
 REQUIRED_FIELDS = ("receiver_id", "transmitter", "payload_hex")
 
 
@@ -190,6 +194,40 @@ class RemoteIdIngest:
             return
         self.published += 1
 
+    def status(self) -> dict[str, int]:
+        """The running totals, as the status line logs them."""
+        tracker = self.tracker
+        totals = {
+            "published": self.published,
+            "refused": self.refused,
+            "withheld": self.withheld,
+            "transmitters": tracker.transmitters,
+            "unidentified": tracker.unidentified,
+            "identity_changes": tracker.identity_changes,
+            "address_conflicts": tracker.address_conflicts,
+            "silences": tracker.silences,
+        }
+        for reason in TIME_FALLBACK_REASONS:
+            totals[f"time_fallback_{reason}"] = tracker.time_fallbacks[reason]
+        if self.store is not None:
+            totals["store_pending"] = self.store.pending
+            totals["store_written"] = self.store.written
+            totals["store_dropped"] = self.store.dropped
+        return totals
+
+
+async def log_status_periodically(
+    ingest: RemoteIdIngest,
+    stop: asyncio.Event,
+    *,
+    every_s: float = STATUS_INTERVAL_S,
+) -> None:
+    """Log `ingest.status()` every `every_s`, and once more on stopping."""
+    while not stop.is_set():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), every_s)
+        _log.info("remote id ingest status", extra=ingest.status())
+
 
 class _Protocol(asyncio.DatagramProtocol):
     def __init__(self, ingest: RemoteIdIngest) -> None:
@@ -236,6 +274,7 @@ def tracker_from_settings(
         time_tolerance_s=settings.remote_id_time_tolerance_s,
         max_latency_s=settings.remote_id_max_latency_s,
         min_vertical_accuracy=settings.remote_id_min_vertical_accuracy,
+        pressure_hold_s=settings.remote_id_pressure_hold_s,
         identity_ttl_s=settings.remote_id_identity_ttl_s,
         max_gap_s=settings.remote_id_max_gap_s,
         identify_within_s=settings.remote_id_identify_within_s,
@@ -313,6 +352,7 @@ async def run(settings: RemoteIdSettings) -> None:
             loop.add_signal_handler(sig, stop.set)
     flusher = asyncio.create_task(flush_periodically(store, stop))
     refresher = asyncio.create_task(refresh_serials_periodically(fleet, engine, stop))
+    reporter = asyncio.create_task(log_status_periodically(ingest, stop))
     try:
         await stop.wait()
     finally:
@@ -321,6 +361,7 @@ async def run(settings: RemoteIdSettings) -> None:
         # The flusher's last pass writes what was still pending.
         await flusher
         await refresher
+        await reporter
         if store.pending:
             _log.error(
                 "remote id observations not stored at shutdown",

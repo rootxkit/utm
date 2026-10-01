@@ -366,6 +366,7 @@ def test_the_tracker_takes_its_limits_from_the_environment(
     monkeypatch.setenv("REMOTE_ID_IDENTITY_TTL_S", "9")
     monkeypatch.setenv("REMOTE_ID_MAX_GAP_S", "2")
     monkeypatch.setenv("REMOTE_ID_IDENTIFY_WITHIN_S", "1.5")
+    monkeypatch.setenv("REMOTE_ID_PRESSURE_HOLD_S", "7")
 
     tracker = tracker_from_settings(RemoteIdSettings(_env_file=None), None)  # type: ignore[call-arg]
 
@@ -373,6 +374,7 @@ def test_the_tracker_takes_its_limits_from_the_environment(
     assert tracker.min_vertical_accuracy == 4
     assert (tracker.identity_ttl_s, tracker.max_gap_s) == (9.0, 2.0)
     assert tracker.identify_within_s == 1.5
+    assert tracker.pressure_hold_s == 7.0
 
 
 # --- one of ours broadcasting (serial match) --------------------------------------
@@ -492,3 +494,50 @@ async def test_refusals_from_one_source_are_logged_once_per_interval(
     ]
     assert [extra["suppressed"] for extra in refused] == [0, 499]
     assert refused[0]["source"] == "10.0.0.7"
+
+
+# --- the status line -------------------------------------------------------------
+
+
+async def test_the_status_carries_the_trackers_counters() -> None:
+    rows = Rows()
+    service = ingest(FakeBus(), PendingRows(writer=rows))
+    # One published; one late beyond the latency bound; one refused.
+    await service.on_datagram(datagram(pack(basic(), location())), "127.0.0.1")
+    await service.on_datagram(
+        datagram(pack(basic(), location(seconds_after_hour=3500.0))), "127.0.0.1"
+    )
+    await service.on_datagram(b"not json", "127.0.0.1")
+
+    status = service.status()
+
+    assert status["published"] == 2
+    assert status["refused"] == 1
+    assert status["transmitters"] == 1
+    assert status["time_fallback_too_old"] == 1
+    assert status["time_fallback_clock_ahead"] == 0
+    assert status["store_pending"] == 2
+    for name in ("unidentified", "identity_changes", "address_conflicts", "silences"):
+        assert status[name] == 0
+
+
+async def test_the_status_is_logged_periodically_and_on_stopping(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+    import logging
+
+    from gateway.remote_id_ingest import log_status_periodically
+
+    caplog.set_level(logging.INFO, logger="gateway.remote_id_ingest")
+    service = ingest(FakeBus())
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(log_status_periodically(service, stop, every_s=0.01))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await task
+
+    lines = [r for r in caplog.records if r.getMessage() == "remote id ingest status"]
+    assert len(lines) >= 2
+    assert lines[-1].published == 0  # type: ignore[attr-defined]

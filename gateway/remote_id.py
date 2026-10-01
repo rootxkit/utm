@@ -33,16 +33,29 @@ answer, so an identity is used only while all of these hold:
   of the standard's 1 s Location periods). After such a silence, a reboot
   or another aircraft, everything known about it is dropped (`silences`).
 
+Freshness is per transmitter, across receivers: a Location heard by a
+receiver that has no fresh identity for the address takes the one another
+receiver holds (its own receiver's first), so receiver A hearing the Basic
+ID while B hears only Locations is one identified track, not an identified
+and an unidentified one.
+
+A Basic ID that names a second fresh identity of one ID type for an
+address, from any receiver, is the anomaly "one transmitter, two
+identities" (`address_conflicts`, logged at warning, rate-limited per
+address): two radios on one address, or a spoofer on another's.
+
 A Location without a fresh identity is held for up to `identify_within_s`
 after the address lost or never had one, since a Basic ID normally follows
 within a static period; one arriving publishes it. After that, Locations
 are published as an **unidentified** track of the transmitter: its id is
 derived from the address, its label is the address, and `remote_id` says
 `identified: false`, with an empty UAS ID and ID type 0 (none). It is never
-attached to an earlier serial. One transmitter can therefore appear under
-two ids, unidentified and identified, while its identity comes and goes;
-the airspace monitor does not pair two Remote ID tracks of one transmitter
-address with each other (`airspace/monitor.py`).
+attached to an earlier serial. When the serial then arrives, the
+unidentified track is not merged into it: it is left to go stale. One
+transmitter can therefore appear under two ids, unidentified and
+identified, for up to the monitor's staleness horizon; the airspace monitor
+does not pair an unidentified Remote ID track with another track of the
+same transmitter address (`airspace/monitor.py`).
 
 ## Time (S-27)
 
@@ -60,8 +73,11 @@ ahead.
   than the tolerance, and not older than `max_latency_s`, the most a
   receiver and the network can plausibly hold a broadcast. Otherwise it is
   the receive time, and the fallback is counted in `time_fallbacks` by
-  reason. A timestamp the standard marks unknown (0xFFFF, `odid`), or one
-  past the hour, makes `ts` the receive time too.
+  reason: `too_old`, or `clock_ahead` for a time ahead of the Gateway's by
+  more than the tolerance (which the hour choice places nearly an hour
+  back; `ts` is then the time the broadcast claims). A timestamp the
+  standard marks unknown (0xFFFF, `odid`), or one past the hour, makes `ts`
+  the receive time too (`unknown`, `invalid`).
 
 `remote_id.time_source` says which: `broadcast` or `receiver`.
 
@@ -91,7 +107,10 @@ altitude is referenced to the standard 1013.25 hPa, not to the local QNH,
 so it is AMSL only on a standard day: off by about 8 m per hPa of
 difference. That is why `alt_source` says which was used, `geodetic` or
 `pressure` (None when there is no AMSL altitude), and the raw
-`alt_pressure_m` is carried beside it. The airspace monitor reads
+`alt_pressure_m` is carried beside it. Once on pressure, a transmitter
+stays on it for `pressure_hold_s` (10 s) after its last poor geodetic
+altitude, so an accuracy hovering at the threshold does not flip the source,
+and the monitor's alerts with it, every message. The airspace monitor reads
 `alt_source: pressure` as an unknown vertical position: horizontal-only
 conflicts, no height limit, no zone altitude limits (`airspace/monitor.py`). An unknown accuracy is not a flag:
 the geodetic altitude is kept. Without a geoid, a usable geodetic altitude
@@ -118,6 +137,7 @@ from uuid import UUID
 
 from common import get_logger
 from gateway import odid
+from gateway.rate_limit import RateLimiter
 
 _log = get_logger(__name__)
 
@@ -136,9 +156,16 @@ DEFAULT_TIME_TOLERANCE_S = 1.0
 DEFAULT_MAX_LATENCY_S = 5.0
 # The timestamp covers one hour, in tenths of a second.
 _SECONDS_PER_HOUR = 3600.0
+# A broadcast time ahead of the Gateway's by more than the tolerance comes
+# back from `broadcast_time` nearly an hour old. Older than half an hour is
+# read as that: the module's clock ahead of ours, or ours behind (S-27).
+_CLOCK_AHEAD_WRAP_S = _SECONDS_PER_HOUR / 2
 # Timestamp accuracy is in steps of 0.1 s, and 0 is unknown
 # (MAV_ODID_TIME_ACC; pinned against pymavlink in the tests).
 _TS_ACCURACY_STEP_S = 0.1
+
+# S-33: see "Pressure altitude" above.
+DEFAULT_PRESSURE_HOLD_S = 10.0
 
 # S-32: see "An identity is used only while it is fresh" above.
 DEFAULT_IDENTITY_TTL_S = 15.0
@@ -231,8 +258,15 @@ def amsl(
     geoid: Geoid | None,
     *,
     min_vertical_accuracy: int = DEFAULT_MIN_VERTICAL_ACCURACY,
+    hold_pressure: bool = False,
 ) -> tuple[float | None, str | None]:
-    """The AMSL altitude and which broadcast altitude it came from (S-33)."""
+    """The AMSL altitude and which broadcast altitude it came from (S-33).
+
+    `hold_pressure`: stay on pressure altitude, while there is one, even
+    though the geodetic altitude is usable again (the tracker's hold).
+    """
+    if hold_pressure and location.alt_baro_m is not None:
+        return location.alt_baro_m, ALT_SOURCE_PRESSURE
     hae_m = location.alt_hae_m
     if hae_m is not None and geodetic_usable(
         location, min_vertical_accuracy=min_vertical_accuracy
@@ -275,10 +309,13 @@ def place(
     ahead_s = tolerance_s + accuracy_s
     moment = broadcast_time(seconds, received_at, ahead_s=ahead_s)
     age_s = (received_at - moment).total_seconds()
-    if age_s < -ahead_s:
-        # broadcast_time never returns this; checked so that a change there
-        # cannot quietly place an aircraft in the future.
-        return Placement(moment, received_at, TIME_SOURCE_RECEIVER, "future")
+    if age_s > _CLOCK_AHEAD_WRAP_S:
+        # More than half an hour old is a time ahead of ours by more than
+        # the tolerance, which broadcast_time put in the previous hour. `ts`
+        # is the time the broadcast claims; the aircraft is placed on
+        # arrival.
+        claimed = moment + timedelta(hours=1)
+        return Placement(claimed, received_at, TIME_SOURCE_RECEIVER, "clock_ahead")
     if age_s > max_latency_s + accuracy_s:
         return Placement(moment, received_at, TIME_SOURCE_RECEIVER, "too_old")
     return Placement(moment, moment, TIME_SOURCE_BROADCAST, None)
@@ -304,6 +341,8 @@ class _Transmitter:
     location_published: bool = False
     system: odid.System | None = None
     operator: odid.OperatorId | None = None
+    # S-33: pressure altitude is used until then, on the tracker's clock.
+    pressure_until_s: float | None = None
 
 
 def _preferred(identities: list[_Identity]) -> odid.BasicId | None:
@@ -333,8 +372,9 @@ class RemoteIdTracker:
     max_latency_s: float = DEFAULT_MAX_LATENCY_S
     # S-33: see "Pressure altitude" above.
     min_vertical_accuracy: int = DEFAULT_MIN_VERTICAL_ACCURACY
+    pressure_hold_s: float = DEFAULT_PRESSURE_HOLD_S
     # Observations whose `captured_at` fell back to the receive time, by
-    # reason: unknown, invalid, future, too_old.
+    # reason: unknown, invalid, clock_ahead, too_old.
     time_fallbacks: Counter[str] = field(default_factory=Counter, init=False)
     # A different Basic ID from an address with an identity (S-32).
     identity_changes: int = field(default=0, init=False)
@@ -342,10 +382,24 @@ class RemoteIdTracker:
     silences: int = field(default=0, init=False)
     # Observations published without a fresh identity.
     unidentified: int = field(default=0, init=False)
+    # Basic IDs naming a second fresh identity of one ID type for an address
+    # (S-32): the "one transmitter, two identities" anomaly.
+    address_conflicts: int = field(default=0, init=False)
 
     _by_transmitter: dict[tuple[str, str], _Transmitter] = field(
         default_factory=dict, init=False
     )
+    # Which receivers hold state for each transmitter address.
+    _receivers: dict[str, set[str]] = field(default_factory=dict, init=False)
+    # Identity changes and two-identity anomalies are logged at most once
+    # per address per interval, with a count of those in between: a spoofer
+    # alternating two serials on one address changes it every message.
+    reports: RateLimiter = field(default_factory=RateLimiter)
+
+    @property
+    def transmitters(self) -> int:
+        """Transmitter addresses heard within `max_gap_s`."""
+        return len(self._receivers)
 
     def take(self, frame: Frame, *, now_s: float) -> dict[str, Any] | None:
         """Decode one frame; return an observation when it completes one.
@@ -360,6 +414,7 @@ class RemoteIdTracker:
         if state is None:
             state = _Transmitter(started_s=now_s, last_heard_s=now_s)
             self._by_transmitter[key] = state
+            self._receivers.setdefault(frame.transmitter, set()).add(frame.receiver_id)
         state.last_heard_s = now_s
         # Identity first: a Basic ID that changes it drops what the address
         # said before, and must not drop a Location in the same pack.
@@ -380,38 +435,92 @@ class RemoteIdTracker:
         # Basic ID it was held for does.
         if location is None or location_frame is None or state.location_published:
             return None
-        basic = _preferred(
-            [
-                identity
-                for identity in state.identities.values()
-                if now_s - identity.heard_s <= self.identity_ttl_s
-            ]
-        )
+        basic = self._identity(frame.transmitter, state, now_s)
         if basic is None:
             if now_s - self._unidentified_since(state) < self.identify_within_s:
                 return None
             self.unidentified += 1
         state.location_published = True
-        return self._observation(basic, location, state, location_frame)
+        if not geodetic_usable(
+            location, min_vertical_accuracy=self.min_vertical_accuracy
+        ):
+            state.pressure_until_s = now_s + self.pressure_hold_s
+        hold_pressure = (
+            state.pressure_until_s is not None and now_s < state.pressure_until_s
+        )
+        return self._observation(
+            basic, location, state, location_frame, hold_pressure=hold_pressure
+        )
+
+    def _identity(
+        self, transmitter: str, state: _Transmitter, now_s: float
+    ) -> odid.BasicId | None:
+        """The fresh identity for a Location from `state`'s receiver.
+
+        Its own receiver's first; else one another receiver holds for the
+        same transmitter (receiver A may hear the Basic ID while B hears
+        only Locations). Freshness is the same rule either way.
+        """
+        own = _preferred(self._fresh(state, now_s))
+        if own is not None:
+            return own
+        return _preferred(
+            [
+                identity
+                for other in self._states_of(transmitter)
+                if other is not state
+                for identity in self._fresh(other, now_s)
+            ]
+        )
+
+    def _fresh(self, state: _Transmitter, now_s: float) -> list[_Identity]:
+        return [
+            identity
+            for identity in state.identities.values()
+            if now_s - identity.heard_s <= self.identity_ttl_s
+        ]
+
+    def _states_of(self, transmitter: str) -> list[_Transmitter]:
+        return [
+            self._by_transmitter[(receiver_id, transmitter)]
+            for receiver_id in self._receivers.get(transmitter, ())
+        ]
 
     def _learn(
         self, state: _Transmitter, basic: odid.BasicId, frame: Frame, now_s: float
     ) -> None:
+        # One transmitter with two fresh identities of one ID type, from this
+        # receiver or another: two radios on one address, or a spoofer on
+        # another's. Not a reboot, which falls silent first (S-32).
+        clashing = [
+            identity
+            for holder in self._states_of(frame.transmitter)
+            for identity in self._fresh(holder, now_s)
+            if identity.basic.id_type == basic.id_type
+            and identity.basic.ua_id != basic.ua_id
+        ]
+        if clashing:
+            self.address_conflicts += 1
+            self._report(
+                "remote id anomaly: one transmitter, two identities",
+                frame,
+                previous_ua_id=clashing[0].basic.ua_id,
+                ua_id=basic.ua_id,
+                id_type=basic.id_type,
+                address_conflicts=self.address_conflicts,
+            )
         known = state.identities.get(basic.id_type)
         if known is not None and known.basic.ua_id != basic.ua_id:
             # Another aircraft on this address: nothing it said before is
             # this one's, a held Location included.
             self.identity_changes += 1
-            _log.warning(
+            self._report(
                 "remote id identity changed on one transmitter address",
-                extra={
-                    "station_id": frame.receiver_id,
-                    "transmitter": frame.transmitter,
-                    "id_type": basic.id_type,
-                    "previous_ua_id": known.basic.ua_id,
-                    "ua_id": basic.ua_id,
-                    "identity_changes": self.identity_changes,
-                },
+                frame,
+                previous_ua_id=known.basic.ua_id,
+                ua_id=basic.ua_id,
+                id_type=basic.id_type,
+                identity_changes=self.identity_changes,
             )
             state.identities.clear()
             state.location = None
@@ -420,6 +529,20 @@ class RemoteIdTracker:
             state.operator = None
             state.started_s = now_s
         state.identities[basic.id_type] = _Identity(basic=basic, heard_s=now_s)
+
+    def _report(self, message: str, frame: Frame, **context: Any) -> None:
+        suppressed = self.reports.admit((message, frame.transmitter))
+        if suppressed is None:
+            return
+        _log.warning(
+            message,
+            extra={
+                "station_id": frame.receiver_id,
+                "transmitter": frame.transmitter,
+                "suppressed": suppressed,
+                **context,
+            },
+        )
 
     def _unidentified_since(self, state: _Transmitter) -> float:
         """Since when the address has had no fresh identity."""
@@ -435,6 +558,11 @@ class RemoteIdTracker:
             if now_s - state.last_heard_s > self.max_gap_s:
                 del self._by_transmitter[key]
                 self.silences += 1
+                receiver_id, transmitter = key
+                receivers = self._receivers[transmitter]
+                receivers.discard(receiver_id)
+                if not receivers:
+                    del self._receivers[transmitter]
 
     def _observation(
         self,
@@ -442,10 +570,15 @@ class RemoteIdTracker:
         location: odid.Location,
         state: _Transmitter,
         frame: Frame,
+        *,
+        hold_pressure: bool = False,
     ) -> dict[str, Any]:
         vn, ve, vd = _velocity_ned(location)
         alt_amsl, alt_source = amsl(
-            location, self.geoid, min_vertical_accuracy=self.min_vertical_accuracy
+            location,
+            self.geoid,
+            min_vertical_accuracy=self.min_vertical_accuracy,
+            hold_pressure=hold_pressure,
         )
         over_takeoff = location.height_reference == odid.HeightReference.OVER_TAKEOFF
         system = state.system

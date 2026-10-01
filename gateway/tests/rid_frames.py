@@ -68,9 +68,10 @@ def frame(
     transmitter: str = "AA:BB:CC:00:00:01",
     *,
     received_at: datetime = NOW,
+    receiver_id: str = "rx-1",
 ) -> Frame:
     return Frame(
-        receiver_id="rx-1",
+        receiver_id=receiver_id,
         transmitter=transmitter,
         received_at=received_at,
         payload=payload,

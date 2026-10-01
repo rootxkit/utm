@@ -144,3 +144,66 @@ def test_the_monitor_evaluates_an_aircraft_on_pressure_altitude() -> None:
     track = track_from_telemetry(with_pressure, arrived_at_s=arrived_s)
     assert track is not None
     assert track.alt_amsl_m == pytest.approx(PRESSURE_M)
+
+
+# --- hysteresis -----------------------------------------------------------------
+
+
+def sources(tracker: RemoteIdTracker, accuracies: list[tuple[float, int]]) -> list[Any]:
+    out = []
+    for now_s, accuracy in accuracies:
+        seen = tracker.take(
+            frame(
+                pack(
+                    basic(),
+                    location(
+                        alt_hae_m=HAE_M, alt_baro_m=PRESSURE_M, vert_accuracy=accuracy
+                    ),
+                )
+            ),
+            now_s=now_s,
+        )
+        assert seen is not None
+        out.append(seen["alt_source"])
+    return out
+
+
+# An accuracy hovering at the threshold: under 150 m, under 45 m, in turn.
+FLAPPING = [(float(t), 1 if t % 2 == 0 else 2) for t in range(6)]
+
+
+def test_an_accuracy_at_the_threshold_does_not_flip_the_source() -> None:
+    held = sources(RemoteIdTracker(geoid=FlatGeoid(), pressure_hold_s=10.0), FLAPPING)
+
+    assert held == [ALT_SOURCE_PRESSURE] * 6
+
+
+def test_without_the_hold_it_flips_every_message() -> None:
+    """The presence half: the same frames, no hold."""
+    flips = sources(RemoteIdTracker(geoid=FlatGeoid(), pressure_hold_s=0.0), FLAPPING)
+
+    assert flips == [ALT_SOURCE_PRESSURE, ALT_SOURCE_GEODETIC] * 3
+
+
+def test_the_hold_ends_after_the_last_poor_geodetic_altitude() -> None:
+    tracker = RemoteIdTracker(geoid=FlatGeoid(), pressure_hold_s=10.0)
+
+    # Good from 1 s on, heard every second (a silence would reset it all).
+    good = [(float(t), 4) for t in range(1, 10)] + [(9.9, 4), (10.1, 4)]
+    seen = sources(tracker, [(0.0, 1), *good])
+
+    assert seen == [ALT_SOURCE_PRESSURE] * 11 + [ALT_SOURCE_GEODETIC]
+
+
+def test_the_hold_needs_a_pressure_altitude_to_hold() -> None:
+    tracker = RemoteIdTracker(geoid=FlatGeoid(), pressure_hold_s=10.0)
+    tracker.take(
+        frame(pack(basic(), location(alt_baro_m=PRESSURE_M, vert_accuracy=1))),
+        now_s=0.0,
+    )
+
+    seen = tracker.take(
+        frame(pack(basic(), location(alt_baro_m=None, vert_accuracy=4))), now_s=1.0
+    )
+
+    assert seen is not None and seen["alt_source"] == ALT_SOURCE_GEODETIC

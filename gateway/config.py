@@ -20,6 +20,7 @@ from gateway.remote_id import (
     DEFAULT_MAX_GAP_S,
     DEFAULT_MAX_LATENCY_S,
     DEFAULT_MIN_VERTICAL_ACCURACY,
+    DEFAULT_PRESSURE_HOLD_S,
     DEFAULT_TIME_TOLERANCE_S,
 )
 
@@ -141,6 +142,13 @@ class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings)
         ge=1,
         le=6,
         validation_alias="REMOTE_ID_MIN_VERTICAL_ACCURACY",
+    )
+    # S-33. Once on pressure altitude, how long a transmitter stays on it
+    # after its last poor geodetic altitude, so the source does not flip.
+    remote_id_pressure_hold_s: float = Field(
+        default=DEFAULT_PRESSURE_HOLD_S,
+        ge=0,
+        validation_alias="REMOTE_ID_PRESSURE_HOLD_S",
     )
     # S-32 (gateway/remote_id.py, "An identity is used only while it is
     # fresh"). How long a Basic ID names its transmitter's Locations; how

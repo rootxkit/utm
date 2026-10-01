@@ -6,6 +6,7 @@ reference library's bytes.
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from typing import Any
 
@@ -216,3 +217,95 @@ def test_one_unidentified_transmitter_heard_by_two_receivers_is_one_id() -> None
 
     assert a is not None and b is not None
     assert a["drone_id"] == b["drone_id"]
+
+
+# --- several receivers ---------------------------------------------------------
+
+
+def test_a_receiver_hearing_only_locations_takes_anothers_identity() -> None:
+    """A hears the Basic ID, B only Locations: one identified track."""
+    t = tracker(identify_within_s=4.0)
+    seen_by_b = []
+    for now_s in range(10):
+        t.take(frame(pack(basic(OLD), location()), receiver_id="rx-a"), now_s=now_s)
+        seen_by_b.append(
+            t.take(frame(location(), receiver_id="rx-b"), now_s=now_s + 0.5)
+        )
+
+    assert all(serial_of(seen) == OLD for seen in seen_by_b)
+    assert t.unidentified == 0
+
+
+def test_without_the_other_receiver_it_is_unidentified() -> None:
+    """The presence half: B alone, the same frames."""
+    t = tracker(identify_within_s=4.0)
+    seen_by_b = [
+        t.take(frame(location(), receiver_id="rx-b"), now_s=now_s + 0.5)
+        for now_s in range(10)
+    ]
+
+    assert seen_by_b[-1] is not None
+    assert seen_by_b[-1]["remote_id"]["identified"] is False
+    assert t.unidentified == 6
+
+
+def test_another_receivers_identity_must_be_fresh_too() -> None:
+    t = tracker(identity_ttl_s=15.0, identify_within_s=4.0)
+    t.take(frame(pack(basic(OLD), location()), receiver_id="rx-a"), now_s=0.0)
+
+    # A keeps hearing Locations, never the Basic ID again; B the same.
+    last = None
+    for now_s in range(1, 21):
+        t.take(frame(location(), receiver_id="rx-a"), now_s=float(now_s))
+        last = t.take(frame(location(), receiver_id="rx-b"), now_s=now_s + 0.5)
+
+    assert last is not None
+    assert last["remote_id"]["identified"] is False
+
+
+# --- one transmitter, two identities ------------------------------------------
+
+
+def anomalies(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [
+        r for r in caplog.records if "one transmitter, two identities" in r.getMessage()
+    ]
+
+
+def test_two_serials_alternating_on_one_address_are_an_anomaly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="gateway.remote_id")
+    t = tracker()
+
+    for now_s in range(6):
+        serial = OLD if now_s % 2 == 0 else NEW
+        t.take(frame(pack(basic(serial), location())), now_s=float(now_s))
+
+    assert t.address_conflicts == 5
+    # Logged once, the rest counted: a spoofer must not fill the log.
+    assert len(anomalies(caplog)) == 1
+    assert anomalies(caplog)[0].previous_ua_id == OLD
+
+
+def test_two_receivers_hearing_two_serials_on_one_address_are_an_anomaly() -> None:
+    t = tracker()
+    t.take(frame(pack(basic(OLD), location()), receiver_id="rx-a"), now_s=0.0)
+
+    t.take(frame(pack(basic(NEW), location()), receiver_id="rx-b"), now_s=1.0)
+
+    assert t.address_conflicts == 1
+
+
+def test_a_serial_after_a_silence_is_not_an_anomaly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The absence half: a restart falls silent first."""
+    caplog.set_level(logging.WARNING, logger="gateway.remote_id")
+    t = tracker(max_gap_s=3.0)
+    t.take(frame(pack(basic(OLD), location())), now_s=0.0)
+
+    t.take(frame(pack(basic(NEW), location())), now_s=5.0)
+
+    assert t.address_conflicts == 0
+    assert anomalies(caplog) == []
