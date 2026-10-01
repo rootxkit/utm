@@ -100,6 +100,7 @@ async def test_the_loop_rereads_until_stopped(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_registration_numbers_compare_trimmed_and_upper_case() -> None:
-    assert operator_key(" geo-ab1 ") == "GEO-AB1"
+    assert operator_key(" geo-op-sitl ") == "GEO-OP-SITL"
+    assert operator_key(" geoab1-x9z ") == "GEOAB1"
     assert ONE.find_operator("geox1") is ONE.operators[0]
     assert ONE.find_operator("GEOx2") is None
