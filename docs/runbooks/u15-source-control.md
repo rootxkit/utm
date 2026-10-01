@@ -26,7 +26,20 @@ admin --PUT /sources/...--> API --one transaction--> source_controls + events
 - **The read path is a JetStream key-value bucket**, one key holding the
   whole state with a version from a database sequence
   (`source_control_version_seq`), so it only ever rises whatever any clock
-  does. Followers apply only a version strictly above the one they hold.
+  does, and an epoch: a random id made with the table
+  (`source_control_epoch`). Within an epoch, followers apply only a version
+  strictly above the one they hold; a state under a different epoch is
+  taken whatever its version. A database restored from a backup keeps its
+  epoch but has a lower sequence: the API notices the bucket ahead of the
+  sequence and starts a new epoch. A downgrade drops the sequence and the
+  epoch with the table, and the upgrade after it makes a new epoch.
+- **Every writer takes a Postgres advisory lock** (`pg_advisory_xact_lock`,
+  one constant key) from its first statement to its commit, switches and
+  republishes alike, so two API replicas serialise and one never writes
+  back a state the other has just replaced.
+- **A corrupt bucket value** is read by the API as nothing, logged at error
+  level, and overwritten at the next republish; followers keep what they
+  hold, count it (`ignored_malformed`), and report the read as failed.
   The Gateway must never reach the relational database (CLAUDE.md), and
   every follower already holds a NATS connection; the bucket is durable on
   the broker's disk, so a follower started later, or after a broker restart,
@@ -39,7 +52,9 @@ admin --PUT /sources/...--> API --one transaction--> source_controls + events
   If the bucket cannot take it, the transaction is rolled back and the API
   answers 503 `control_channel_unavailable`: nothing changed, and the
   database and the adapters still agree. There is no state in which a
-  switch is recorded but not on its way.
+  switch is recorded but not on its way. If the commit fails after the
+  bucket was written, the API puts the bucket back to the database's state
+  before the call returns.
 - **Repair.** The API republishes from the database at start and every
   `SOURCE_CONTROL_REPUBLISH_S` (30 s), writing a new version only when the
   bucket differs (a lost bucket, a changed default). Each pass reconnects
