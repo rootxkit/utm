@@ -14,7 +14,6 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-import nats
 import redis.asyncio
 import uvicorn
 from fastapi import FastAPI
@@ -31,6 +30,7 @@ from api.sources import (
     NatsControlChannel,
     SourceControlService,
     SourceControlStore,
+    nats_channel_factory,
     republish_periodically,
 )
 from api.uas_registry import UasRegistry
@@ -80,6 +80,12 @@ def build_app(settings: ApiSettings) -> FastAPI:
         store=SourceControlStore(engine=engine),
         channel=None,
         default_deny=settings.sources_default_deny,
+        connect=nats_channel_factory(
+            str(settings.nats_url),
+            bucket=settings.source_control_bucket,
+            subject=settings.source_control_subject,
+            connect_timeout_s=NATS_CONNECT_TIMEOUT_S,
+        ),
     )
     app = create_api_app(
         registry,
@@ -103,23 +109,8 @@ def build_app(settings: ApiSettings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        bus = None
-        try:
-            bus = await asyncio.wait_for(
-                nats.connect(str(settings.nats_url)), timeout=NATS_CONNECT_TIMEOUT_S
-            )
-            channel = NatsControlChannel(
-                client=bus,
-                bucket=settings.source_control_bucket,
-                subject=settings.source_control_subject,
-            )
-            await channel.ensure_bucket()
-            sources.channel = channel
-        except Exception as error:
-            _log.error(
-                "could not reach NATS; source switches are refused until a restart",
-                extra={"nats_url": str(settings.nats_url), "error": repr(error)},
-            )
+        # The first connection is made by the republish loop's first pass,
+        # and remade by any later pass that finds it missing or closed.
         stop = asyncio.Event()
         republisher = asyncio.create_task(
             republish_periodically(
@@ -131,8 +122,9 @@ def build_app(settings: ApiSettings) -> FastAPI:
         finally:
             stop.set()
             await republisher
-            if bus is not None:
-                await bus.drain()
+            channel = sources.channel
+            if isinstance(channel, NatsControlChannel) and not channel.closed:
+                await channel.client.drain()
             await redis_client.aclose()
             await asyncio.gather(engine.dispose(), telemetry_engine.dispose())
 

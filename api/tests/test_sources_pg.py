@@ -8,7 +8,9 @@ bus is a recording fake here; `test_sources_nats.py` drives the real one.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -28,14 +30,28 @@ pytestmark = pytest.mark.postgres
 
 
 class RecordingChannel:
+    """The bucket and the subject, in memory. `published` is every state
+    written to the bucket; `fail` makes the bucket refuse writes, as
+    JetStream does when it is off or full."""
+
     def __init__(self) -> None:
         self.published: list[SourceControlState] = []
+        self.announced: list[SourceControlState] = []
         self.fail = False
+        self.closed = False
 
-    async def publish(self, state: SourceControlState) -> None:
+    async def load(self) -> SourceControlState | None:
         if self.fail:
-            raise ConnectionError("no bus")
+            raise ConnectionError("no JetStream")
+        return self.published[-1] if self.published else None
+
+    async def store(self, state: SourceControlState) -> None:
+        if self.fail:
+            raise ConnectionError("no JetStream")
         self.published.append(state)
+
+    async def announce(self, state: SourceControlState) -> None:
+        self.announced.append(state)
 
 
 def build(service: SourceControlService | None) -> Any:
@@ -231,27 +247,158 @@ async def test_without_the_bus_nothing_is_changed(
     assert await events_for(relational_engine, f"relay/{name}") == []
 
 
-async def test_a_failed_publish_is_recorded_reported_and_repaired(
+async def rows_for(engine: AsyncEngine, instance_id: str) -> list[Any]:
+    async with engine.connect() as connection:
+        return list(
+            await connection.execute(
+                sa.text("SELECT * FROM source_controls WHERE instance_id = :i"),
+                {"i": instance_id},
+            )
+        )
+
+
+async def test_a_bucket_that_refuses_the_write_leaves_nothing_changed(
     client: AsyncClient,
     relational_engine: AsyncEngine,
     channel: RecordingChannel,
     service: SourceControlService,
 ) -> None:
+    """JetStream off or full: the switch is refused, and neither the row nor
+    the audit event is written, so the database and the adapters agree."""
     name = station()
     channel.fail = True
     response = await client.put(
         f"/sources/relay/instances/{name}",
-        json={"enabled": False, "reason": "bus down"},
+        json={"enabled": False, "reason": "JetStream down"},
     )
 
     assert response.status_code == 503
-    assert response.json()["detail"]["code"] == "not_propagated"
-    assert len(await events_for(relational_engine, f"relay/{name}")) == 1
+    assert response.json()["detail"]["code"] == "control_channel_unavailable"
+    assert await events_for(relational_engine, f"relay/{name}") == []
+    assert await rows_for(relational_engine, name) == []
     assert service.publish_failures == 1
 
+    # The paired presence: the same switch once the bucket takes writes.
     channel.fail = False
-    assert await service.publish_current()
+    again = await client.put(
+        f"/sources/relay/instances/{name}",
+        json={"enabled": False, "reason": "JetStream back"},
+    )
+    assert again.status_code == 200
     assert not channel.published[-1].enabled(RELAY, name)
+    assert channel.announced[-1] == channel.published[-1]
+
+
+async def test_versions_rise_when_the_clock_steps_back(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    """The version is a database sequence, not the newest change time: a
+    clock that steps back an hour still gives the next state a higher one."""
+    times = iter(
+        [
+            datetime(2026, 10, 1, 12, 0, tzinfo=UTC),
+            datetime(2026, 10, 1, 11, 0, tzinfo=UTC),
+            datetime(2026, 10, 1, 11, 0, tzinfo=UTC),
+        ]
+    )
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine, clock=lambda: next(times)),
+        channel=channel,
+    )
+    name = station()
+    for enabled in (False, True, False):
+        await service.switch(
+            RELAY,
+            name,
+            enabled=enabled,
+            reason="clock",
+            actor=ADMIN.actor,
+            actor_name="a",
+        )
+    versions = [state.version for state in channel.published[-3:]]
+    assert versions[0] < versions[1] < versions[2]
+    assert not channel.published[-1].enabled(RELAY, name)
+
+
+async def test_a_republish_of_the_same_switches_keeps_the_version(
+    service: SourceControlService, channel: RecordingChannel
+) -> None:
+    assert await service.publish_current()
+    held = channel.published[-1]
+    assert await service.publish_current()
+
+    assert channel.published[-1] is held
+    assert channel.announced[-1] == held
+
+
+async def test_a_changed_default_gets_a_new_version(
+    relational_engine: AsyncEngine, channel: RecordingChannel
+) -> None:
+    store = SourceControlStore(engine=relational_engine)
+    allow = SourceControlService(store=store, channel=channel)
+    assert await allow.publish_current()
+    before = channel.published[-1]
+    deny = SourceControlService(store=store, channel=channel, default_deny=True)
+    assert await deny.publish_current()
+
+    assert channel.published[-1].version > before.version
+    assert channel.published[-1].default_deny
+
+
+class ClosingChannel(RecordingChannel):
+    """A channel whose client gave up, as nats-py's does after its
+    reconnect attempts run out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = True
+
+
+async def test_a_channel_that_gave_up_is_replaced_and_the_republish_succeeds(
+    relational_engine: AsyncEngine,
+) -> None:
+    """A broker away for longer than the client's reconnect limit leaves a
+    closed client. The next republish makes a new channel and succeeds."""
+    fresh = RecordingChannel()
+    made: list[RecordingChannel] = []
+
+    async def connect() -> RecordingChannel:
+        made.append(fresh)
+        return fresh
+
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine),
+        channel=ClosingChannel(),
+        connect=connect,
+    )
+    assert await service.publish_current()
+    assert made == [fresh]
+    assert fresh.published
+
+
+async def test_with_no_channel_the_republish_fails_loudly_and_retries(
+    relational_engine: AsyncEngine, caplog: pytest.LogCaptureFixture
+) -> None:
+    attempts = 0
+
+    async def connect() -> RecordingChannel:
+        nonlocal attempts
+        attempts += 1
+        raise ConnectionError("broker away")
+
+    service = SourceControlService(
+        store=SourceControlStore(engine=relational_engine),
+        channel=None,
+        connect=connect,
+    )
+    with caplog.at_level(logging.ERROR, logger="api.sources"):
+        assert not await service.publish_current()
+        assert not await service.publish_current()
+
+    assert attempts == 2
+    assert service.publish_failures == 2
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "source switches not published: no control channel (NATS)" in messages
 
 
 async def test_the_published_state_carries_default_deny(

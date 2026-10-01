@@ -5,10 +5,9 @@ are `detail: {code, message}`, as the registry's are (`api.http_errors`):
 
 - 422 `unknown_source_type`, `invalid_instance_id`, `reason_required`,
   `reason_too_long`;
-- 503 `control_channel_unavailable`: the bus is not connected, nothing was
-  changed;
-- 503 `not_propagated`: the switch is recorded and audited, and has not
-  reached the adapters yet; the API retries on its own;
+- 503 `control_channel_unavailable`: NATS is not connected, or JetStream
+  cannot take the new state (not enabled, store full). Nothing was changed:
+  the database and what the adapters follow still agree;
 - 503 `sources_unavailable`: this API was built without the store.
 
 A switch to the state a source is already in answers 200 with the row and
@@ -29,7 +28,6 @@ from api.sources import (
     MAX_REASON,
     ChannelUnavailableError,
     InvalidSourceError,
-    NotPropagatedError,
     SourceControlService,
     SourceError,
 )
@@ -63,7 +61,7 @@ def _http(error: SourceError) -> HTTPException:
     detail = {"code": error.code, "message": str(error)}
     if isinstance(error, InvalidSourceError):
         return HTTPException(status_code=422, detail=detail)
-    if isinstance(error, ChannelUnavailableError | NotPropagatedError):
+    if isinstance(error, ChannelUnavailableError):
         return HTTPException(status_code=503, detail=detail)
     return HTTPException(status_code=400, detail=detail)
 

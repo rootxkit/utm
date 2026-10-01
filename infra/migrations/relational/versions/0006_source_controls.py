@@ -19,6 +19,11 @@ same transaction by the API, which is the only writer.
 - `reason` is required: a switch nobody can explain later is the one that
   is undone by the next person to notice it.
 
+`source_control_version_seq` numbers each published state. The followers
+apply only a state numbered above the one they hold, so the number must
+only go up: a sequence does, whatever the clocks of the API or the database
+do, where the newest `changed_at` could tie or step back.
+
 The Gateway never reads this table (CLAUDE.md). It reads the state the API
 publishes on NATS (`common/sources.py`).
 """
@@ -37,6 +42,7 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    op.execute("CREATE SEQUENCE source_control_version_seq AS bigint START 1")
     op.create_table(
         "source_controls",
         sa.Column("source_type", sa.Text(), nullable=False),
@@ -70,3 +76,4 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("source_controls")
+    op.execute("DROP SEQUENCE source_control_version_seq")
