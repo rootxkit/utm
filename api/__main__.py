@@ -2,6 +2,10 @@
 
 Loopback by default (`API_HOST`). Every route needs a signed-in operator
 (P6-08); create the first admin with `python tools/operators.py create-admin`.
+
+U-15: the API is the writer of the source switches, so it holds a NATS
+connection for publishing them (`api/sources.py`). Without the bus it still
+serves, and a switch answers 503 without changing anything.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import nats
 import redis.asyncio
 import uvicorn
 from fastapi import FastAPI
@@ -22,10 +27,22 @@ from api.live import RedisLiveState
 from api.ratelimit import LoginRateLimiter
 from api.registry import FleetRegistry
 from api.replay import ReplayStore
+from api.sources import (
+    NatsControlChannel,
+    SourceControlService,
+    SourceControlStore,
+    republish_periodically,
+)
 from api.uas_registry import UasRegistry
-from common import configure_logging, load_settings
+from common import configure_logging, get_logger, load_settings
 from common.terrain import Terrain
 from gateway.binding import BindingResolver
+
+_log = get_logger(__name__)
+
+# How long startup may wait for the bus before serving without it; see
+# api/telemetry_ws.py CONNECT_TIMEOUT_S for why this is bounded.
+NATS_CONNECT_TIMEOUT_S = 5.0
 
 
 def build_app(settings: ApiSettings) -> FastAPI:
@@ -59,8 +76,14 @@ def build_app(settings: ApiSettings) -> FastAPI:
         projection=registry.projection,
         registration_pattern=settings.registration_pattern,
     )
+    sources = SourceControlService(
+        store=SourceControlStore(engine=engine),
+        channel=None,
+        default_deny=settings.sources_default_deny,
+    )
     app = create_api_app(
         registry,
+        sources=sources,
         uas=uas,
         auth=operators,
         feed_secret=settings.feed_ticket_secret.get_secret_value().encode("utf-8"),
@@ -80,9 +103,36 @@ def build_app(settings: ApiSettings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        bus = None
+        try:
+            bus = await asyncio.wait_for(
+                nats.connect(str(settings.nats_url)), timeout=NATS_CONNECT_TIMEOUT_S
+            )
+            channel = NatsControlChannel(
+                client=bus,
+                bucket=settings.source_control_bucket,
+                subject=settings.source_control_subject,
+            )
+            await channel.ensure_bucket()
+            sources.channel = channel
+        except Exception as error:
+            _log.error(
+                "could not reach NATS; source switches are refused until a restart",
+                extra={"nats_url": str(settings.nats_url), "error": repr(error)},
+            )
+        stop = asyncio.Event()
+        republisher = asyncio.create_task(
+            republish_periodically(
+                sources, stop, every_s=settings.source_control_republish_s
+            )
+        )
         try:
             yield
         finally:
+            stop.set()
+            await republisher
+            if bus is not None:
+                await bus.drain()
             await redis_client.aclose()
             await asyncio.gather(engine.dispose(), telemetry_engine.dispose())
 

@@ -8,7 +8,13 @@ from typing import Any, Self
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 
-from common import NatsSettings, PostgresSettings, RedisSettings, ServiceSettings
+from common import (
+    NatsSettings,
+    PostgresSettings,
+    RedisSettings,
+    ServiceSettings,
+    SourceControlSettings,
+)
 from common.config import Environment, TelemetryDatabaseSettings
 
 # The feed secret that ships in infra/.env.example. Refused outside dev.
@@ -77,6 +83,7 @@ class ApiSettings(
     TelemetryDatabaseSettings,
     RedisSettings,
     NatsSettings,
+    SourceControlSettings,
 ):
     """Everything the core API needs to start.
 
@@ -179,6 +186,18 @@ class ApiSettings(
         default=DEFAULT_REGISTRATION_PATTERN,
         min_length=1,
         validation_alias="UAS_OPERATOR_REGISTRATION_PATTERN",
+    )
+
+    # U-15. When true, a source instance with no switch of its own (a new
+    # station or receiver) is disabled until an admin enables it. Travels
+    # with the published state, so every adapter applies the same default.
+    sources_default_deny: bool = Field(
+        default=False, validation_alias="SOURCES_DEFAULT_DENY"
+    )
+    # U-15. How often the API republishes the switches from the database,
+    # repairing a bucket write that failed after the database committed.
+    source_control_republish_s: float = Field(
+        default=30.0, gt=0, validation_alias="SOURCE_CONTROL_REPUBLISH_S"
     )
 
     @field_validator("uas_operator_registration_pattern")
