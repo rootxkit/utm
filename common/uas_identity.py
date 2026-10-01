@@ -35,6 +35,18 @@ _CTA_CHAR = "[0-9A-HJ-NP-Z]"
 _CTA_SHAPE = re.compile(rf"^({_CTA_CHAR}{{4}})([1-9A-F])({_CTA_CHAR}{{1,15}})$")
 
 
+class RegistrationStatus(StrEnum):
+    """An operator's, a remote pilot's or a UAS's registration (U-01).
+
+    Here because both sides need it: the API sets it, and U-02's resolvers
+    read it back from the projection (`gateway/registry_projection.py`).
+    """
+
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    REVOKED = "revoked"
+
+
 class ClassLabel(StrEnum):
     """The class marking of 2019/945. None of them: no class label."""
 
