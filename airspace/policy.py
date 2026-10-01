@@ -40,6 +40,22 @@ async def load_policy(engine: AsyncEngine) -> SeparationPolicy:
     )
 
 
+_CONDITIONAL_SEVERITY = sa.text(
+    "SELECT conditional_zone_severity FROM airspace_policy WHERE id = 1"
+)
+
+
+async def load_conditional_zone_severity(engine: AsyncEngine) -> str:
+    """What a CONDITIONAL zone raises: "info" or "warning" (U-03)."""
+    async with engine.connect() as connection:
+        row = (await connection.execute(_CONDITIONAL_SEVERITY)).one_or_none()
+    if row is None:
+        raise PolicyMissingError(
+            "airspace_policy has no row; run the relational migrations"
+        )
+    return str(row.conditional_zone_severity)
+
+
 _HEIGHT_LIMIT = sa.text("SELECT max_height_agl_m FROM airspace_policy WHERE id = 1")
 
 

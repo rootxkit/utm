@@ -230,8 +230,13 @@ drone_state(drone_id, ts, geom POINT, alt_amsl_m, alt_above_home_m,
 
 remote_id_observations(...)   -- telemetry database, every broadcast (P1-15)
 
-airspace_zones(id, name, geom POLYGON, min_alt_m, max_alt_m,
-               type)   -- no_fly | restricted | corridor | base
+airspace_zones(id, type, name, geom POLYGON,   -- type: geozone | corridor | base
+               identifier, country, ed269_type, restriction, reason,
+               message, zone_authority, applicability,
+               uom_dimensions, lower_limit, lower_reference,
+               upper_limit, upper_reference,       -- AGL | AMSL | WGS84
+               circle_center POINT, circle_radius,
+               ed269_extra)   -- U-03: one EUROCAE ED-269 zone per row
 
 events(id, ts, actor_type, actor_id, entity_type, entity_id,
        event_type, payload JSONB)   -- append-only audit

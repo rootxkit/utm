@@ -706,7 +706,7 @@ never commands an aircraft.
       with the owner: adopt, integrate with, or continue alone.
       *Added* 2026-09-29 with the owner.
 
-- [ ] **P5-18** Official geo-zones: import zones in EUROCAE ED-269 format
+- [!] **P5-18** *(superseded by U-03)* Official geo-zones: import zones in EUROCAE ED-269 format
       from the authority's published data into `airspace_zones`, keeping the
       source, version and validity period, instead of drawing them by hand.
       *Done when:* an ED-269 file imports, its zones alert as P5-15 does, and
@@ -1199,7 +1199,7 @@ optional there and can be made mandatory by the authority.
       status in the console, and an `unidentified` or `unknown operator`
       track in a zone opens an incident (U-12).
 
-- [ ] **U-03** Geo-awareness: the zone model follows EUROCAE ED-269
+- [x] **U-03** Geo-awareness: the zone model follows EUROCAE ED-269
       (identifier, restriction type, reason, vertical limits with their
       reference, applicability windows, authority), with import and export
       in ED-269 JSON, an editor in the console for the authority, and an
@@ -1208,6 +1208,10 @@ optional there and can be made mandatory by the authority.
       *Done when:* an ED-269 file round-trips unchanged, an invalid one is
       refused with a named reason, a zone drawn in the editor alerts in
       SITL, and a zone outside its applicability window does not.
+      *Done* 2026-10-01: SITL runs in `docs/runbooks/p5-airspace-monitor.md`.
+      airspace.gov.ge publishes no feed and no limits or times, so its
+      importer (`tools/gov_ge_zones.py`) needs a rules file from the
+      authority before it can be used on the real data.
 
 - [ ] **U-04** Dynamic airspace reconfiguration (2021/665): the authority
       activates a temporary restriction (for example `TEMPO RESTR. AREA`),

@@ -33,6 +33,10 @@ class AirspaceSettings(
     # P5-19. The same tiles the API serves (P5-00). Unset: the height limit
     # in airspace_policy is not evaluated, and the service says so.
     terrain_dir: Path | None = Field(default=None, validation_alias="TERRAIN_DIR")
+    # U-03. The geoid grid the Remote ID ingest uses (P1-15), for zone limits
+    # given above the WGS-84 ellipsoid. Unset: those limits are not
+    # evaluated, and the service says so.
+    geoid_path: Path | None = Field(default=None, validation_alias="GEOID_PATH")
     # S-13. Terrain tiles held in memory, least recently used out. A tile is
     # a 1 x 1 degree cell of about 26 MB, so 8 is about 210 MB: an operating
     # area and every cell around it, bounded below what a small container

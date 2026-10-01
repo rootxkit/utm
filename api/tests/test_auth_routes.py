@@ -54,6 +54,9 @@ VIEWER_ROUTES = {
     ("GET", "/events"),
     ("GET", "/replay/drones"),
     ("GET", "/airspace/zones"),
+    # U-03: zones are read and exported by viewers, changed by ZONE_WRITERS.
+    ("GET", "/airspace/zones/export"),
+    ("GET", "/airspace/zones/{zone_id}"),
     ("GET", "/terrain"),
     ("GET", "/replay/drones/{drone_id}/flights"),
     ("GET", "/replay/drones/{drone_id}"),

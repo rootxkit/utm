@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from airspace.ed269 import MAX_RING_VERTICES
 from api.assets import STATIC, mount_map_assets
 from api.auth import Operator, Role
 from api.auth_http import AccountStore, Authenticator, auth_router, require
@@ -42,7 +43,8 @@ from api.source_routes import sources_router
 from api.sources import SourceControlService
 from api.uas_registry import UasRegistry
 from api.uas_routes import uas_router
-from api.zones import ZoneReader
+from api.zone_routes import zone_router
+from api.zones import ZoneStore
 from common.terrain import Terrain
 
 MAX_EVENTS_PER_PAGE = 1_000
@@ -126,17 +128,6 @@ class MaintenanceIn(BaseModel):
     in_maintenance: bool
 
 
-class ZoneOut(BaseModel):
-    id: UUID
-    name: str
-    # no_fly, restricted, corridor or base (migration 0001_fleet).
-    type: str
-    min_alt_amsl_m: float | None
-    max_alt_amsl_m: float | None
-    # A GeoJSON Polygon in WGS84, as PostGIS writes it.
-    geometry: dict[str, Any]
-
-
 class TerrainOut(BaseModel):
     lat_deg: float
     lon_deg: float
@@ -190,6 +181,7 @@ def create_api_app(
     terrain: Terrain | None = None,
     login_limiter: LoginRateLimiter | None = None,
     uas: UasRegistry | None = None,
+    zone_max_ring_vertices: int = MAX_RING_VERTICES,
     sources: SourceControlService | None = None,
 ) -> FastAPI:
     """The API. `auth` is required: there is no way to build it open.
@@ -199,6 +191,21 @@ def create_api_app(
     request they make for data is authenticated.
     """
     app = FastAPI(title="courier API", version="0.1.0")
+
+    @app.exception_handler(RecursionError)
+    async def too_deep(_: Request, error: RecursionError) -> JSONResponse:
+        """A JSON body nested deeply enough to exhaust the parser's stack
+        (U-03 review): a refusal with a reason, not a 500."""
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "code": "nested_too_deeply",
+                    "message": "the request body is nested too deeply",
+                }
+            },
+        )
+
     viewer = require(auth, Role.VIEWER)
     admin = require(auth, Role.ADMIN)
     app.include_router(
@@ -328,18 +335,18 @@ def create_api_app(
     # Always routed, so the schema carries them; without `sources`, 503.
     app.include_router(sources_router(sources, auth))
 
-    # --- airspace (P6-01) ------------------------------------------------------
+    # --- airspace zones (P6-01, U-03) ---------------------------------------------
 
-    zone_reader = ZoneReader(engine=registry.engine) if registry is not None else None
-
-    @app.get("/airspace/zones", response_model=list[ZoneOut])
-    async def zones(
-        _: Annotated[Operator, Depends(viewer)],
-    ) -> list[dict[str, Any]]:
-        """Every zone, for drawing. The monitor alerts on no-fly and restricted."""
-        if zone_reader is None:
-            raise HTTPException(status_code=503, detail="no relational database")
-        return await zone_reader.zones()
+    # Always routed, so the schema carries them; without a database they
+    # answer 503.
+    app.include_router(
+        zone_router(
+            ZoneStore(engine=registry.engine, max_ring_vertices=zone_max_ring_vertices)
+            if registry is not None
+            else None,
+            auth,
+        )
+    )
 
     # --- terrain (P5-00) -------------------------------------------------------
 

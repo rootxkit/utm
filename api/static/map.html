@@ -178,8 +178,11 @@
           conflict: "Converging",
           conflict_detail: "closest {d} m in {t} s (vertical {v} m)",
           zone: "Inside {zone}",
-          no_fly: "no-fly zone",
-          restricted: "restricted zone",
+          info: "info",
+          // U-03: a zone alert names the zone's ED-269 restriction.
+          PROHIBITED: "prohibited zone",
+          REQ_AUTHORISATION: "authorisation required",
+          CONDITIONAL: "conditional zone",
           acknowledge: "Acknowledge",
           acknowledged: "acknowledged",
           data_lost: "data lost",
@@ -228,8 +231,10 @@
           conflict: "უახლოვდებიან",
           conflict_detail: "უმცირესი მანძილი {d} მ {t} წმ-ში (ვერტიკალურად {v} მ)",
           zone: "ზონაშია: {zone}",
-          no_fly: "აკრძალული ზონა",
-          restricted: "შეზღუდული ზონა",
+          info: "ინფორმაცია",
+          PROHIBITED: "აკრძალული ზონა",
+          REQ_AUTHORISATION: "საჭიროა ნებართვა",
+          CONDITIONAL: "პირობითი ზონა",
           acknowledge: "დადასტურება",
           acknowledged: "დადასტურებულია",
           data_lost: "მონაცემები დაკარგულია",
@@ -469,8 +474,8 @@
                   v: d.d_alt_at_cpa_m,
                 })}</div>`
               : `${alertName(alert, 0)}: ${fill(t("zone"), {
-                  zone: escapeHtml(d.zone_name),
-                })}<div class="muted">${t(d.zone_type)}</div>`;
+                  zone: escapeHtml(d.zone_name || d.identifier),
+                })}<div class="muted">${t(d.restriction)}</div>`;
           const acked = acknowledged.has(key);
           const action = acked
             ? `<span class="muted">${t("acknowledged")}</span>`

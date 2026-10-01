@@ -11,7 +11,6 @@ height limit is judged with it taken off; either alert is then a warning.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 from uuid import UUID
@@ -27,7 +26,9 @@ from airspace.monitor import (
 )
 from airspace.tests.test_height_limit import LIMIT_M, Slope
 from airspace.tests.test_monitor import LAT0, LON0, POLICY, A, B, message
-from airspace.zones import zone_from_geojson
+from airspace.tests.zone_helpers import square
+from airspace.tests.zone_helpers import zone as make_zone
+from airspace.zones import Zone
 
 GEODETIC, PRESSURE = "geodetic", "pressure"
 
@@ -110,21 +111,15 @@ def test_the_track_carries_the_flag_through_the_cpa() -> None:
 # --- zones and the height limit ------------------------------------------------
 
 
-def zone(min_alt_amsl_m: float | None, max_alt_amsl_m: float | None) -> Any:
-    square = [
-        [LON0 - 0.01, LAT0 - 0.01],
-        [LON0 + 0.01, LAT0 - 0.01],
-        [LON0 + 0.01, LAT0 + 0.01],
-        [LON0 - 0.01, LAT0 + 0.01],
-        [LON0 - 0.01, LAT0 - 0.01],
-    ]
-    return zone_from_geojson(
+def zone(min_alt_amsl_m: float | None, max_alt_amsl_m: float | None) -> Zone:
+    """A PROHIBITED zone (no-fly before U-03) with an AMSL band."""
+    return make_zone(
         zone_id=UUID(int=78),
         name="Band",
-        zone_type="no_fly",
-        geojson=json.dumps({"type": "Polygon", "coordinates": [square]}),
-        min_alt_amsl_m=min_alt_amsl_m,
-        max_alt_amsl_m=max_alt_amsl_m,
+        restriction="PROHIBITED",
+        coordinates=square(LAT0, LON0),
+        lower=None if min_alt_amsl_m is None else (min_alt_amsl_m, "AMSL"),
+        upper=None if max_alt_amsl_m is None else (max_alt_amsl_m, "AMSL"),
     )
 
 

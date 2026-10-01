@@ -1,12 +1,13 @@
-"""Run the airspace monitor: `python -m airspace`. P5-06, P5-07, P5-19.
+"""Run the airspace monitor: `python -m airspace`. P5-06, P5-07, P5-19, U-03.
 
 Reads the separation policy, the height limit and the zones from the
-relational database, and the terrain tiles from `TERRAIN_DIR`, then
-follows the Gateway's telemetry on the bus, leaving out sources that are
-switched off (U-15, `common/sources.py`). Zones are re-read every
-`ZONE_REFRESH_S`, and so are the separation policy and the height limit, so
-a zone added or a threshold changed through the database takes effect
-without a restart; a change is logged with the values before and after.
+relational database, the terrain tiles from `TERRAIN_DIR` and the geoid
+from `GEOID_PATH`, then follows the Gateway's telemetry on the bus, leaving
+out sources that are switched off (U-15, `common/sources.py`). Zones are
+re-read every `ZONE_REFRESH_S` (60 s), and so are the separation policy, the
+height limit and the CONDITIONAL zone severity, so a zone drawn in the
+console, imported, edited or deleted takes effect within a minute without a
+restart; a change is logged.
 """
 
 from __future__ import annotations
@@ -20,12 +21,18 @@ from nats.aio.msg import Msg
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from airspace.config import AirspaceSettings
-from airspace.monitor import AirspaceMonitor
-from airspace.policy import load_height_limit, load_policy
+from airspace.ed269 import Restriction
+from airspace.monitor import AirspaceMonitor, Severity
+from airspace.policy import (
+    load_conditional_zone_severity,
+    load_height_limit,
+    load_policy,
+)
 from airspace.service import AirspaceService, EventsAuditLog, run_ticker
-from airspace.zones import load_zones
+from airspace.zones import Zone, load_zones, unjudgeable
 from common import configure_logging, get_logger, load_settings
 from common.bus import RECONNECT_FOREVER
+from common.geoid import GeoidGrid
 from common.sources import (
     SourceControlState,
     follow,
@@ -36,7 +43,35 @@ from common.terrain import Terrain
 _log = get_logger(__name__)
 
 TICK_S = 1.0
+# How long an edited zone can take to reach the monitor. A cheap query; a
+# push on change is U-04's (dynamic restrictions within one tick).
 ZONE_REFRESH_S = 60.0
+
+
+def warn_unjudgeable_zones(
+    zones: list[Zone],
+    *,
+    terrain: Terrain | None,
+    geoid: GeoidGrid | None,
+    before: dict[str, list[str]] | None,
+) -> dict[str, list[str]]:
+    """Log, when it changes, which zones have limits nothing configured can
+    judge; such a zone is never evaluated vertically (U-03)."""
+    missing = unjudgeable(zones, terrain=terrain is not None, geoid=geoid is not None)
+    if missing != before and missing:
+        prohibited = {
+            zone.identifier
+            for zone in zones
+            if zone.restriction is Restriction.PROHIBITED
+        }
+        unjudged_prohibited = sorted(set(missing.get("TERRAIN_DIR", [])) & prohibited)
+        # A PROHIBITED zone whose AGL limit cannot be judged raises a warning
+        # where it should raise critical: an error, not a warning.
+        (_log.error if unjudged_prohibited else _log.warning)(
+            "zones with limits that cannot be evaluated: configure what they need",
+            extra={"missing": missing, "prohibited": unjudged_prohibited},
+        )
+    return missing
 
 
 async def run(settings: AirspaceSettings) -> None:
@@ -58,6 +93,8 @@ async def run(settings: AirspaceSettings) -> None:
             "be evaluated",
             extra={"max_height_agl_m": max_height_agl_m},
         )
+    geoid = None if settings.geoid_path is None else GeoidGrid.load(settings.geoid_path)
+    zones = await load_zones(engine)
     bus = await nats.connect(
         str(settings.nats_url), max_reconnect_attempts=RECONNECT_FOREVER
     )
@@ -67,8 +104,10 @@ async def run(settings: AirspaceSettings) -> None:
     monitor = AirspaceMonitor(
         source_enabled=follower.enabled,
         policy=policy,
-        zones=await load_zones(engine),
+        zones=zones,
         terrain=terrain,
+        geoid=geoid,
+        conditional_severity=Severity(await load_conditional_zone_severity(engine)),
         max_height_agl_m=max_height_agl_m,
         live_max_age_s=settings.live_max_age_s,
         neighbour_max_age_s=settings.neighbour_max_age_s,
@@ -95,8 +134,12 @@ async def run(settings: AirspaceSettings) -> None:
             "zones": len(monitor.zones),
             "max_height_agl_m": max_height_agl_m,
             "terrain_dir": str(settings.terrain_dir) if settings.terrain_dir else None,
+            "geoid_path": str(settings.geoid_path) if settings.geoid_path else None,
+            "conditional_zone_severity": monitor.conditional_severity.value,
+            "zone_refresh_s": ZONE_REFRESH_S,
         },
     )
+    unjudged = warn_unjudgeable_zones(zones, terrain=terrain, geoid=geoid, before=None)
 
     async def on_message(message: Msg) -> None:
         await service.on_telemetry(message.data)
@@ -118,12 +161,30 @@ async def run(settings: AirspaceSettings) -> None:
             loop.add_signal_handler(sig, stop.set)
 
     async def refresh() -> None:
+        nonlocal unjudged
         # Read everything before changing anything, so a failure part-way
         # leaves the monitor consistent with one database state.
         zones = await load_zones(engine)
         new_policy = await load_policy(engine)
         new_limit_m = await load_height_limit(engine)
+        conditional = Severity(await load_conditional_zone_severity(engine))
+        if [z.zone_id for z in zones] != [z.zone_id for z in monitor.zones] or any(
+            new != old for new, old in zip(zones, monitor.zones, strict=True)
+        ):
+            _log.info("zones changed", extra={"zones": len(zones)})
         monitor.zones = zones
+        unjudged = warn_unjudgeable_zones(
+            zones, terrain=terrain, geoid=geoid, before=unjudged
+        )
+        if conditional is not monitor.conditional_severity:
+            _log.info(
+                "conditional zone severity changed",
+                extra={
+                    "before": monitor.conditional_severity.value,
+                    "after": conditional.value,
+                },
+            )
+            monitor.conditional_severity = conditional
         if new_limit_m != monitor.max_height_agl_m:
             _log.info(
                 "height limit changed",

@@ -1,6 +1,6 @@
 import { ageSeconds, num, shortId } from "../format";
 import { useT } from "../i18n";
-import type { Aircraft, Alert } from "../types";
+import { type Aircraft, type Alert, worse } from "../types";
 
 interface Props {
   aircraft: Map<string, Aircraft>;
@@ -26,7 +26,7 @@ export function AircraftList({ aircraft, alerts, selected, now, onSelect, source
   const severity = new Map<string, Alert["severity"]>();
   for (const alert of alerts.values()) {
     for (const id of alert.drone_ids) {
-      if (severity.get(id) !== "critical") severity.set(id, alert.severity);
+      severity.set(id, worse(severity.get(id), alert.severity));
     }
   }
   return (

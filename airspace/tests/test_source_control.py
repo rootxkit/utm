@@ -23,7 +23,7 @@ from airspace.cpa import SeparationPolicy, local_offset_m
 from airspace.monitor import AirspaceMonitor, ClearReason, conflict_key
 from airspace.service import AirspaceService, EventsAuditLog
 from airspace.tests.test_service import Clock, RecordingAudit, RecordingBus
-from airspace.zones import zone_from_geojson
+from airspace.tests.zone_helpers import zone as make_zone
 from common.sources import RELAY, REMOTE_ID, Control, SourceControlState
 
 A = UUID(int=1)
@@ -230,13 +230,12 @@ def test_a_zone_alert_is_cleared_as_source_disabled_too() -> None:
             ]
         ],
     }
-    zone = zone_from_geojson(
+    # A PROHIBITED zone (no-fly before U-03), from the ground up.
+    zone = make_zone(
         zone_id=uuid4(),
         name="no-fly test",
-        zone_type="no_fly",
-        geojson=json.dumps(square),
-        min_alt_amsl_m=None,
-        max_alt_amsl_m=None,
+        restriction="PROHIBITED",
+        coordinates=square["coordinates"],
     )
     m = AirspaceMonitor(policy=POLICY, zones=[zone], source_enabled=switches.enabled)
     raised = m.observe(rid_b(0.0), now_s=0.0).raised
