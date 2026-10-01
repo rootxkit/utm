@@ -644,3 +644,114 @@ def test_placement_without_a_response_time_falls_back_to_our_clock() -> None:
     assert on_time is not None and on_time.captured_at == state.timestamp
     clamped = place(state, response_at=NOW, received_at=NOW)
     assert clamped is not None and clamped.note == "ahead_of_response"
+
+
+# --- the poller's housekeeping -------------------------------------------------------
+
+
+async def test_a_state_ahead_of_its_response_is_placed_on_arrival_and_counted() -> None:
+    sp = Sp()
+    sp.store.put(flight(at=NOW + timedelta(seconds=2)))
+
+    await sp.poller.poll()
+
+    [(_, message)] = sp.bus.sent
+    assert message["captured_at"] == NOW.isoformat()
+    assert message["network_rid"]["time_source"] == "receiver"
+    assert sp.poller.status()["time_ahead_of_response"] == 1
+    await sp.close()
+
+
+async def test_a_bus_failure_is_logged_and_the_next_state_still_goes() -> None:
+    sp = Sp()
+    sp.store.put(flight())
+
+    class Down:
+        async def publish(self, subject: str, payload: bytes) -> None:
+            raise ConnectionError("bus gone")
+
+    sp.poller.bus = Down()
+    await sp.poller.poll()
+    assert sp.poller.published == 0
+
+    sp.poller.bus = sp.bus
+    sp.store.put(flight(at=NOW))
+    await sp.poller.poll()
+    assert sp.poller.published == 1
+    await sp.close()
+
+
+async def test_flights_the_sp_stops_mentioning_are_forgotten() -> None:
+    sp = Sp()
+    now = [0.0]
+    sp.poller.clock_s = lambda: now[0]
+    sp.store.put(flight())
+    await sp.poller.poll()
+    assert sp.poller.status()["flights_held"] == 1
+
+    sp.store.flights.clear()
+    now[0] = 61.0
+    await sp.poller.poll()
+
+    assert sp.poller.status()["flights_held"] == 0
+    await sp.close()
+
+
+async def test_a_provider_switched_off_mid_poll_publishes_nothing() -> None:
+    sp = Sp(switch=SourceControlState())
+    sp.store.put(flight())
+    holder = sp.sources.switch
+    assert isinstance(holder, _Holder)
+    real = sp.poller.client.flights
+
+    async def then_switch_off(area: Area) -> httpx.Response:
+        response = await real(area)
+        holder.state = disabled()
+        return response
+
+    sp.poller.client.flights = then_switch_off  # type: ignore[method-assign]
+
+    await sp.poller.poll()
+
+    assert sp.bus.sent == []
+    assert sp.sources.refused_disabled == 1
+    await sp.close()
+
+
+async def test_the_poll_loop_runs_until_stopped() -> None:
+    import asyncio
+
+    from gateway.network_rid_ingest import poll_periodically
+
+    sp = Sp()
+    stop = asyncio.Event()
+    task = asyncio.create_task(poll_periodically(sp.poller, stop, every_s=0.01))
+    while sp.poller.polls < 3:
+        await asyncio.sleep(0.01)
+    stop.set()
+    await task
+    assert sp.poller.polls >= 3
+    await sp.close()
+
+
+async def test_the_status_is_logged_per_provider(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+    import logging
+
+    from gateway.network_rid_ingest import log_status_periodically
+    from gateway.registry_projection import RegistryFollower
+
+    sp = Sp()
+    stop = asyncio.Event()
+    follower = RegistryFollower(engine=None)  # type: ignore[arg-type]
+    with caplog.at_level(logging.INFO):
+        task = asyncio.create_task(
+            log_status_periodically([sp.poller], follower, stop, every_s=0.01)
+        )
+        await asyncio.sleep(0.05)
+        stop.set()
+        await task
+    assert "network remote id status" in caplog.text
+    await sp.close()
