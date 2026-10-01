@@ -46,6 +46,7 @@ from gateway.relay_messages import (
     parse_control_message,
 )
 from gateway.relay_records import Record, RecordFramingError, decode_records
+from gateway.source_activity import SourceActivity
 from gateway.stage_timing import StageTimings, shared_timings
 from gateway.station_state import LinkState, LossEvent, StationLinkTracker
 
@@ -63,6 +64,19 @@ STATION_REPORT_INTERVAL_S: Final = 1.0
 # WebSocket close codes. 1008 is "policy violation", which is what a
 # protocol-conformance failure is once the connection is already open.
 _CLOSE_PROTOCOL_ERROR: Final = 1008
+# U-15. A station switched off while connected is closed with 1013, "try
+# again later" (RFC 6455 registry): the relay reconnects with backoff
+# (relay-v1 §12), keeps queueing to disk, and is refused at the upgrade with
+# 503 until it is switched on again, when its queue drains as backlog.
+CLOSE_SOURCE_DISABLED: Final = 1013
+SOURCE_DISABLED_REASON: Final = "source disabled"
+# U-15. The upgrade's answer to a disabled station. Not 401 or 403: the
+# relay treats those as fatal and stops for good (agent/relay.py), and a
+# station switched off is to come back when it is switched on, without
+# anyone at the ground station doing anything.
+SOURCE_DISABLED_STATUS: Final = 503
+# Seconds, as a hint; the relay's own backoff caps at 10 s (relay-v1 §12).
+SOURCE_DISABLED_RETRY_AFTER_S: Final = 10
 
 # S-11. A data frame at least this large means the relay is draining a
 # queue: relay-v1 §6 flushes a batch at 100 ms or 64 KiB, whichever is first,
@@ -209,6 +223,13 @@ class RelayServer:
     # per interval, with a count of those suppressed in between. Each one
     # costs a caller nothing, so logging all of them is a way to fill a disk.
     auth_rejections: RateLimiter = field(default_factory=RateLimiter)
+    # U-15. Which stations are switched on, and what each is doing. None:
+    # every station is enabled (a test, or a Gateway with no control
+    # channel). A disabled station is refused at the upgrade with 503 and
+    # closed with 1013 if it is connected; see `apply_source_control`.
+    sources: SourceActivity | None = None
+    # Sessions closed because their station was switched off.
+    closed_disabled: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         self._server: Server | None = None
@@ -219,6 +240,30 @@ class RelayServer:
         self._generations: dict[str, int] = {}
         self._issued_generations: dict[str, int] = {}
         self._open_generations: dict[str, set[int]] = {}
+        # U-15. Every session past its handshake, so a station switched off
+        # can be closed.
+        self._sessions: dict[str, set[_Session]] = {}
+
+    def station_enabled(self, station_id: str) -> bool:
+        return self.sources is None or self.sources.enabled(station_id)
+
+    def connected_stations(self) -> set[str]:
+        """Stations with a session past its handshake."""
+        return {station for station, open_ in self._sessions.items() if open_}
+
+    async def apply_source_control(self) -> int:
+        """Close every session whose station is now switched off; returns
+        how many. Called when the switches change (`common/sources.py`),
+        and safe to call at any time: an enabled station is not touched."""
+        closing = [
+            session
+            for station_id, sessions in self._sessions.items()
+            if not self.station_enabled(station_id)
+            for session in sessions
+        ]
+        for session in closing:
+            await session.close_disabled()
+        return len(closing)
 
     @property
     def trackers(self) -> dict[str, StationLinkTracker]:
@@ -325,6 +370,17 @@ class RelayServer:
             self._log_rejected_connection(connection, "unknown or revoked token")
             return connection.respond(401, "unknown or revoked token\n")
 
+        if self.sources is not None and not self.sources.enabled(station_id):
+            # After the credential, so a stranger learns nothing about which
+            # stations exist; and counted, so a disabled station that keeps
+            # knocking is visibly not silent.
+            self.sources.refuse(station_id)
+            response = connection.respond(
+                SOURCE_DISABLED_STATUS, f"{SOURCE_DISABLED_REASON}\n"
+            )
+            response.headers["Retry-After"] = str(SOURCE_DISABLED_RETRY_AFTER_S)
+            return response
+
         # Carried on the connection so the handler does not re-authenticate.
         connection.station_id = station_id  # type: ignore[attr-defined]
         return None
@@ -376,7 +432,11 @@ class RelayServer:
             resume_from_seq=resume_from_seq,
             newest_seq_held=hello.newest_seq_held,
         )
-        await session.run()
+        self._sessions.setdefault(station_id, set()).add(session)
+        try:
+            await session.run()
+        finally:
+            self._sessions[station_id].discard(session)
 
     async def _handshake(
         self, connection: ServerConnection, station_id: str, log: BoundLogger
@@ -432,7 +492,11 @@ class RelayServer:
         return message, resume_from_seq
 
 
-@dataclass
+class SourceDisabledError(Exception):
+    """The station was switched off while its session was open (U-15)."""
+
+
+@dataclass(eq=False)
 class _Session:
     """One station's connection, after a successful handshake."""
 
@@ -468,6 +532,7 @@ class _Session:
     # when the station's clock steps back, counted in `clock_steps_back`.
     _recent_batches: deque[tuple[int, int, int]] = field(default_factory=deque)
     clock_steps_back: int = 0
+    _closed_disabled: bool = False
 
     def __post_init__(self) -> None:
         # The highest seq durably stored for this epoch, cumulative. -1 means
@@ -506,6 +571,8 @@ class _Session:
             self.log.error("closing relay session", extra={"error": str(error)})
             with contextlib.suppress(websockets.WebSocketException):
                 await self.connection.close(_CLOSE_PROTOCOL_ERROR, str(error)[:120])
+        except SourceDisabledError:
+            await self.close_disabled()
         finally:
             # First, so that if an older session is still open it becomes
             # current before this one decides whether to report a disconnect.
@@ -530,6 +597,22 @@ class _Session:
             await self._acknowledge()
             await self._report_disconnected()
 
+    async def close_disabled(self) -> None:
+        """Close with 1013: the station has been switched off (U-15)."""
+        if self._closed_disabled:
+            return
+        self._closed_disabled = True
+        self.server.closed_disabled += 1
+        self.log.warning(
+            "closing relay session: source disabled",
+            extra={
+                "close_code": CLOSE_SOURCE_DISABLED,
+                "closed_disabled": self.server.closed_disabled,
+            },
+        )
+        with contextlib.suppress(websockets.WebSocketException):
+            await self.connection.close(CLOSE_SOURCE_DISABLED, SOURCE_DISABLED_REASON)
+
     async def _ingest_batch(self, frame: bytes) -> None:
         """Store a batch durably. Nothing is acknowledged before this returns."""
         timings = self.server.timings
@@ -537,6 +620,12 @@ class _Session:
             records = decode_records(frame)
         if not records:
             return
+        # U-15. Checked before anything is stored: a disabled station's
+        # records are refused, not acknowledged, so the relay keeps them and
+        # delivers them as backlog once the station is switched on again.
+        sources = self.server.sources
+        if sources is not None and not sources.admit(self.station_id, len(records)):
+            raise SourceDisabledError(self.station_id)
         with timings.measure("store"):
             stored = await self.server.store.store_records(
                 self.station_id, self.epoch, records
@@ -661,6 +750,8 @@ class _Session:
         now_s = time.monotonic()
 
         if isinstance(message, Status):
+            if self.server.sources is not None:
+                self.server.sources.seen(self.station_id)
             self._note_queue_depth(message.queue_depth)
             if self.superseded:
                 # The tracker is shared and belongs to the current session.
