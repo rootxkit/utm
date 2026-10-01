@@ -44,6 +44,10 @@ stored is what was published, so `feature(parse(f))` gives `f` back. The
 one exception is `null`: an optional field that is `null` is read as absent
 and written back absent.
 
+Numbers round-trip by value, not by spelling: `5.0` is written back as
+`5` and `1e2` as `100`, as JSON compares them. A string where a number is
+required (`"lowerLimit": "0"`) is refused, never converted.
+
 Coordinates are GeoJSON order, `[longitude, latitude]`, as every published
 file and InterUSS's own parsing use (the standard's prose says "lat, lng" in
 places; the files do not).
@@ -64,6 +68,12 @@ FEET_M = 0.3048
 # Refusals listed in one report, so a broken file does not produce a
 # thousand-line answer. The count of the rest is said.
 MAX_PROBLEMS = 100
+# Positions in one ring, by default. The monitor tests every zone a track is
+# near on every message, and a ring's cost grows with its vertices: a
+# published zone has tens to hundreds (Luxembourg's largest: 1,400), so a
+# ring of 300,000 is an error or an attack, not a zone. Callers may set
+# their own (`ZONE_MAX_RING_VERTICES` for the API).
+MAX_RING_VERTICES = 5000
 
 Position = tuple[float, float]
 Ring = tuple[Position, ...]
@@ -209,9 +219,11 @@ class Ed269Error(ValueError):
 
 
 class _Problems:
-    def __init__(self) -> None:
+    def __init__(self, *, max_ring_vertices: int = MAX_RING_VERTICES) -> None:
         self.found: list[Problem] = []
         self.more = 0
+        # Carried here so every reader below sees the caller's limit.
+        self.max_ring_vertices = max_ring_vertices
 
     def add(self, path: str, reason: str) -> None:
         if len(self.found) < MAX_PROBLEMS:
@@ -379,14 +391,18 @@ class Ed269Document:
     description: str | None = None
 
 
-def parse(data: bytes) -> Ed269Document:
+def parse(data: bytes, *, max_ring_vertices: int = MAX_RING_VERTICES) -> Ed269Document:
     """A whole ED-269 document. Raises Ed269Error naming every problem; a
     document is accepted whole or not at all, since half of an authority's
     zones looks complete and is not."""
-    problems = _Problems()
+    problems = _Problems(max_ring_vertices=max_ring_vertices)
     try:
         # utf-8-sig: Luxembourg's live file starts with a byte-order mark.
         document = json.loads(data.decode("utf-8-sig"))
+    except RecursionError as error:
+        # Thousands of nested brackets exhaust the JSON reader's stack. No
+        # ED-269 document nests more than seven levels.
+        raise Ed269Error([Problem("$", "nested too deeply to be ED-269")]) from error
     except UnicodeDecodeError as error:
         raise Ed269Error([Problem("$", f"not UTF-8: {error.reason}")]) from error
     except json.JSONDecodeError as error:
@@ -438,9 +454,11 @@ def parse(data: bytes) -> Ed269Document:
     )
 
 
-def parse_zone(raw: Any, path: str = "zone") -> GeoZone:
+def parse_zone(
+    raw: Any, path: str = "zone", *, max_ring_vertices: int = MAX_RING_VERTICES
+) -> GeoZone:
     """One `UASZoneVersion`. Raises Ed269Error naming every problem."""
-    problems = _Problems()
+    problems = _Problems(max_ring_vertices=max_ring_vertices)
     zone = _zone(raw, path, problems)
     problems.raise_if_any()
     assert zone is not None
@@ -970,6 +988,13 @@ def _position(value: Any, where: str, problems: _Problems) -> Position | None:
 def _ring(value: Any, where: str, problems: _Problems) -> Ring | None:
     if not isinstance(value, list):
         problems.add(where, "a ring must be a list of positions")
+        return None
+    if len(value) > problems.max_ring_vertices:
+        problems.add(
+            where,
+            f"has {len(value)} positions; at most {problems.max_ring_vertices} "
+            "per ring",
+        )
         return None
     points: list[Position] = []
     for index, raw in enumerate(value):

@@ -18,7 +18,8 @@ the boundary; a zone the size of a country would need the database's own
 `ST_Contains` on `geography`. Interior rings (holes) are honoured.
 
 A circle is tested exactly, by great-circle distance from its centre, not
-against the inscribed polygon `geom` holds for drawing.
+against the inscribed polygon `geom` holds for drawing. Every shape is first
+tested against its bounding box.
 
 ## Vertically, each limit in its own reference
 
@@ -47,7 +48,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol
@@ -122,7 +123,37 @@ class Zone:
     def applies_at(self, at: datetime) -> bool:
         return applies(self.periods, at)
 
+    def __post_init__(self) -> None:
+        # The bounding box, checked before the ray casting: a track far
+        # from a zone of thousands of vertices costs four comparisons.
+        if self.circle is None:
+            lons = [p[0] for p in self.exterior]
+            lats = [p[1] for p in self.exterior]
+            box = (min(lons), min(lats), max(lons), max(lats))
+        else:
+            # Degrees of latitude are at least 110.5 km on WGS-84; of
+            # longitude, that times cos(lat). The box is a little generous,
+            # never short.
+            c = self.circle
+            d_lat = c.radius_m / 110_500.0
+            d_lon = d_lat / max(
+                math.cos(math.radians(min(abs(c.lat_deg) + d_lat, 89.9))), 1e-6
+            )
+            box = (
+                c.lon_deg - d_lon,
+                c.lat_deg - d_lat,
+                c.lon_deg + d_lon,
+                c.lat_deg + d_lat,
+            )
+        object.__setattr__(self, "bbox", box)
+
+    # (min_lon, min_lat, max_lon, max_lat), set from the shape.
+    bbox: tuple[float, float, float, float] = field(init=False, compare=False)
+
     def contains_horizontally(self, lat_deg: float, lon_deg: float) -> bool:
+        min_lon, min_lat, max_lon, max_lat = self.bbox
+        if not (min_lon <= lon_deg <= max_lon and min_lat <= lat_deg <= max_lat):
+            return False
         if self.circle is not None:
             return (
                 great_circle_m(
