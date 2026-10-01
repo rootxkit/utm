@@ -153,11 +153,6 @@ jobs:
     name: Telemetry database and bus
     runs-on: ubuntu-latest
     services:
-      nats:
-        # Same image as infra/docker-compose.dev.yml.
-        image: nats:2.10-alpine
-        ports:
-          - 4222:4222
       redis:
         # Same image as infra/docker-compose.dev.yml.
         image: redis:7-alpine
@@ -214,6 +209,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e '.[dev]'
+
+      # NATS with JetStream, as both compose files start it (`-js`). Not a
+      # service container: a service's command cannot be overridden, and
+      # without JetStream the source-switch bucket (U-15) does not exist.
+      # Same image as infra/docker-compose.dev.yml.
+      - name: Start NATS with JetStream
+        run: |
+          docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:2.10-alpine -js -m 8222
+          for _ in $(seq 1 30); do
+            if curl -fsS 'http://localhost:8222/healthz?js-enabled-only=true'; then exit 0; fi
+            sleep 1
+          done
+          docker logs nats
+          exit 1
 
       # The service container runs no initdb scripts, so the extensions the
       # compose stack installs are created here instead. psql is already on the
