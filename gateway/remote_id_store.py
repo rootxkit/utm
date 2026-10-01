@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from common import get_logger
+from gateway.remote_id import ALT_SOURCE_PRESSURE, PRESSURE_ALTITUDE_MODEL
 
 _log = get_logger(__name__)
 
@@ -93,8 +94,7 @@ def row_from_observation(
         lon_deg=observation["lon_deg"],
         alt_hae_m=observation["alt_hae_m"],
         alt_amsl_m=alt_amsl_m,
-        # Named only when there is an AMSL height it produced.
-        geoid_model=geoid_model if alt_amsl_m is not None else None,
+        geoid_model=_height_model(observation, geoid_model),
         alt_above_takeoff_m=observation["alt_above_home_m"],
         track_deg=observation["track_deg"],
         vx_ms=observation["vx_ms"],
@@ -109,6 +109,24 @@ def row_from_observation(
         payload=payload,
         matched_drone_id=matched_drone_id,
     )
+
+
+def _height_model(observation: dict[str, Any], geoid_model: str | None) -> str | None:
+    """What produced the row's AMSL height; None when it has none.
+
+    The geoid for a geodetic altitude. For a pressure altitude (S-33), the
+    text `PRESSURE_ALTITUDE_MODEL`: the standard atmosphere it is referenced
+    to, so the row says its height is not geodetic without a new column.
+    Note that this puts a non-geoid in `geoid_model`: whoever reads the
+    column must treat that text as "this AMSL height is a pressure altitude,
+    vertical position unknown", never as a geoid model name. A dedicated
+    `alt_source` column would need a telemetry migration.
+    """
+    if observation["alt_amsl_m"] is None:
+        return None
+    if observation.get("alt_source") == ALT_SOURCE_PRESSURE:
+        return PRESSURE_ALTITUDE_MODEL
+    return geoid_model
 
 
 class RowWriter(Protocol):

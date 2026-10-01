@@ -781,3 +781,88 @@ def test_one_neighbours_failure_does_not_lose_the_others(
     assert monitor.check_failures == 2, "B-C on B's message, A-C on A's"
     failures = [r for r in caplog.records if "pair is not judged" in r.getMessage()]
     assert len(failures) == 2 and all(r.exc_info for r in failures)
+
+
+# --- one Remote ID transmitter under two ids (S-32) ---------------------------
+
+
+def broadcast(
+    drone_id: UUID,
+    north_m: float,
+    transmitter: str,
+    *,
+    identified: bool = True,
+    **kw: Any,
+) -> Any:
+    """A Remote ID observation, as gateway/remote_id.py publishes it."""
+    return {
+        **message(drone_id, north_m, armed=None, **kw),
+        "source": "remote_id",
+        "airborne": True,
+        "remote_id": {"transmitter": transmitter, "identified": identified},
+    }
+
+
+def test_an_unidentified_track_and_the_serial_of_its_transmitter_are_one() -> None:
+    """Unidentified, then identified: one radio, never a pair."""
+    monitor = AirspaceMonitor(policy=POLICY)
+
+    monitor.observe(
+        broadcast(A, 0, "02:55:16:00:00:01", identified=False, vn=1.0), now_s=0.0
+    )
+    change = monitor.observe(
+        broadcast(B, 1, "02:55:16:00:00:01", vn=1.0, at_s=0.5), now_s=0.5
+    )
+
+    assert change.raised == []
+
+
+def test_two_serials_on_one_transmitter_address_are_a_conflict() -> None:
+    """Two identified claims on one address, a spoofer using another's
+    address among them, are judged like any pair."""
+    monitor = AirspaceMonitor(policy=POLICY)
+
+    monitor.observe(broadcast(A, 0, "02:55:16:00:00:01", vn=1.0), now_s=0.0)
+    change = monitor.observe(
+        broadcast(B, 1, "02:55:16:00:00:01", vn=1.0, at_s=0.5), now_s=0.5
+    )
+
+    assert [alert.kind for alert in change.raised] == [AlertKind.CONFLICT]
+
+
+def test_a_broadcast_without_the_identified_field_is_judged() -> None:
+    """Only an explicit `identified: false` can make a pair one radio."""
+    monitor = AirspaceMonitor(policy=POLICY)
+    first = broadcast(A, 0, "02:55:16:00:00:01", vn=1.0)
+    del first["remote_id"]["identified"]
+
+    monitor.observe(first, now_s=0.0)
+    change = monitor.observe(
+        broadcast(B, 1, "02:55:16:00:00:01", vn=1.0, at_s=0.5), now_s=0.5
+    )
+
+    assert [alert.kind for alert in change.raised] == [AlertKind.CONFLICT]
+
+
+def test_two_transmitters_in_the_same_place_are_a_conflict() -> None:
+    """The presence half: the same geometry, two radios."""
+    monitor = AirspaceMonitor(policy=POLICY)
+
+    monitor.observe(broadcast(A, 0, "02:55:16:00:00:01", vn=1.0), now_s=0.0)
+    change = monitor.observe(
+        broadcast(B, 1, "02:55:16:00:00:02", vn=1.0, at_s=0.5), now_s=0.5
+    )
+
+    assert [alert.kind for alert in change.raised] == [AlertKind.CONFLICT]
+
+
+def test_a_transmitter_is_never_matched_against_mavlink() -> None:
+    """A MAVLink track has no transmitter, so the rule cannot hide one."""
+    monitor = AirspaceMonitor(policy=POLICY)
+
+    monitor.observe(message(A, 0, vn=1.0), now_s=0.0)
+    change = monitor.observe(
+        broadcast(B, 1, "02:55:16:00:00:01", vn=1.0, at_s=0.5), now_s=0.5
+    )
+
+    assert [alert.kind for alert in change.raised] == [AlertKind.CONFLICT]

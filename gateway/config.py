@@ -14,6 +14,15 @@ from common import (
     ServiceSettings,
     TelemetryDatabaseSettings,
 )
+from gateway.remote_id import (
+    DEFAULT_IDENTIFY_WITHIN_S,
+    DEFAULT_IDENTITY_TTL_S,
+    DEFAULT_MAX_GAP_S,
+    DEFAULT_MAX_LATENCY_S,
+    DEFAULT_MIN_VERTICAL_ACCURACY,
+    DEFAULT_PRESSURE_HOLD_S,
+    DEFAULT_TIME_TOLERANCE_S,
+)
 
 
 class GatewaySettings(
@@ -112,6 +121,53 @@ class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings)
     # Without one, Remote ID aircraft have no AMSL altitude and the airspace
     # monitor does not evaluate them.
     geoid_path: Path | None = Field(default=None, validation_alias="GEOID_PATH")
+    # S-27 (gateway/remote_id.py, "Time"). How far ahead of the ingest's
+    # clock a broadcast's own time may be, and how old it may be on arrival,
+    # for the aircraft to be placed at it rather than at its receive time.
+    remote_id_time_tolerance_s: float = Field(
+        default=DEFAULT_TIME_TOLERANCE_S,
+        ge=0,
+        validation_alias="REMOTE_ID_TIME_TOLERANCE_S",
+    )
+    remote_id_max_latency_s: float = Field(
+        default=DEFAULT_MAX_LATENCY_S,
+        gt=0,
+        validation_alias="REMOTE_ID_MAX_LATENCY_S",
+    )
+    # S-33. The poorest declared vertical accuracy (MAV_ODID_VER_ACC code,
+    # 1 to 6 for under 150, 45, 25, 10, 3 and 1 m) at which a broadcast's
+    # geodetic altitude is used; below it, its pressure altitude is.
+    remote_id_min_vertical_accuracy: int = Field(
+        default=DEFAULT_MIN_VERTICAL_ACCURACY,
+        ge=1,
+        le=6,
+        validation_alias="REMOTE_ID_MIN_VERTICAL_ACCURACY",
+    )
+    # S-33. Once on pressure altitude, how long a transmitter stays on it
+    # after its last poor geodetic altitude, so the source does not flip.
+    remote_id_pressure_hold_s: float = Field(
+        default=DEFAULT_PRESSURE_HOLD_S,
+        ge=0,
+        validation_alias="REMOTE_ID_PRESSURE_HOLD_S",
+    )
+    # S-32 (gateway/remote_id.py, "An identity is used only while it is
+    # fresh"). How long a Basic ID names its transmitter's Locations; how
+    # long a silence ends everything known about a transmitter address; how
+    # long a Location waits for a Basic ID before it is published as an
+    # unidentified track.
+    remote_id_identity_ttl_s: float = Field(
+        default=DEFAULT_IDENTITY_TTL_S,
+        gt=0,
+        validation_alias="REMOTE_ID_IDENTITY_TTL_S",
+    )
+    remote_id_max_gap_s: float = Field(
+        default=DEFAULT_MAX_GAP_S, gt=0, validation_alias="REMOTE_ID_MAX_GAP_S"
+    )
+    remote_id_identify_within_s: float = Field(
+        default=DEFAULT_IDENTIFY_WITHIN_S,
+        ge=0,
+        validation_alias="REMOTE_ID_IDENTIFY_WITHIN_S",
+    )
 
     @model_validator(mode="after")
     def unsigned_only_on_loopback(self) -> Self:

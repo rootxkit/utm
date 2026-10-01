@@ -108,18 +108,19 @@ def test_a_repeated_identity_alone_does_not_republish_a_position() -> None:
     moved = tracker.take(frame(location(lat=LAT + 0.001)), now_s=1.0)
 
     assert first is not None
-    assert again is not None  # a Basic ID completing a held location publishes
+    # The position was already published; only a held one is completed.
+    assert again is None
     assert moved is not None and moved["lat_deg"] == pytest.approx(LAT + 0.001)
 
 
 def test_a_forgotten_transmitter_does_not_lend_its_position() -> None:
-    tracker = RemoteIdTracker(geoid=FlatGeoid(), forget_after_s=60.0)
+    tracker = RemoteIdTracker(geoid=FlatGeoid(), max_gap_s=3.0)
 
     tracker.take(frame(location()), now_s=0.0)
-    after_silence = tracker.take(frame(basic()), now_s=61.0)
-    in_time = RemoteIdTracker(geoid=FlatGeoid(), forget_after_s=60.0)
+    after_silence = tracker.take(frame(basic()), now_s=3.5)
+    in_time = RemoteIdTracker(geoid=FlatGeoid(), max_gap_s=3.0)
     in_time.take(frame(location()), now_s=0.0)
-    before_silence = in_time.take(frame(basic()), now_s=59.0)
+    before_silence = in_time.take(frame(basic()), now_s=2.9)
 
     assert after_silence is None
     assert before_silence is not None

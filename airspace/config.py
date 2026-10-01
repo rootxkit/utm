@@ -61,6 +61,14 @@ class AirspaceSettings(ServiceSettings, PostgresSettings, RedisSettings, NatsSet
     neighbour_max_age_s: float = Field(
         default=10.0, gt=0, validation_alias="NEIGHBOUR_MAX_AGE_S"
     )
+    # S-33. How far a Remote ID pressure altitude may be from AMSL: about
+    # 8 m per hPa between the local QNH and 1013.25 hPa, so 250 m covers a
+    # 30 hPa day. For an aircraft on pressure altitude, a zone's band is
+    # widened by it (inside the widened band only: a warning), and alerts
+    # say the altitude is approximate to within it.
+    pressure_uncertainty_m: float = Field(
+        default=250.0, ge=0, validation_alias="PRESSURE_UNCERTAINTY_M"
+    )
     # S-13. Audit rows waiting for the background writer. Transitions are
     # rare (the 2026-09-29 SITL run wrote 16 rows in four minutes), so 1000
     # entries, each a small tuple, cover hours of a slow or absent database
