@@ -4,7 +4,8 @@ Subscribes to the Gateway's `telemetry.*`, feeds `AirspaceMonitor`, and for
 each alert raised or cleared:
 
 - publishes `alert.<key>` with `state` "raised" or "cleared" (a clear also
-  says why: `reason` "resolved" or "stale"), which the console shows (P6-03),
+  says why: `reason` "resolved", "stale" or "source_disabled", U-15), which
+  the console shows (P6-03),
   and republishes each active alert every tick with `state` "active", so the
   numbers a console shows are current;
 - appends an `events` row in the relational database, so an incident can be
@@ -73,7 +74,7 @@ def encode_alert(
     alert: Alert, state: str, *, reason: ClearReason | None = None
 ) -> bytes:
     """The bus payload. `reason` is present only when `state` is "cleared":
-    "resolved" or "stale" (`airspace.monitor.ClearReason`)."""
+    "resolved", "stale" or "source_disabled" (`airspace.monitor.ClearReason`)."""
     body: dict[str, Any] = {"state": state}
     if reason is not None:
         body["reason"] = reason.value
@@ -282,6 +283,8 @@ class AirspaceService:
             "without_capture_time": self.monitor.without_capture_time,
             "check_failures": self.monitor.check_failures,
             "vertical_unknown": self.monitor.vertical_unknown,
+            "rejected_source_disabled": self.monitor.rejected_source_disabled,
+            "dropped_source_disabled": self.monitor.dropped_source_disabled,
             "tile_failures": self.tile_failures,
             "audit_pending": self.audit_pending,
             "audit_overflow": self.audit_overflow,
@@ -298,8 +301,16 @@ class AirspaceService:
         self._status_logged_at_s = now_s
         _log.info("airspace monitor status", extra=self.status())
 
+    async def on_sources_changed(self) -> None:
+        """The switches changed (U-15): drop what is now switched off, and
+        publish and audit its alerts as cleared with `source_disabled`."""
+        await self._emit(self.monitor.apply_sources(now_s=self.clock()))
+
     async def on_tick(self) -> None:
         now_s = self.clock()
+        # Sources first: an aircraft switched off is cleared as such, not
+        # left for the tick to call stale.
+        await self._emit(self.monitor.apply_sources(now_s=now_s))
         await self._emit(self.monitor.tick(now_s=now_s))
         self._log_status(now_s)
         # Refresh what is still active, on the bus only. An alert's numbers
