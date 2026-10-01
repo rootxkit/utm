@@ -96,6 +96,7 @@ from api.uas_registry import (
 from common import load_settings
 from common.uas_identity import ClassLabel, normalize_registration_number
 from gateway.binding import BindingResolver
+from gateway.registry_projection import IdentityProjection
 
 Row = Mapping[str, Any]
 
@@ -489,6 +490,7 @@ async def run(args: argparse.Namespace) -> int:
         engine=engine,
         projection=BindingResolver(engine=telemetry),
         registration_pattern=settings.registration_pattern,
+        identity=IdentityProjection(engine=telemetry),
     )
     try:
         report = await import_registry(

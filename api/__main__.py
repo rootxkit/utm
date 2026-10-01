@@ -37,6 +37,7 @@ from api.uas_registry import UasRegistry
 from common import configure_logging, get_logger, load_settings
 from common.terrain import Terrain
 from gateway.binding import BindingResolver
+from gateway.registry_projection import IdentityProjection
 
 _log = get_logger(__name__)
 
@@ -75,6 +76,7 @@ def build_app(settings: ApiSettings) -> FastAPI:
         engine=engine,
         projection=registry.projection,
         registration_pattern=settings.registration_pattern,
+        identity=IdentityProjection(engine=telemetry_engine),
     )
     sources = SourceControlService(
         store=SourceControlStore(engine=engine),
@@ -118,11 +120,18 @@ def build_app(settings: ApiSettings) -> FastAPI:
                 sources, stop, every_s=settings.source_control_republish_s
             )
         )
+        # U-02: the identity projection, re-made at start and periodically.
+        projector = asyncio.create_task(
+            uas.sync_projection_periodically(
+                stop, every_s=settings.registry_projection_sync_s
+            )
+        )
         try:
             yield
         finally:
             stop.set()
             await republisher
+            await projector
             channel = sources.channel
             if isinstance(channel, NatsControlChannel) and not channel.closed:
                 await channel.client.drain()
