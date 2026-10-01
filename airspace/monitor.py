@@ -24,9 +24,8 @@ state already says why (P1-05).
 Every message carries two times (`gateway/README.md`). `ts` is the clock of
 whoever captured it: on the relay path the ground PC's `recv_utc_ns`
 (relay-v1 §9: it may be wrong, drifting or stepped); on the Remote ID path
-the Gateway's own receive time, since the broadcast's `seconds_after_hour`
-is decoded but not yet carried, so a Remote ID position is stamped when it
-reached the Gateway, not when the aircraft measured it. `rx_ts` is when the
+the broadcast's own capture time (S-27), which the Gateway also uses for
+`captured_at` when it is plausible. `rx_ts` is when the
 Gateway received the batch, on the Gateway's clock: one clock for every
 station. `captured_at` is where the Gateway placed the row on that clock:
 `rx_ts` less how far behind its batch's newest record it was captured, so a

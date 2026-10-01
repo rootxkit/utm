@@ -20,11 +20,10 @@ arrived. What `ts` is depends on the path:
 - **Relay (MAVLink):** the ground PC's `recv_utc_ns`, the moment the relay
   received the frame. relay-v1 §9 says that clock may be wrong, drifting or
   stepped, and nothing corrects it upstream.
-- **Remote ID:** the Gateway's own receive time (`gateway/remote_id.py`).
-  The broadcast's `seconds_after_hour` is decoded (`gateway/odid.py`) but not
-  yet carried, so a Remote ID position is stamped when it reached the
-  Gateway, not when the aircraft measured it. Carrying the broadcast time is
-  a Gateway follow-up.
+- **Remote ID:** the broadcast's own capture time (`gateway/remote_id.py`,
+  S-27). The Gateway also sets `captured_at` to it when it is plausible, so
+  a Remote ID position is placed when the aircraft measured it, not when it
+  reached the Gateway.
 
 Neither clock is trusted for placing an aircraft in time. Every message also
 carries `rx_ts`, when the Gateway received the batch on its own clock;

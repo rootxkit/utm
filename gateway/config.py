@@ -14,6 +14,7 @@ from common import (
     ServiceSettings,
     TelemetryDatabaseSettings,
 )
+from gateway.remote_id import DEFAULT_MAX_LATENCY_S, DEFAULT_TIME_TOLERANCE_S
 
 
 class GatewaySettings(
@@ -112,6 +113,19 @@ class RemoteIdSettings(ServiceSettings, NatsSettings, TelemetryDatabaseSettings)
     # Without one, Remote ID aircraft have no AMSL altitude and the airspace
     # monitor does not evaluate them.
     geoid_path: Path | None = Field(default=None, validation_alias="GEOID_PATH")
+    # S-27 (gateway/remote_id.py, "Time"). How far ahead of the ingest's
+    # clock a broadcast's own time may be, and how old it may be on arrival,
+    # for the aircraft to be placed at it rather than at its receive time.
+    remote_id_time_tolerance_s: float = Field(
+        default=DEFAULT_TIME_TOLERANCE_S,
+        ge=0,
+        validation_alias="REMOTE_ID_TIME_TOLERANCE_S",
+    )
+    remote_id_max_latency_s: float = Field(
+        default=DEFAULT_MAX_LATENCY_S,
+        gt=0,
+        validation_alias="REMOTE_ID_MAX_LATENCY_S",
+    )
 
     @model_validator(mode="after")
     def unsigned_only_on_loopback(self) -> Self:

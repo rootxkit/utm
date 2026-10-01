@@ -17,9 +17,11 @@ Every published telemetry message carries these time-related fields:
 - `ts`: the record's capture time, on the clock of whoever captured it. On
   the relay path that is the ground PC's `recv_utc_ns`, which relay-v1 §9
   says may be wrong, drifting or stepped. On the Remote ID path it is the
-  Gateway's receive time (the broadcast's own `seconds_after_hour` is decoded
-  but not yet carried). `ts` orders a station's own records; it is not
-  comparable across stations.
+  broadcast's own capture time (S-27): the Location's tenths of a second
+  after the hour, on the hour that puts it closest to and not after the
+  Gateway's receive time plus a tolerance, or the receive time when the
+  broadcast says the time is unknown. `ts` orders a station's own records;
+  it is not comparable across stations.
 - `rx_ts`: when the Gateway received the batch, on the Gateway's clock. One
   clock for every station. `null` for a row that did not come through the
   pipeline (the Redis snapshot, whose rows carry `rx_ts: null`,
@@ -34,7 +36,13 @@ Every published telemetry message carries these time-related fields:
   the rest sit behind it by their true spacing. A spacing that is negative
   or beyond 120 s (`MAX_BATCH_SPAN_S`, a clock stepped inside the batch) is
   clamped and counted. The airspace monitor places aircraft by this field;
-  it uses `rx_ts` only to judge its own lag. Equal to `rx_ts` for Remote ID.
+  it uses `rx_ts` only to judge its own lag. For Remote ID it is the
+  broadcast time when that is plausible: no more than
+  `REMOTE_ID_TIME_TOLERANCE_S` (1 s) ahead of `rx_ts` and no more than
+  `REMOTE_ID_MAX_LATENCY_S` (5 s) behind it, each widened by the
+  broadcast's declared timestamp accuracy. Otherwise it is `rx_ts`, the
+  fallback is counted by reason (`RemoteIdTracker.time_fallbacks`), and
+  `remote_id.time_source` says `receiver` instead of `broadcast`.
 - `backlog`: `true` when the record is not the present. Two cases:
   - it was queued on the relay before the session that delivered it, that
     is, its `seq` is at or below the `newest_seq_held` the relay declared in

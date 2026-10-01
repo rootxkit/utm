@@ -164,7 +164,9 @@ class RemoteIdIngest:
             self.store.add(
                 row_from_observation(
                     observation,
-                    ts=frame.received_at,
+                    # Where the aircraft was placed: the broadcast's own time
+                    # when plausible, else the receive time (S-27).
+                    ts=datetime.fromisoformat(observation["captured_at"]),
                     payload=frame.payload,
                     geoid_model=self.geoid_model,
                     matched_drone_id=None if ours is None else ours.drone_id,
@@ -226,6 +228,16 @@ def geoid_model(geoid: GeoidGrid | None, path: Path | None) -> str | None:
     return geoid.description or path.name
 
 
+def tracker_from_settings(
+    settings: RemoteIdSettings, geoid: GeoidGrid | None
+) -> RemoteIdTracker:
+    return RemoteIdTracker(
+        geoid=geoid,
+        time_tolerance_s=settings.remote_id_time_tolerance_s,
+        max_latency_s=settings.remote_id_max_latency_s,
+    )
+
+
 async def flush_periodically(store: PendingRows, stop: asyncio.Event) -> None:
     while not stop.is_set():
         with contextlib.suppress(TimeoutError):
@@ -263,7 +275,7 @@ async def run(settings: RemoteIdSettings) -> None:
     fleet = FleetSerials()
     await fleet.refresh(engine)
     ingest = RemoteIdIngest(
-        tracker=RemoteIdTracker(geoid=geoid),
+        tracker=tracker_from_settings(settings, geoid),
         bus=bus,
         store=store,
         geoid_model=geoid_model(geoid, settings.geoid_path),

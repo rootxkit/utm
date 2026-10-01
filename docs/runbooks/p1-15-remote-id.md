@@ -90,8 +90,9 @@ python -m tools.sitl_remote_id --count 3 --serial 'SITLRID{sysid:04d}' \
 - **Time:** the Location timestamp is the vehicle's own clock (its
   `time_boot_ms`, put on UTC by `SYSTEM_TIME`), in tenths of a second after
   the hour. Until the vehicle has sent `SYSTEM_TIME` the timestamp is sent
-  as unknown and no System message goes out. The ingest does not use the
-  timestamp yet (`ts` is arrival time).
+  as unknown and no System message goes out. The ingest places the
+  aircraft at that time (S-27, "Time" below); an unknown one is placed at
+  its arrival.
 - **Rates:** Location every `--location-period-s` (1 s). Basic ID, System
   and Operator ID every `--static-period-s` (3 s), sent as one message pack
   (`--transport pack`) or one message per datagram, as Bluetooth 4 does
@@ -101,6 +102,25 @@ python -m tools.sitl_remote_id --count 3 --serial 'SITLRID{sysid:04d}' \
   for a repeatable run). `--delay-s 2` delivers each datagram two seconds
   late, signed when it is sent. `--spoof-serial <serial>` broadcasts
   someone else's serial number (U-02).
+
+## Time
+
+The aircraft is placed at the time its Location says it was measured, not
+when the ingest heard it (S-27). The broadcast carries tenths of a second
+after the UTC hour; the ingest takes the hour that puts it closest to, and
+not after, its own receive time plus a tolerance, so a broadcast at
+12:59:59.9 heard at 13:00:00.2 is 12:59:59.9.
+
+| Setting | Default | |
+|---|---|---|
+| `REMOTE_ID_TIME_TOLERANCE_S` | 1.0 | How far ahead of the ingest's clock a broadcast time may be. |
+| `REMOTE_ID_MAX_LATENCY_S` | 5.0 | How old a broadcast may be on arrival and still be placed at its own time. |
+
+Both are widened by the timestamp accuracy the broadcast declares. Outside
+them, or with the time unknown, the aircraft is placed at its arrival:
+`captured_at` is `rx_ts`, `remote_id.time_source` is `receiver`, and the
+tracker counts the reason (`unknown`, `invalid`, `too_old`). Stored rows
+(`remote_id_observations.ts`) take the same placement.
 
 ## Signed receivers
 

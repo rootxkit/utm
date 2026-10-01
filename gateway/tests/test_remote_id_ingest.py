@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
@@ -106,6 +107,24 @@ async def test_a_published_observation_is_also_stored() -> None:
     row = rows.rows[0]
     assert (row.ts, row.receiver_id, row.payload) == (NOW, "rx-1", payload)
     assert row.geoid_model == "flat 20 m"
+
+
+async def test_a_late_broadcast_is_stored_and_published_at_its_own_time() -> None:
+    """S-27: 1.5 s between the broadcast and the ingest's clock."""
+    rows = Rows()
+    store = PendingRows(writer=rows)
+    bus = FakeBus()
+    # NOW is on the hour: 3598.5 s after the previous one is 1.5 s before it.
+    payload = pack(basic(), location(seconds_after_hour=3598.5))
+
+    await ingest(bus, store).on_datagram(datagram(payload), "127.0.0.1")
+    await store.flush()
+
+    broadcast = NOW - timedelta(seconds=1.5)
+    assert rows.rows[0].ts == broadcast
+    message = bus.sent[0][1]
+    assert message["captured_at"] == broadcast.isoformat()
+    assert message["rx_ts"] == NOW.isoformat()
 
 
 async def test_a_bus_failure_does_not_lose_the_record() -> None:
@@ -328,6 +347,25 @@ def test_an_unauthenticated_ingest_only_binds_to_loopback(
     else:
         with pytest.raises(ValidationError, match="REMOTE_ID_RECEIVER_KEYS"):
             RemoteIdSettings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_the_tracker_takes_its_limits_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway.config import RemoteIdSettings
+    from gateway.remote_id_ingest import tracker_from_settings
+
+    monkeypatch.setenv("NATS_URL", "nats://127.0.0.1:4222")
+    monkeypatch.setenv(
+        "TELEMETRY_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:5433/t"
+    )
+    monkeypatch.setenv("REMOTE_ID_BIND_HOST", "127.0.0.1")
+    monkeypatch.setenv("REMOTE_ID_TIME_TOLERANCE_S", "0.5")
+    monkeypatch.setenv("REMOTE_ID_MAX_LATENCY_S", "2.5")
+
+    tracker = tracker_from_settings(RemoteIdSettings(_env_file=None), None)  # type: ignore[call-arg]
+
+    assert (tracker.time_tolerance_s, tracker.max_latency_s) == (0.5, 2.5)
 
 
 # --- one of ours broadcasting (serial match) --------------------------------------
